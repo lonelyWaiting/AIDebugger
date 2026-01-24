@@ -14,6 +14,53 @@ namespace VSDebuggerMCP
     {
         private const string McpServerName = "vs-debugger";
         private static readonly string[] RequiredPythonPackages = { "mcp" };
+
+        /// <summary>
+        /// Server use instructions that help Cursor AI understand when and how to use this MCP.
+        /// This is critical for AI to automatically invoke debugging tools when users ask about crashes, errors, etc.
+        /// </summary>
+        private const string ServerUseInstructions = @"VS Debugger MCP - Visual Studio调试信息获取工具
+
+## 何时使用此MCP
+
+当用户提到以下关键词或场景时，应主动使用此MCP获取调试信息：
+
+### 崩溃/异常分析（最常见场景）
+- 关键词：崩溃、crash、异常、exception、错误、error、闪退、挂起、hang、死循环
+- 推荐操作：首先调用 get_full_context 或 get_exception + get_callstack 获取完整的崩溃现场
+
+### 调试分析
+- 关键词：调试、debug、断点、breakpoint、单步、step、堆栈、stack、变量、variable
+- 推荐操作：根据需求使用 get_debug_status、get_callstack、get_locals 等
+
+### 编译问题
+- 关键词：编译错误、build error、编译失败、无法编译、syntax error、链接错误
+- 推荐操作：调用 get_build_errors 获取错误列表
+
+### 内存/底层分析
+- 关键词：内存、memory、指针、pointer、地址、address、反汇编、disassembly、寄存器
+- 推荐操作：使用 read_memory、get_disassembly、get_registers 等
+
+## 推荐工作流程
+
+### 崩溃分析标准流程：
+1. 调用 get_full_context 一次性获取所有上下文（状态、堆栈、变量、异常、线程）
+2. 根据返回的文件路径，使用 Read 工具读取相关源代码
+3. 分析异常信息和堆栈，定位问题根因
+4. 如需更多信息，使用 evaluate_expression 检查特定变量或表达式
+
+### 断点调试流程：
+1. get_debug_status 确认调试状态
+2. get_callstack 查看调用链
+3. get_locals 查看当前变量
+4. evaluate_expression 求值特定表达式
+
+## 重要注意事项
+
+- 支持多个VS实例，会自动选择处于断点暂停状态的实例
+- 如果有多个实例且无法自动选择，使用 list_vs_instances 查看，然后 select_vs_instance 选择
+- 调试控制工具（如 debug_step_over）会改变程序状态，需谨慎使用
+- get_full_context 是最高效的起点，一次调用获取全部信息";
         
         /// <summary>
         /// Gets the path to the MCP server Python script.
@@ -149,7 +196,11 @@ namespace VSDebuggerMCP
                             firstArg = argsList[0]?.ToString();
                         }
                         
-                        bool isCorrectConfig = existingCommand == "python" && firstArg == normalizedPath;
+                        // Check if serverUseInstructions is present
+                        var hasServerUseInstructions = existingConfig.ContainsKey("serverUseInstructions") 
+                            && !string.IsNullOrEmpty(existingConfig["serverUseInstructions"]?.ToString());
+                        
+                        bool isCorrectConfig = existingCommand == "python" && firstArg == normalizedPath && hasServerUseInstructions;
                         
                         if (isCorrectConfig)
                         {
@@ -161,9 +212,10 @@ namespace VSDebuggerMCP
                         }
                         else
                         {
-                            log($"MCP server '{McpServerName}' exists but with different config, updating...");
+                            log($"MCP server '{McpServerName}' exists but needs update...");
                             log($"  Existing command: {existingCommand}");
                             log($"  Expected: python {normalizedPath}");
+                            log($"  Has serverUseInstructions: {hasServerUseInstructions}");
                         }
                     }
                 }
@@ -173,7 +225,8 @@ namespace VSDebuggerMCP
                 {
                     { "command", "python" },
                     { "args", new object[] { normalizedPath } },
-                    { "env", new Dictionary<string, object>() }
+                    { "env", new Dictionary<string, object>() },
+                    { "serverUseInstructions", ServerUseInstructions }
                 };
 
                 mcpServers[McpServerName] = serverConfig;
