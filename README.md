@@ -149,7 +149,7 @@ pip install -r requirements.txt
 
 ### Step 3: Configure Cursor (Automatic!)
 
-The VS extension will **automatically register** itself with Cursor when it first starts. It modifies the Cursor MCP configuration file (`~/.cursor/mcp.json`) to add the vs-debugger server.
+The VS extension will **automatically register** itself with Cursor when it first starts. The Python MCP server files are **bundled with the VSIX extension**, so no manual path configuration is needed.
 
 After installing the VS extension and restarting Visual Studio, you just need to **restart Cursor** for the MCP tools to become available.
 
@@ -162,13 +162,13 @@ If auto-registration doesn't work, you can manually add the following to your Cu
   "mcpServers": {
     "vs-debugger": {
       "command": "python",
-      "args": ["d:/CursorMCP/mcp_server/server.py"]
+      "args": ["<path-to-vs-extension>/mcp_server/server.py"]
     }
   }
 }
 ```
 
-**Note:** Adjust the path according to your installation location.
+**Note:** Replace `<path-to-vs-extension>` with the actual extension installation path. You can find it by checking the VS extension installation directory (typically under `%LOCALAPPDATA%\Microsoft\VisualStudio\<version>\Extensions\`).
 
 ## Usage
 

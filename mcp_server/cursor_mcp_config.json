@@ -1,8 +1,10 @@
 {
+  "_comment": "This is a template. The VS extension automatically registers with Cursor using the correct path.",
+  "_note": "The Python MCP server files are bundled with the VSIX extension.",
   "mcpServers": {
     "vs-debugger": {
       "command": "python",
-      "args": ["d:/CursorMCP/mcp_server/server.py"],
+      "args": ["<auto-detected-by-extension>/mcp_server/server.py"],
       "env": {}
     }
   }

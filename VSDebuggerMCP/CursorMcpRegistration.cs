@@ -17,24 +17,32 @@ namespace VSDebuggerMCP
         
         /// <summary>
         /// Gets the path to the MCP server Python script.
+        /// The Python files are bundled with the VSIX extension.
         /// </summary>
         public static string GetMcpServerPath()
         {
-            // The MCP server should be in the same directory as this extension or in a known location
-            // Try multiple possible locations
-            var possiblePaths = new[]
+            // The MCP server files are bundled in the VSIX and installed alongside the extension
+            var extensionDir = GetExtensionDirectory();
+            
+            // Primary location: mcp_server folder in the extension directory (bundled with VSIX)
+            var bundledPath = Path.Combine(extensionDir, "mcp_server", "server.py");
+            var normalizedBundledPath = Path.GetFullPath(bundledPath);
+            
+            if (File.Exists(normalizedBundledPath))
             {
-                // Same directory as extension
-                Path.Combine(GetExtensionDirectory(), "mcp_server", "server.py"),
-                // Parent directory (if extension is in VSDebuggerMCP folder)
-                Path.Combine(GetExtensionDirectory(), "..", "mcp_server", "server.py"),
-                // Default installation location
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "CursorMCP", "mcp_server", "server.py"),
-                // D: drive location (development)
-                @"D:\CursorMCP\mcp_server\server.py"
+                return normalizedBundledPath;
+            }
+            
+            // Fallback locations for development scenarios
+            var fallbackPaths = new[]
+            {
+                // Parent directory (development: running from VSDebuggerMCP/bin/Debug)
+                Path.Combine(extensionDir, "..", "..", "..", "mcp_server", "server.py"),
+                // User profile location (manual installation)
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".vs-debugger-mcp", "mcp_server", "server.py"),
             };
 
-            foreach (var path in possiblePaths)
+            foreach (var path in fallbackPaths)
             {
                 var normalizedPath = Path.GetFullPath(path);
                 if (File.Exists(normalizedPath))
@@ -43,8 +51,8 @@ namespace VSDebuggerMCP
                 }
             }
 
-            // Return the default path even if it doesn't exist
-            return @"D:\CursorMCP\mcp_server\server.py";
+            // Return the bundled path even if it doesn't exist (will show meaningful error)
+            return normalizedBundledPath;
         }
 
         /// <summary>
