@@ -164,6 +164,8 @@ async def clear_vs_selection() -> str:
 async def get_debug_status() -> str:
     """
     获取Visual Studio当前的调试状态，包括是否正在调试、是否暂停、当前位置等信息。
+    
+    **触发场景**: 当用户提到"调试"、"debug"、"断点"、"breakpoint"、"VS"、"Visual Studio"时，优先调用此工具了解当前状态。
     """
     try:
         result = await vs_bridge.call("get_debug_status")
@@ -179,6 +181,8 @@ async def get_callstack() -> str:
     """
     获取当前线程的完整调用堆栈，包含每个栈帧的函数名、文件路径、行号等信息。
     Cursor可以根据返回的文件路径自动读取相关代码。
+    
+    **触发场景**: 当用户询问"怎么执行到这里的"、"调用链"、"堆栈"、"callstack"、"函数调用顺序"时调用此工具。
     """
     try:
         result = await vs_bridge.call("get_callstack")
@@ -193,6 +197,8 @@ async def get_callstack() -> str:
 async def get_locals() -> str:
     """
     获取当前栈帧的所有局部变量和参数，包含变量名、类型和当前值。
+    
+    **触发场景**: 当用户询问"变量值是什么"、"参数是多少"、"局部变量"、"当前状态"时调用此工具。
     """
     try:
         result = await vs_bridge.call("get_locals")
@@ -210,6 +216,8 @@ async def evaluate_expression(
     """
     在当前调试上下文中求值任意表达式。可以获取变量的地址、计算偏移量、访问结构成员等。
     对于指针和数值类型会同时返回十进制和十六进制值。
+    
+    **触发场景**: 当用户想查看特定表达式的值、询问"xxx的值是多少"、"计算xxx"、"查看指针"、"展开对象"时调用此工具。
     
     Args:
         expression: 要求值的表达式，如：&myVariable、myPointer->field、sizeof(MyStruct)、(int*)0x1234
@@ -233,6 +241,8 @@ async def evaluate_expression(
 async def get_threads() -> str:
     """
     获取调试进程中所有线程的信息，包括线程ID、名称、状态和当前位置。
+    
+    **触发场景**: 当用户提到"线程"、"thread"、"多线程"、"并发"、"死锁"时调用此工具。
     """
     try:
         result = await vs_bridge.call("get_threads")
@@ -261,6 +271,8 @@ async def get_modules() -> str:
 async def get_exception() -> str:
     """
     获取当前异常的详细信息，包括异常类型、消息、堆栈跟踪和内部异常。
+    
+    **触发场景**: 当用户提到"崩溃"、"crash"、"异常"、"exception"、"报错"、"出错了"、"抛异常"时，优先调用此工具。
     """
     try:
         result = await vs_bridge.call("get_exception")
@@ -276,6 +288,8 @@ async def read_memory(address: str, size: int = 256) -> str:
     """
     读取指定内存地址的原始字节数据。用于分析内存布局、检查数据结构、排查内存损坏问题。
     返回十六进制转储、ASCII视图和格式化的内存视图。地址可以是十六进制或变量表达式。
+    
+    **触发场景**: 当用户提到"内存"、"memory"、"内存损坏"、"内存布局"、"查看地址"、"hex dump"时调用此工具。
     
     Args:
         address: 内存地址，支持十六进制（如0x7ff61234）或表达式（如&myVariable、myPointer）
@@ -301,6 +315,8 @@ async def get_disassembly(lines_before: int = 20, lines_after: int = 20) -> str:
     """
     获取当前断点/暂停位置附近的反汇编代码。用于分析底层机器指令、排查优化代码问题、理解编译器生成的代码。
     返回汇编指令、机器码和对应的内存地址。
+    
+    **触发场景**: 当用户提到"反汇编"、"disassembly"、"汇编代码"、"机器指令"、"底层分析"、"asm"时调用此工具。
     
     Args:
         lines_before: 当前指令之前要显示的行数，默认20
@@ -343,6 +359,8 @@ async def get_build_errors() -> str:
     """
     获取Visual Studio Error List中的所有编译错误和警告，包含错误代码（如CS0001）、文件路径、行号和详细描述。
     Cursor可以根据返回的文件路径自动读取相关代码并帮助修复。
+    
+    **触发场景**: 当用户提到"编译错误"、"build error"、"构建失败"、"无法编译"、"语法错误"、"红色波浪线"时，优先调用此工具。
     """
     try:
         result = await vs_bridge.call("get_build_errors")
@@ -385,6 +403,8 @@ async def get_debug_output(
     """
     获取Visual Studio Output窗口的内容。用于查看调试输出、构建日志、程序输出等。
     默认返回最后50行以避免内容过多。
+    
+    **触发场景**: 当用户提到"输出"、"output"、"日志"、"log"、"打印了什么"、"构建日志"时调用此工具。
     
     Args:
         pane: 输出面板名称，如 "Debug"（调试输出）, "Build"（构建日志）, "General" 等。默认为 "Debug"
@@ -438,6 +458,8 @@ async def get_full_context() -> str:
     """
     一次性获取所有调试上下文信息，包括状态、堆栈、变量、异常、线程和模块。
     当你需要完整分析调试现场时使用此工具。
+    
+    **触发场景**: 当用户说"帮我分析一下"、"看看发生了什么"、"调试现场"、"为什么会这样"等需要全面了解情况时调用此工具。
     """
     try:
         result = await vs_bridge.call("get_full_context")
@@ -453,6 +475,8 @@ async def debug_continue() -> str:
     """
     继续执行程序直到下一个断点或程序结束 (F5)。
     返回执行后的新状态。
+    
+    **触发场景**: 当用户说"继续"、"continue"、"运行"、"F5"、"执行下去"时调用此工具。
     """
     try:
         result = await vs_bridge.call("continue")
@@ -466,6 +490,8 @@ async def debug_step_over() -> str:
     """
     单步跳过当前行 (F10)，不进入函数内部。
     返回执行后的新位置信息。
+    
+    **触发场景**: 当用户说"单步"、"下一行"、"step over"、"F10"、"跳过这行"时调用此工具。
     """
     try:
         result = await vs_bridge.call("step_over")
@@ -479,6 +505,8 @@ async def debug_step_into() -> str:
     """
     单步进入当前行的函数 (F11)。
     返回执行后的新位置信息。
+    
+    **触发场景**: 当用户说"进入函数"、"step into"、"F11"、"跟进去"时调用此工具。
     """
     try:
         result = await vs_bridge.call("step_into")
@@ -492,6 +520,8 @@ async def debug_step_out() -> str:
     """
     单步跳出当前函数 (Shift+F11)，执行到调用方。
     返回执行后的新位置信息。
+    
+    **触发场景**: 当用户说"跳出函数"、"step out"、"Shift+F11"、"返回上层"时调用此工具。
     """
     try:
         result = await vs_bridge.call("step_out")
@@ -571,6 +601,8 @@ async def get_breakpoints() -> str:
     """
     获取所有已设置的断点列表，包括文件断点、函数断点和条件断点。
     返回断点位置、条件、命中次数等详细信息。
+    
+    **触发场景**: 当用户询问"断点在哪"、"有哪些断点"、"breakpoint列表"时调用此工具。
     """
     try:
         result = await vs_bridge.call("get_breakpoints")
@@ -587,6 +619,8 @@ async def set_breakpoint(
 ) -> str:
     """
     在指定文件的指定行设置断点。
+    
+    **触发场景**: 当用户说"设置断点"、"加个断点"、"在xxx行打断点"时调用此工具。
     
     Args:
         file_path: 源文件的完整路径
@@ -729,6 +763,8 @@ async def get_registers() -> str:
     """
     获取CPU寄存器值（RAX, RBX, RCX, RDX, RSP, RBP, RIP, RFLAGS等）。
     用于底层调试和分析。包括通用寄存器、段寄存器和XMM寄存器。
+    
+    **触发场景**: 当用户提到"寄存器"、"register"、"RAX"、"RSP"、"RIP"、"CPU状态"时调用此工具。
     """
     try:
         result = await vs_bridge.call("get_registers")
