@@ -1,0 +1,501 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Pipes;
+using System.Runtime.Serialization.Json;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
+using VSDebuggerMCP.Protocol;
+
+namespace VSDebuggerMCP
+{
+    /// <summary>
+    /// Named Pipe server for MCP communication.
+    /// Uses JSON-RPC style protocol over a named pipe.
+    /// Each VS instance creates a unique pipe with its process ID.
+    /// </summary>
+    public class NamedPipeServer : IDisposable
+    {
+        private const string PipeNamePrefix = "VSDebuggerMCP";
+        private const int MaxConnections = 10;
+        
+        // Unique pipe name for this VS instance (includes process ID)
+        private readonly string _pipeName;
+
+        private readonly DebuggerService _debuggerService;
+        private readonly Action<string> _log;
+        private readonly CancellationTokenSource _cts;
+        private readonly JavaScriptSerializer _serializer;
+        private readonly List<Task> _connectionTasks;
+        private bool _isRunning;
+        private bool _disposed;
+
+        /// <summary>
+        /// Gets the unique pipe name for this VS instance.
+        /// </summary>
+        public string PipeName => _pipeName;
+
+        public NamedPipeServer(DebuggerService debuggerService, Action<string> log)
+        {
+            _debuggerService = debuggerService ?? throw new ArgumentNullException(nameof(debuggerService));
+            _log = log ?? ((s) => { });
+            _cts = new CancellationTokenSource();
+            _serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+            _connectionTasks = new List<Task>();
+            
+            // Create unique pipe name with process ID
+            int processId = System.Diagnostics.Process.GetCurrentProcess().Id;
+            _pipeName = $"{PipeNamePrefix}_{processId}";
+        }
+
+        public void Start()
+        {
+            if (_isRunning) return;
+            _isRunning = true;
+
+            _log($"Starting Named Pipe server on \\\\.\\pipe\\{_pipeName}");
+
+            // Start multiple listeners for concurrent connections
+            for (int i = 0; i < MaxConnections; i++)
+            {
+                var task = Task.Run(() => ListenForConnectionsAsync(_cts.Token));
+                _connectionTasks.Add(task);
+            }
+        }
+
+        public void Stop()
+        {
+            if (!_isRunning) return;
+            _isRunning = false;
+
+            _log("Stopping Named Pipe server...");
+            _cts.Cancel();
+
+            // Wait for all connection tasks to complete (with timeout)
+            try
+            {
+                var allTasks = Task.WhenAll(_connectionTasks.ToArray());
+                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5));
+                // Wait for either all tasks to complete or timeout
+                var completedTask = Task.WhenAny(allTasks, timeoutTask).ConfigureAwait(false).GetAwaiter().GetResult();
+                // Observe the result to prevent unobserved task exceptions
+                if (completedTask == allTasks)
+                {
+                    try { allTasks.GetAwaiter().GetResult(); } catch { }
+                }
+            }
+            catch (AggregateException)
+            {
+                // Ignore cancellation exceptions
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected
+            }
+
+            _connectionTasks.Clear();
+            _log("Named Pipe server stopped.");
+        }
+
+        private async Task ListenForConnectionsAsync(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                NamedPipeServerStream pipeServer = null;
+
+                try
+                {
+                    pipeServer = new NamedPipeServerStream(
+                        _pipeName,
+                        PipeDirection.InOut,
+                        MaxConnections,
+                        PipeTransmissionMode.Byte,
+                        PipeOptions.Asynchronous);
+
+                    _log("Waiting for client connection...");
+
+                    // Wait for connection with cancellation support
+                    await Task.Factory.FromAsync(
+                        pipeServer.BeginWaitForConnection,
+                        pipeServer.EndWaitForConnection,
+                        null);
+
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        pipeServer.Dispose();
+                        break;
+                    }
+
+                    _log("Client connected.");
+
+                    // Handle the connection
+                    await HandleConnectionAsync(pipeServer, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Expected when stopping
+                    break;
+                }
+                catch (IOException ex)
+                {
+                    _log($"IO error: {ex.Message}");
+                }
+                catch (Exception ex)
+                {
+                    _log($"Error in pipe listener: {ex.Message}");
+                }
+                finally
+                {
+                    pipeServer?.Dispose();
+                }
+            }
+        }
+
+        private async Task HandleConnectionAsync(NamedPipeServerStream pipeServer, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var reader = new StreamReader(pipeServer, Encoding.UTF8, true, 4096, leaveOpen: true);
+
+                // Use UTF-8 without BOM - the BOM causes Python's json.loads to fail
+                var utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+                var writer = new StreamWriter(pipeServer, utf8NoBom, 4096, leaveOpen: true);
+
+                try
+                {
+                    // NOTE: Do NOT set writer.AutoFlush = true here!
+                    // It causes deadlock with async NamedPipeServerStream when client has pending writes.
+                    // Instead, call FlushAsync() explicitly after each write.
+
+                    while (pipeServer.IsConnected && !cancellationToken.IsCancellationRequested)
+                    {
+                        // Read request
+                        string requestLine = await reader.ReadLineAsync();
+                        if (string.IsNullOrEmpty(requestLine))
+                        {
+                            break;
+                        }
+
+                        _log($"Received request: {requestLine.Substring(0, Math.Min(100, requestLine.Length))}...");
+
+                        // Process request
+                        string response = ProcessRequest(requestLine);
+
+                        // Send response and flush explicitly
+                        await writer.WriteLineAsync(response);
+                        await writer.FlushAsync();
+                        _log($"Sent response: {response.Substring(0, Math.Min(100, response.Length))}...");
+                    }
+                }
+                finally
+                {
+                    reader.Dispose();
+                    writer.Dispose();
+                }
+            }
+            catch (IOException)
+            {
+                // Client disconnected
+                _log("Client disconnected.");
+            }
+            catch (Exception ex)
+            {
+                _log($"Error handling connection: {ex.Message}");
+            }
+        }
+
+        private string ProcessRequest(string requestJson)
+        {
+            DebugRequest request = null;
+            try
+            {
+                request = _serializer.Deserialize<DebugRequest>(requestJson);
+            }
+            catch (Exception ex)
+            {
+                return SerializeResponse(DebugResponse.Failure(null, "PARSE_ERROR", $"Failed to parse request: {ex.Message}"));
+            }
+
+            if (request == null || string.IsNullOrEmpty(request.Method))
+            {
+                return SerializeResponse(DebugResponse.Failure(request?.Id, "INVALID_REQUEST", "Missing method"));
+            }
+
+            try
+            {
+                object result = HandleMethod(request);
+                return SerializeResponse(DebugResponse.Success(request.Id, result));
+            }
+            catch (Exception ex)
+            {
+                _log($"Error processing method {request.Method}: {ex.Message}");
+                return SerializeResponse(DebugResponse.Failure(request.Id, "INTERNAL_ERROR", ex.Message));
+            }
+        }
+
+        private object HandleMethod(DebugRequest request)
+        {
+            switch (request.Method.ToLowerInvariant())
+            {
+                case "get_debug_status":
+                    return _debuggerService.GetDebugStatus();
+
+                case "get_callstack":
+                    return _debuggerService.GetCallStack();
+
+                case "get_locals":
+                    return _debuggerService.GetLocals();
+
+                case "get_threads":
+                    return _debuggerService.GetThreads();
+
+                case "get_modules":
+                    return _debuggerService.GetModules();
+
+                case "get_exception":
+                    return _debuggerService.GetException();
+
+                case "evaluate_expression":
+                    {
+                        string expression = GetParam<string>(request.Params, "expression", "");
+                        bool expandChildren = GetParam<bool>(request.Params, "expandChildren", false);
+                        int maxDepth = GetParam<int>(request.Params, "maxDepth", 2);
+                        return _debuggerService.EvaluateExpression(expression, expandChildren, maxDepth);
+                    }
+
+                case "read_memory":
+                    {
+                        string address = GetParam<string>(request.Params, "address", "");
+                        int size = GetParam<int>(request.Params, "size", 256);
+                        return _debuggerService.ReadMemory(address, size);
+                    }
+
+                case "get_disassembly":
+                    {
+                        int linesBefore = GetParam<int>(request.Params, "linesBefore", 20);
+                        int linesAfter = GetParam<int>(request.Params, "linesAfter", 20);
+                        return _debuggerService.GetDisassembly(linesBefore, linesAfter);
+                    }
+
+                case "get_disassembly_at":
+                    {
+                        string address = GetParam<string>(request.Params, "address", "");
+                        int count = GetParam<int>(request.Params, "count", 50);
+                        return _debuggerService.GetDisassemblyAt(address, count);
+                    }
+
+                case "get_build_errors":
+                    return _debuggerService.GetBuildErrors();
+
+                case "get_errors_only":
+                    return _debuggerService.GetBuildErrors(errorsOnly: true);
+
+                case "get_warnings_only":
+                    return _debuggerService.GetBuildErrors(warningsOnly: true);
+
+                case "get_full_context":
+                    return _debuggerService.GetFullContext();
+
+                case "ping":
+                    return new PingResult { Status = "ok", Timestamp = DateTime.UtcNow.ToString("o") };
+
+                case "get_instance_info":
+                    return _debuggerService.GetInstanceInfo(_pipeName);
+
+                // Debug Control
+                case "continue":
+                    return _debuggerService.Continue();
+
+                case "step_into":
+                    return _debuggerService.StepInto();
+
+                case "step_over":
+                    return _debuggerService.StepOver();
+
+                case "step_out":
+                    return _debuggerService.StepOut();
+
+                case "break":
+                    return _debuggerService.Break();
+
+                case "stop":
+                    return _debuggerService.Stop();
+
+                case "run_to_cursor":
+                    {
+                        string filePath = GetParam<string>(request.Params, "filePath", "");
+                        int lineNumber = GetParam<int>(request.Params, "lineNumber", 0);
+                        return _debuggerService.RunToCursor(filePath, lineNumber);
+                    }
+
+                case "set_next_statement":
+                    {
+                        string filePath = GetParam<string>(request.Params, "filePath", "");
+                        int lineNumber = GetParam<int>(request.Params, "lineNumber", 0);
+                        return _debuggerService.SetNextStatement(filePath, lineNumber);
+                    }
+
+                // Breakpoints
+                case "get_breakpoints":
+                    return _debuggerService.GetBreakpoints();
+
+                case "set_breakpoint":
+                    {
+                        string filePath = GetParam<string>(request.Params, "filePath", "");
+                        int lineNumber = GetParam<int>(request.Params, "lineNumber", 0);
+                        string condition = GetParam<string>(request.Params, "condition", null);
+                        return _debuggerService.SetBreakpoint(filePath, lineNumber, condition);
+                    }
+
+                case "set_function_breakpoint":
+                    {
+                        string functionName = GetParam<string>(request.Params, "functionName", "");
+                        string condition = GetParam<string>(request.Params, "condition", null);
+                        return _debuggerService.SetFunctionBreakpoint(functionName, condition);
+                    }
+
+                case "delete_breakpoint":
+                    {
+                        string filePath = GetParam<string>(request.Params, "filePath", "");
+                        int lineNumber = GetParam<int>(request.Params, "lineNumber", 0);
+                        return _debuggerService.DeleteBreakpoint(filePath, lineNumber);
+                    }
+
+                case "delete_all_breakpoints":
+                    return _debuggerService.DeleteAllBreakpoints();
+
+                case "enable_breakpoint":
+                    {
+                        string filePath = GetParam<string>(request.Params, "filePath", "");
+                        int lineNumber = GetParam<int>(request.Params, "lineNumber", 0);
+                        bool enabled = GetParam<bool>(request.Params, "enabled", true);
+                        return _debuggerService.EnableBreakpoint(filePath, lineNumber, enabled);
+                    }
+
+                // Registers
+                case "get_registers":
+                    return _debuggerService.GetRegisters();
+
+                // Watch
+                case "add_watch":
+                    {
+                        string expression = GetParam<string>(request.Params, "expression", "");
+                        return _debuggerService.AddWatch(expression);
+                    }
+
+                // Memory Search
+                case "search_memory":
+                    {
+                        string startAddress = GetParam<string>(request.Params, "startAddress", "");
+                        string pattern = GetParam<string>(request.Params, "pattern", "");
+                        int maxResults = GetParam<int>(request.Params, "maxResults", 100);
+                        int searchSize = GetParam<int>(request.Params, "searchSize", 0x10000);
+                        return _debuggerService.SearchMemory(startAddress, pattern, maxResults, searchSize);
+                    }
+
+                // Stack Frame Navigation
+                case "switch_stack_frame":
+                    {
+                        int frameIndex = GetParam<int>(request.Params, "frameIndex", 0);
+                        return _debuggerService.SwitchStackFrame(frameIndex);
+                    }
+
+                case "switch_thread":
+                    {
+                        int threadId = GetParam<int>(request.Params, "threadId", 0);
+                        return _debuggerService.SwitchThread(threadId);
+                    }
+
+                // Output Window
+                case "get_output_window":
+                    {
+                        string pane = GetParam<string>(request.Params, "pane", "Debug");
+                        int tailLines = GetParam<int>(request.Params, "tailLines", 50);
+                        return _debuggerService.GetOutputWindow(pane, tailLines);
+                    }
+
+                case "search_output":
+                    {
+                        string pattern = GetParam<string>(request.Params, "pattern", "");
+                        string pane = GetParam<string>(request.Params, "pane", "Debug");
+                        bool isRegex = GetParam<bool>(request.Params, "isRegex", false);
+                        int contextLines = GetParam<int>(request.Params, "contextLines", 2);
+                        int maxMatches = GetParam<int>(request.Params, "maxMatches", 20);
+                        return _debuggerService.SearchOutput(pattern, pane, isRegex, contextLines, maxMatches);
+                    }
+
+                default:
+                    throw new NotSupportedException($"Unknown method: {request.Method}");
+            }
+        }
+
+        private T GetParam<T>(Dictionary<string, object> parameters, string key, T defaultValue)
+        {
+            if (parameters == null || !parameters.ContainsKey(key))
+            {
+                return defaultValue;
+            }
+
+            try
+            {
+                object value = parameters[key];
+                if (value == null)
+                {
+                    return defaultValue;
+                }
+
+                // Handle type conversions
+                if (typeof(T) == typeof(int))
+                {
+                    return (T)(object)Convert.ToInt32(value);
+                }
+                if (typeof(T) == typeof(bool))
+                {
+                    return (T)(object)Convert.ToBoolean(value);
+                }
+                if (typeof(T) == typeof(string))
+                {
+                    return (T)(object)value.ToString();
+                }
+
+                return (T)value;
+            }
+            catch
+            {
+                return defaultValue;
+            }
+        }
+
+        private string SerializeResponse(DebugResponse response)
+        {
+            try
+            {
+                // Use DataContractJsonSerializer to respect DataMember(Name = "...") attributes
+                // This ensures lowercase property names like "result" instead of "Result"
+                var serializer = new DataContractJsonSerializer(typeof(DebugResponse));
+                using (var ms = new MemoryStream())
+                {
+                    serializer.WriteObject(ms, response);
+                    return Encoding.UTF8.GetString(ms.ToArray());
+                }
+            }
+            catch (Exception ex)
+            {
+                _log($"Error serializing response: {ex.Message}");
+                // Fallback to simple error JSON
+                return $"{{\"id\":\"{response?.Id}\",\"error\":{{\"code\":\"SERIALIZE_ERROR\",\"message\":\"{ex.Message.Replace("\"", "\\\"")}\"}}}}";
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            Stop();
+            _cts.Dispose();
+        }
+    }
+}

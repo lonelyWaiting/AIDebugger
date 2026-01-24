@@ -1,0 +1,35 @@
+name: Build VSIX
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Setup NuGet
+      uses: NuGet/setup-nuget@v2
+
+    - name: Restore NuGet packages
+      run: nuget restore VSDebuggerMCP/VSDebuggerMCP.csproj
+
+    - name: Build VSIX (Release)
+      run: msbuild VSDebuggerMCP/VSDebuggerMCP.csproj /p:Configuration=Release /p:DeployExtension=false
+
+    - name: Upload VSIX artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: VSDebuggerMCP-VSIX
+        path: VSDebuggerMCP/bin/Release/VSDebuggerMCP.vsix
+        if-no-files-found: error

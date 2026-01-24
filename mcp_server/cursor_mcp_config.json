@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "vs-debugger": {
+      "command": "python",
+      "args": ["d:/CursorMCP/mcp_server/server.py"],
+      "env": {}
+    }
+  }
+}

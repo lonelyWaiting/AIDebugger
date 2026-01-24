@@ -1,0 +1,5 @@
+# VS Debugger MCP Server - Python Dependencies
+# These packages are automatically installed by the VS extension
+# You can also install them manually with: pip install -r requirements.txt
+
+mcp>=1.0.0

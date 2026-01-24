@@ -1,0 +1,793 @@
+"""
+Visual Studio Debugger MCP Server
+
+This MCP server provides tools for Cursor to access debugging information
+from Visual Studio, including call stacks, variables, memory, and more.
+
+Supports multiple VS instances with automatic discovery and smart selection:
+- If only one VS instance is in debugging/paused state, it will be auto-selected
+- Use list_vs_instances to see all available VS instances
+- Use select_vs_instance to choose a specific instance
+"""
+
+import sys
+import json
+from typing import Any, Dict, Optional
+
+# Use FastMCP for easy tool registration
+from mcp.server.fastmcp import FastMCP
+
+import vs_bridge
+
+# Create MCP server instance using FastMCP
+mcp = FastMCP("vs-debugger")
+
+
+def format_result(result: Any) -> str:
+    """Format result as readable text for MCP response."""
+    if isinstance(result, dict):
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    return str(result)
+
+
+def handle_vs_error(e: Exception, operation: str) -> str:
+    """Handle VS bridge errors and return user-friendly message."""
+    error_msg = str(e)
+    if "No Visual Studio instances found" in error_msg:
+        return f"未找到Visual Studio实例。请确保：\n1. Visual Studio已启动\n2. VSDebuggerMCP扩展已安装并启用\n3. 扩展已正确加载（可能需要重启VS）"
+    if "Multiple VS instances found" in error_msg:
+        return error_msg  # Already formatted with instance list
+    if "Failed to connect" in error_msg:
+        return f"无法连接到Visual Studio。请确保：\n1. Visual Studio已启动\n2. VSDebuggerMCP扩展已安装并启用\n3. 扩展已正确加载（可能需要重启VS）\n\n错误详情: {error_msg}"
+    return f"执行 {operation} 时出错: {error_msg}"
+
+
+# ============== Instance Management Tools ==============
+
+@mcp.tool()
+async def list_vs_instances() -> str:
+    """
+    列出所有可用的Visual Studio实例及其状态。
+    显示每个实例的进程ID、解决方案名称、调试状态等信息。
+    当有多个VS实例时，使用此工具查看所有实例，然后用select_vs_instance选择要操作的实例。
+    """
+    try:
+        instances = await vs_bridge.discover_instances()
+        
+        if not instances:
+            return "未找到任何Visual Studio实例。请确保VS已启动且VSDebuggerMCP扩展已加载。"
+        
+        result = {
+            "instanceCount": len(instances),
+            "instances": [inst.to_dict() for inst in instances],
+            "hint": "使用 select_vs_instance 工具选择要操作的实例（通过 process_id 参数）"
+        }
+        
+        # Add summary
+        paused = [i for i in instances if i.is_paused]
+        debugging = [i for i in instances if i.is_debugging and not i.is_paused]
+        idle = [i for i in instances if not i.is_debugging]
+        
+        result["summary"] = {
+            "paused": len(paused),
+            "debugging": len(debugging),
+            "idle": len(idle)
+        }
+        
+        if len(paused) == 1:
+            result["autoSelected"] = f"自动选择了唯一处于断点暂停状态的实例 (PID: {paused[0].process_id})"
+        elif len(debugging) == 1 and len(paused) == 0:
+            result["autoSelected"] = f"自动选择了唯一正在调试的实例 (PID: {debugging[0].process_id})"
+        elif len(instances) == 1:
+            result["autoSelected"] = f"自动选择了唯一的实例 (PID: {instances[0].process_id})"
+        
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "list_vs_instances")
+
+
+@mcp.tool()
+async def select_vs_instance(process_id: int) -> str:
+    """
+    选择要操作的Visual Studio实例。选择后，所有后续的调试工具调用都会使用这个实例。
+    
+    Args:
+        process_id: Visual Studio进程ID，可通过list_vs_instances获取
+    """
+    try:
+        # Discover instances
+        instances = await vs_bridge.discover_instances()
+        
+        # Build pipe name from process_id
+        target_pipe = f"VSDebuggerMCP_{process_id}"
+        
+        # Find the instance - match by process_id OR by pipe name containing the PID
+        target = None
+        for inst in instances:
+            # Match by process_id if it's set correctly
+            if inst.process_id == process_id:
+                target = inst
+                break
+            # Also match by pipe name (handles case where get_instance_info failed)
+            if inst.pipe_name == target_pipe:
+                target = inst
+                # Update the process_id from pipe name
+                inst.process_id = process_id
+                break
+        
+        if target is None:
+            # Show available PIDs extracted from pipe names
+            available_pids = []
+            for inst in instances:
+                if inst.process_id != 0:
+                    available_pids.append(str(inst.process_id))
+                elif inst.pipe_name.startswith("VSDebuggerMCP_"):
+                    try:
+                        pid = int(inst.pipe_name.split("_")[1])
+                        available_pids.append(str(pid))
+                    except (ValueError, IndexError):
+                        pass
+            available = ", ".join(available_pids)
+            return f"未找到进程ID为 {process_id} 的VS实例。可用的实例: {available if available else '无'}"
+        
+        # Select using pipe name directly (more reliable)
+        vs_bridge.select_instance(pipe_name=target_pipe)
+        
+        result = {
+            "success": True,
+            "message": f"已选择VS实例",
+            "selectedInstance": target.to_dict()
+        }
+        
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "select_vs_instance")
+
+
+@mcp.tool()
+async def clear_vs_selection() -> str:
+    """
+    清除已选择的VS实例，恢复自动选择模式。
+    自动选择逻辑：
+    1. 如果只有一个实例处于断点暂停状态，自动使用它
+    2. 如果只有一个实例正在调试，自动使用它
+    3. 如果只有一个实例，自动使用它
+    4. 否则需要手动选择
+    """
+    vs_bridge.clear_selection()
+    return "已清除VS实例选择，恢复自动选择模式。"
+
+
+# ============== Debug Status Tools ==============
+
+@mcp.tool()
+async def get_debug_status() -> str:
+    """
+    获取Visual Studio当前的调试状态，包括是否正在调试、是否暂停、当前位置等信息。
+    """
+    try:
+        result = await vs_bridge.call("get_debug_status")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_debug_status")
+
+
+# ============== Call Stack Tools ==============
+
+@mcp.tool()
+async def get_callstack() -> str:
+    """
+    获取当前线程的完整调用堆栈，包含每个栈帧的函数名、文件路径、行号等信息。
+    Cursor可以根据返回的文件路径自动读取相关代码。
+    """
+    try:
+        result = await vs_bridge.call("get_callstack")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_callstack")
+
+
+# ============== Variables Tools ==============
+
+@mcp.tool()
+async def get_locals() -> str:
+    """
+    获取当前栈帧的所有局部变量和参数，包含变量名、类型和当前值。
+    """
+    try:
+        result = await vs_bridge.call("get_locals")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_locals")
+
+
+@mcp.tool()
+async def evaluate_expression(
+    expression: str,
+    expand_children: bool = False,
+    max_depth: int = 2
+) -> str:
+    """
+    在当前调试上下文中求值任意表达式。可以获取变量的地址、计算偏移量、访问结构成员等。
+    对于指针和数值类型会同时返回十进制和十六进制值。
+    
+    Args:
+        expression: 要求值的表达式，如：&myVariable、myPointer->field、sizeof(MyStruct)、(int*)0x1234
+        expand_children: 是否展开对象的子成员，默认false
+        max_depth: 展开子成员的最大深度，默认2
+    """
+    try:
+        result = await vs_bridge.call("evaluate_expression", {
+            "expression": expression,
+            "expandChildren": expand_children,
+            "maxDepth": max_depth
+        })
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "evaluate_expression")
+
+
+# ============== Thread Tools ==============
+
+@mcp.tool()
+async def get_threads() -> str:
+    """
+    获取调试进程中所有线程的信息，包括线程ID、名称、状态和当前位置。
+    """
+    try:
+        result = await vs_bridge.call("get_threads")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_threads")
+
+
+# ============== Module Tools ==============
+
+@mcp.tool()
+async def get_modules() -> str:
+    """
+    获取调试进程中已加载的所有模块/程序集信息。
+    """
+    try:
+        result = await vs_bridge.call("get_modules")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_modules")
+
+
+# ============== Exception Tools ==============
+
+@mcp.tool()
+async def get_exception() -> str:
+    """
+    获取当前异常的详细信息，包括异常类型、消息、堆栈跟踪和内部异常。
+    """
+    try:
+        result = await vs_bridge.call("get_exception")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_exception")
+
+
+# ============== Memory Tools ==============
+
+@mcp.tool()
+async def read_memory(address: str, size: int = 256) -> str:
+    """
+    读取指定内存地址的原始字节数据。用于分析内存布局、检查数据结构、排查内存损坏问题。
+    返回十六进制转储、ASCII视图和格式化的内存视图。地址可以是十六进制或变量表达式。
+    
+    Args:
+        address: 内存地址，支持十六进制（如0x7ff61234）或表达式（如&myVariable、myPointer）
+        size: 要读取的字节数，默认256，最大4096
+    """
+    # Clamp size
+    size = max(1, min(size, 4096))
+    
+    try:
+        result = await vs_bridge.call("read_memory", {
+            "address": address,
+            "size": size
+        })
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "read_memory")
+
+
+# ============== Disassembly Tools ==============
+
+@mcp.tool()
+async def get_disassembly(lines_before: int = 20, lines_after: int = 20) -> str:
+    """
+    获取当前断点/暂停位置附近的反汇编代码。用于分析底层机器指令、排查优化代码问题、理解编译器生成的代码。
+    返回汇编指令、机器码和对应的内存地址。
+    
+    Args:
+        lines_before: 当前指令之前要显示的行数，默认20
+        lines_after: 当前指令之后要显示的行数，默认20
+    """
+    try:
+        result = await vs_bridge.call("get_disassembly", {
+            "linesBefore": lines_before,
+            "linesAfter": lines_after
+        })
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_disassembly")
+
+
+@mcp.tool()
+async def get_disassembly_at(address: str, count: int = 50) -> str:
+    """
+    获取指定内存地址处的反汇编代码。可以用于查看特定函数或代码段的汇编指令。
+    地址可以是十六进制格式（如0x7ff61234）或表达式（如&myFunction）。
+    
+    Args:
+        address: 起始内存地址，支持十六进制（如0x7ff61234）或表达式（如&myFunction）
+        count: 要获取的指令数量，默认50
+    """
+    try:
+        result = await vs_bridge.call("get_disassembly_at", {
+            "address": address,
+            "count": count
+        })
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_disassembly_at")
+
+
+# ============== Build Error Tools ==============
+
+@mcp.tool()
+async def get_build_errors() -> str:
+    """
+    获取Visual Studio Error List中的所有编译错误和警告，包含错误代码（如CS0001）、文件路径、行号和详细描述。
+    Cursor可以根据返回的文件路径自动读取相关代码并帮助修复。
+    """
+    try:
+        result = await vs_bridge.call("get_build_errors")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_build_errors")
+
+
+@mcp.tool()
+async def get_errors_only() -> str:
+    """
+    仅获取编译错误（不包括警告）。
+    """
+    try:
+        result = await vs_bridge.call("get_errors_only")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_errors_only")
+
+
+@mcp.tool()
+async def get_warnings_only() -> str:
+    """
+    仅获取编译警告（不包括错误）。
+    """
+    try:
+        result = await vs_bridge.call("get_warnings_only")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_warnings_only")
+
+
+# ============== Output Window Tools ==============
+
+@mcp.tool()
+async def get_debug_output(
+    pane: str = "Debug",
+    tail_lines: int = 50
+) -> str:
+    """
+    获取Visual Studio Output窗口的内容。用于查看调试输出、构建日志、程序输出等。
+    默认返回最后50行以避免内容过多。
+    
+    Args:
+        pane: 输出面板名称，如 "Debug"（调试输出）, "Build"（构建日志）, "General" 等。默认为 "Debug"
+        tail_lines: 返回最后N行，0表示返回全部。默认50行
+    """
+    try:
+        result = await vs_bridge.call("get_output_window", {
+            "pane": pane,
+            "tailLines": tail_lines
+        })
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_debug_output")
+
+
+@mcp.tool()
+async def search_output(
+    pattern: str,
+    pane: str = "Debug",
+    is_regex: bool = False,
+    context_lines: int = 2,
+    max_matches: int = 20
+) -> str:
+    """
+    在Visual Studio Output窗口中搜索指定模式。可用于查找特定错误、检查执行状态、定位关键输出等。
+    
+    Args:
+        pattern: 搜索模式（字符串或正则表达式）
+        pane: 输出面板名称，默认 "Debug"
+        is_regex: 是否使用正则表达式匹配，默认False（普通字符串匹配，不区分大小写）
+        context_lines: 每个匹配结果显示的上下文行数，默认2
+        max_matches: 最大返回匹配数，默认20
+    """
+    try:
+        result = await vs_bridge.call("search_output", {
+            "pattern": pattern,
+            "pane": pane,
+            "isRegex": is_regex,
+            "contextLines": context_lines,
+            "maxMatches": max_matches
+        })
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "search_output")
+
+
+# ============== Full Context Tools ==============
+
+@mcp.tool()
+async def get_full_context() -> str:
+    """
+    一次性获取所有调试上下文信息，包括状态、堆栈、变量、异常、线程和模块。
+    当你需要完整分析调试现场时使用此工具。
+    """
+    try:
+        result = await vs_bridge.call("get_full_context")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_full_context")
+
+
+# ============== Debug Control Tools ==============
+
+@mcp.tool()
+async def debug_continue() -> str:
+    """
+    继续执行程序直到下一个断点或程序结束 (F5)。
+    返回执行后的新状态。
+    """
+    try:
+        result = await vs_bridge.call("continue")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "continue")
+
+
+@mcp.tool()
+async def debug_step_over() -> str:
+    """
+    单步跳过当前行 (F10)，不进入函数内部。
+    返回执行后的新位置信息。
+    """
+    try:
+        result = await vs_bridge.call("step_over")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "step_over")
+
+
+@mcp.tool()
+async def debug_step_into() -> str:
+    """
+    单步进入当前行的函数 (F11)。
+    返回执行后的新位置信息。
+    """
+    try:
+        result = await vs_bridge.call("step_into")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "step_into")
+
+
+@mcp.tool()
+async def debug_step_out() -> str:
+    """
+    单步跳出当前函数 (Shift+F11)，执行到调用方。
+    返回执行后的新位置信息。
+    """
+    try:
+        result = await vs_bridge.call("step_out")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "step_out")
+
+
+@mcp.tool()
+async def debug_break() -> str:
+    """
+    中断正在运行的程序 (Ctrl+Alt+Break)。
+    仅在程序运行状态下有效。
+    """
+    try:
+        result = await vs_bridge.call("break")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "break")
+
+
+@mcp.tool()
+async def debug_stop() -> str:
+    """
+    停止调试会话 (Shift+F5)。
+    """
+    try:
+        result = await vs_bridge.call("stop")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "stop")
+
+
+@mcp.tool()
+async def debug_run_to_cursor(file_path: str, line_number: int) -> str:
+    """
+    运行程序到指定的文件和行号位置。
+    
+    Args:
+        file_path: 目标文件的完整路径
+        line_number: 目标行号
+    """
+    try:
+        result = await vs_bridge.call("run_to_cursor", {
+            "filePath": file_path,
+            "lineNumber": line_number
+        })
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "run_to_cursor")
+
+
+@mcp.tool()
+async def debug_set_next_statement(file_path: str, line_number: int) -> str:
+    """
+    设置下一条要执行的语句（移动指令指针）。
+    警告：这可能导致程序行为异常，谨慎使用。
+    
+    Args:
+        file_path: 目标文件的完整路径
+        line_number: 目标行号
+    """
+    try:
+        result = await vs_bridge.call("set_next_statement", {
+            "filePath": file_path,
+            "lineNumber": line_number
+        })
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "set_next_statement")
+
+
+# ============== Breakpoint Tools ==============
+
+@mcp.tool()
+async def get_breakpoints() -> str:
+    """
+    获取所有已设置的断点列表，包括文件断点、函数断点和条件断点。
+    返回断点位置、条件、命中次数等详细信息。
+    """
+    try:
+        result = await vs_bridge.call("get_breakpoints")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_breakpoints")
+
+
+@mcp.tool()
+async def set_breakpoint(
+    file_path: str,
+    line_number: int,
+    condition: str = None
+) -> str:
+    """
+    在指定文件的指定行设置断点。
+    
+    Args:
+        file_path: 源文件的完整路径
+        line_number: 要设置断点的行号
+        condition: 可选的条件表达式，当条件为true时才触发断点
+    """
+    try:
+        params = {
+            "filePath": file_path,
+            "lineNumber": line_number
+        }
+        if condition:
+            params["condition"] = condition
+        result = await vs_bridge.call("set_breakpoint", params)
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "set_breakpoint")
+
+
+@mcp.tool()
+async def set_function_breakpoint(
+    function_name: str,
+    condition: str = None
+) -> str:
+    """
+    在指定函数入口设置断点。适用于不知道确切文件位置的情况。
+    
+    Args:
+        function_name: 函数名（可包含类名，如 MyClass::MyMethod 或 MyNamespace.MyClass.MyMethod）
+        condition: 可选的条件表达式
+    """
+    try:
+        params = {"functionName": function_name}
+        if condition:
+            params["condition"] = condition
+        result = await vs_bridge.call("set_function_breakpoint", params)
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "set_function_breakpoint")
+
+
+@mcp.tool()
+async def delete_breakpoint(file_path: str, line_number: int) -> str:
+    """
+    删除指定位置的断点。
+    
+    Args:
+        file_path: 源文件的完整路径
+        line_number: 断点所在行号
+    """
+    try:
+        result = await vs_bridge.call("delete_breakpoint", {
+            "filePath": file_path,
+            "lineNumber": line_number
+        })
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "delete_breakpoint")
+
+
+@mcp.tool()
+async def delete_all_breakpoints() -> str:
+    """
+    删除所有断点。谨慎使用。
+    """
+    try:
+        result = await vs_bridge.call("delete_all_breakpoints")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "delete_all_breakpoints")
+
+
+@mcp.tool()
+async def enable_breakpoint(
+    file_path: str,
+    line_number: int,
+    enabled: bool = True
+) -> str:
+    """
+    启用或禁用指定位置的断点。禁用的断点保留但不触发。
+    
+    Args:
+        file_path: 源文件的完整路径
+        line_number: 断点所在行号
+        enabled: True启用，False禁用
+    """
+    try:
+        result = await vs_bridge.call("enable_breakpoint", {
+            "filePath": file_path,
+            "lineNumber": line_number,
+            "enabled": enabled
+        })
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "enable_breakpoint")
+
+
+# ============== Navigation Tools ==============
+
+@mcp.tool()
+async def switch_stack_frame(frame_index: int) -> str:
+    """
+    切换到调用堆栈中的指定帧，以查看该层级的局部变量和上下文。
+    使用 get_callstack 获取帧索引。
+    
+    Args:
+        frame_index: 栈帧索引（0为当前帧，越大越靠近调用起点）
+    """
+    try:
+        result = await vs_bridge.call("switch_stack_frame", {
+            "frameIndex": frame_index
+        })
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "switch_stack_frame")
+
+
+@mcp.tool()
+async def switch_thread(thread_id: int) -> str:
+    """
+    切换到指定线程以查看其调用堆栈和变量。
+    使用 get_threads 获取线程ID。
+    
+    Args:
+        thread_id: 目标线程的ID
+    """
+    try:
+        result = await vs_bridge.call("switch_thread", {
+            "threadId": thread_id
+        })
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "switch_thread")
+
+
+# ============== Register Tools ==============
+
+@mcp.tool()
+async def get_registers() -> str:
+    """
+    获取CPU寄存器值（RAX, RBX, RCX, RDX, RSP, RBP, RIP, RFLAGS等）。
+    用于底层调试和分析。包括通用寄存器、段寄存器和XMM寄存器。
+    """
+    try:
+        result = await vs_bridge.call("get_registers")
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "get_registers")
+
+
+# ============== Watch Tools ==============
+
+@mcp.tool()
+async def add_watch(expression: str) -> str:
+    """
+    添加一个监视表达式到VS的Watch窗口，并返回当前值。
+    
+    Args:
+        expression: 要监视的表达式
+    """
+    try:
+        result = await vs_bridge.call("add_watch", {
+            "expression": expression
+        })
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "add_watch")
+
+
+# ============== Memory Search Tools ==============
+
+@mcp.tool()
+async def search_memory(
+    start_address: str,
+    pattern: str,
+    max_results: int = 100,
+    search_size: int = 0x10000
+) -> str:
+    """
+    在内存中搜索指定模式。可用于查找特定数据或字符串。
+    
+    Args:
+        start_address: 搜索起始地址（十六进制如0x7ff61234或表达式如&myVar）
+        pattern: 搜索模式，可以是十六进制字节(如"4D 5A")或ASCII字符串
+        max_results: 最大返回结果数，默认100
+        search_size: 搜索范围大小（字节），默认64KB
+    """
+    try:
+        result = await vs_bridge.call("search_memory", {
+            "startAddress": start_address,
+            "pattern": pattern,
+            "maxResults": max_results,
+            "searchSize": search_size
+        })
+        return format_result(result)
+    except vs_bridge.VSBridgeError as e:
+        return handle_vs_error(e, "search_memory")
+
+
+# ============== Main Entry Point ==============
+
+if __name__ == "__main__":
+    # Run the server using stdio transport
+    mcp.run(transport="stdio")
