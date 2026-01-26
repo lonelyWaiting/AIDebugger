@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Pipes;
 using System.Runtime.Serialization.Json;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -107,12 +109,31 @@ namespace VSDebuggerMCP
 
                 try
                 {
+                    // Create pipe security that allows access from non-admin processes
+                    // This is critical when VS runs as admin but Cursor runs as normal user
+                    var pipeSecurity = new PipeSecurity();
+                    
+                    // Allow Everyone to read/write (for cross-privilege-level communication)
+                    pipeSecurity.AddAccessRule(new PipeAccessRule(
+                        new SecurityIdentifier(WellKnownSidType.WorldSid, null),
+                        PipeAccessRights.ReadWrite | PipeAccessRights.CreateNewInstance,
+                        AccessControlType.Allow));
+                    
+                    // Also allow the current user full control
+                    pipeSecurity.AddAccessRule(new PipeAccessRule(
+                        WindowsIdentity.GetCurrent().User,
+                        PipeAccessRights.FullControl,
+                        AccessControlType.Allow));
+
                     pipeServer = new NamedPipeServerStream(
                         _pipeName,
                         PipeDirection.InOut,
                         MaxConnections,
                         PipeTransmissionMode.Byte,
-                        PipeOptions.Asynchronous);
+                        PipeOptions.Asynchronous,
+                        inBufferSize: 4096,
+                        outBufferSize: 4096,
+                        pipeSecurity: pipeSecurity);
 
                     _log("Waiting for client connection...");
 

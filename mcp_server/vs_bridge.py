@@ -158,16 +158,23 @@ def _discover_vs_pipes() -> List[str]:
 
 def _sync_call_to_pipe(pipe_name: str, method: str, params: Optional[Dict[str, Any]], timeout: float = 5.0) -> Any:
     """Synchronous call to a specific named pipe."""
-    kernel32 = ctypes.windll.kernel32
+    # Use WinDLL with use_last_error=True to properly capture Windows error codes
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
     
     # Constants for CreateFileW
     GENERIC_READ = 0x80000000
     GENERIC_WRITE = 0x40000000
     OPEN_EXISTING = 3
     FILE_ATTRIBUTE_NORMAL = 0x80
-    INVALID_HANDLE_VALUE = -1
     
     full_pipe_name = f"\\\\.\\pipe\\{pipe_name}"
+    
+    # Set proper return type for 64-bit compatibility
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE
+    ]
     
     # Open the pipe (synchronous mode)
     handle = kernel32.CreateFileW(
@@ -180,11 +187,13 @@ def _sync_call_to_pipe(pipe_name: str, method: str, params: Optional[Dict[str, A
         None
     )
     
-    if handle == INVALID_HANDLE_VALUE or handle == 0xFFFFFFFF:
+    # Check for invalid handle (works correctly on both 32-bit and 64-bit)
+    INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+    if handle == INVALID_HANDLE_VALUE:
         error = ctypes.get_last_error()
         error_messages = {
             2: f"Named pipe '{pipe_name}' not found.",
-            5: "Access denied to named pipe.",
+            5: "Access denied to named pipe. VS may be running as admin while Python is not.",
             231: "All pipe instances are busy. Try again later.",
         }
         msg = error_messages.get(error, f"Unknown error code: {error}")
