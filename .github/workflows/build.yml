@@ -3,6 +3,7 @@ name: Build VSIX
 on:
   push:
     branches: [ master, main ]
+    tags: [ 'v*' ]
   pull_request:
     branches: [ master, main ]
   workflow_dispatch:
@@ -24,6 +25,26 @@ jobs:
     - name: Restore NuGet packages
       run: nuget restore VSDebuggerMCP/VSDebuggerMCP.csproj
 
+    - name: Update version number
+      shell: pwsh
+      run: |
+        $version = "1.0.${{ github.run_number }}"
+        $assemblyVersion = "1.0.${{ github.run_number }}.0"
+        Write-Host "Setting version to $version"
+        
+        # Update source.extension.vsixmanifest
+        $manifestPath = "VSDebuggerMCP/source.extension.vsixmanifest"
+        $manifest = Get-Content $manifestPath -Raw
+        $manifest = $manifest -replace 'Version="1\.0"', "Version=`"$version`""
+        Set-Content $manifestPath $manifest -NoNewline
+        
+        # Update AssemblyInfo.cs
+        $assemblyInfoPath = "VSDebuggerMCP/Properties/AssemblyInfo.cs"
+        $assemblyInfo = Get-Content $assemblyInfoPath -Raw
+        $assemblyInfo = $assemblyInfo -replace 'AssemblyVersion\("1\.0\.0\.0"\)', "AssemblyVersion(`"$assemblyVersion`")"
+        $assemblyInfo = $assemblyInfo -replace 'AssemblyFileVersion\("1\.0\.0\.0"\)', "AssemblyFileVersion(`"$assemblyVersion`")"
+        Set-Content $assemblyInfoPath $assemblyInfo -NoNewline
+
     - name: Build VSIX (Release)
       run: msbuild VSDebuggerMCP/VSDebuggerMCP.csproj /p:Configuration=Release /p:DeployExtension=false
 
@@ -33,3 +54,10 @@ jobs:
         name: VSDebuggerMCP-VSIX
         path: VSDebuggerMCP/bin/Release/VSDebuggerMCP.vsix
         if-no-files-found: error
+
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: VSDebuggerMCP/bin/Release/VSDebuggerMCP.vsix
+        generate_release_notes: true
