@@ -15,7 +15,7 @@ import re
 
 logger = logging.getLogger(__name__)
 
-PIPE_NAME_PREFIX = r"\\.\pipe\VSDebuggerMCP"
+PIPE_NAME_PREFIX = r"\\.\pipe\AIDebuggerVS"
 DEFAULT_TIMEOUT = 10.0  # seconds
 
 
@@ -49,7 +49,7 @@ class VSInstance:
             self.vs_version = info.get("vsVersion", "")
         
         # If process_id is still 0, try to extract from pipe name
-        if self.process_id == 0 and pipe_name.startswith("VSDebuggerMCP_"):
+        if self.process_id == 0 and pipe_name.startswith("AIDebuggerVS_"):
             try:
                 self.process_id = int(pipe_name.split("_")[1])
             except (ValueError, IndexError):
@@ -76,7 +76,7 @@ class VSInstance:
 def _discover_vs_pipes() -> List[str]:
     """
     Discover all VS Debugger MCP named pipes.
-    Returns list of pipe names like ['VSDebuggerMCP_1234', 'VSDebuggerMCP_5678']
+    Returns list of pipe names like ['AIDebuggerVS_1234', 'AIDebuggerVS_5678']
     """
     import os
     
@@ -87,7 +87,7 @@ def _discover_vs_pipes() -> List[str]:
     try:
         all_pipes = os.listdir(pipe_dir)
         for pipe_name in all_pipes:
-            if pipe_name.startswith("VSDebuggerMCP_"):
+            if pipe_name.startswith("AIDebuggerVS_"):
                 pipes.append(pipe_name)
         if pipes:
             logger.debug(f"Found pipes via os.listdir: {pipes}")
@@ -124,7 +124,7 @@ def _discover_vs_pipes() -> List[str]:
         kernel32.FindClose.argtypes = [wintypes.HANDLE]
         
         handle = kernel32.FindFirstFileW(
-            r"\\.\pipe\VSDebuggerMCP_*",
+            r"\\.\pipe\AIDebuggerVS_*",
             ctypes.byref(find_data)
         )
         
@@ -137,7 +137,7 @@ def _discover_vs_pipes() -> List[str]:
         try:
             while True:
                 pipe_name = find_data.cFileName
-                if pipe_name and pipe_name.startswith("VSDebuggerMCP_"):
+                if pipe_name and pipe_name.startswith("AIDebuggerVS_"):
                     if pipe_name not in pipes:  # Avoid duplicates
                         pipes.append(pipe_name)
                 
@@ -322,11 +322,11 @@ class VSBridge:
         Select a specific VS instance to communicate with.
         
         Args:
-            pipe_name: Full pipe name (e.g., 'VSDebuggerMCP_1234')
+            pipe_name: Full pipe name (e.g., 'AIDebuggerVS_1234')
             process_id: VS process ID (will be converted to pipe name)
         """
         if process_id is not None:
-            self._selected_pipe = f"VSDebuggerMCP_{process_id}"
+            self._selected_pipe = f"AIDebuggerVS_{process_id}"
         elif pipe_name is not None:
             self._selected_pipe = pipe_name
         else:
@@ -403,7 +403,7 @@ class VSBridge:
                     raise VSBridgeError(
                         "No Visual Studio instances found. Please ensure:\n"
                         "1. Visual Studio is running\n"
-                        "2. VSDebuggerMCP extension is installed and enabled\n"
+                        "2. AIDebuggerVS extension is installed and enabled\n"
                         "3. The extension has loaded (may need to restart VS)"
                     )
                 
@@ -480,7 +480,7 @@ def select_instance(pipe_name: Optional[str] = None, process_id: Optional[int] =
     Select a specific VS instance to use.
     
     Args:
-        pipe_name: Full pipe name (e.g., 'VSDebuggerMCP_1234')
+        pipe_name: Full pipe name (e.g., 'AIDebuggerVS_1234')
         process_id: VS process ID
     """
     bridge = get_bridge()

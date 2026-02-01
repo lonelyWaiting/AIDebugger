@@ -1,5 +1,5 @@
-# VS Debugger MCP Server - Python Dependencies
-# These packages are automatically installed by the VS extension
-# You can also install them manually with: pip install -r requirements.txt
+# AIDebugger MCP Server - Python Dependencies
+# Dependencies are bundled with the extensions (no pip install required).
+# This file is only for manual development setups: pip install -r requirements.txt
 
 mcp>=1.0.0

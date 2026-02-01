@@ -1,26 +1,30 @@
 """
-Visual Studio Debugger MCP Server
+IDE Debugger MCP Server
 
 This MCP server provides tools for Cursor to access debugging information
-from Visual Studio, including call stacks, variables, memory, and more.
+from Visual Studio and Rider, including call stacks, variables, memory, and more.
 
-Supports multiple VS instances with automatic discovery and smart selection:
-- If only one VS instance is in debugging/paused state, it will be auto-selected
-- Use list_vs_instances to see all available VS instances
-- Use select_vs_instance to choose a specific instance
+Supports multiple IDE instances with automatic discovery and smart selection:
+- If only one instance is in debugging/paused state, it will be auto-selected
+- Use list_ide_instances to see all available instances
+- Use select_ide_instance to choose a specific instance
 """
 
 import sys
 import json
 from typing import Any, Dict, Optional
 
+import bootstrap
+
+bootstrap.ensure_deps()
+
 # Use FastMCP for easy tool registration
 from mcp.server.fastmcp import FastMCP
 
-import vs_bridge
+import ide_bridge
 
 # Create MCP server instance using FastMCP
-mcp = FastMCP("vs-debugger")
+mcp = FastMCP("AIDebugger")
 
 
 def format_result(result: Any) -> str:
@@ -30,18 +34,29 @@ def format_result(result: Any) -> str:
     return str(result)
 
 
-def handle_vs_error(e: Exception, operation: str) -> str:
-    """Handle VS bridge errors and return user-friendly message."""
+def handle_ide_error(e: Exception, operation: str) -> str:
+    """Handle IDE bridge errors and return user-friendly message."""
     error_msg = str(e)
-    if "No Visual Studio instances found" in error_msg:
-        return f"未找到Visual Studio实例。请确保：\n1. Visual Studio已启动\n2. VSDebuggerMCP扩展已安装并启用\n3. 扩展已正确加载（可能需要重启VS）"
-    if "Multiple VS instances found" in error_msg:
+    if "No IDE instances found" in error_msg:
+        return (
+            "未找到IDE实例。请确保：\n"
+            "1. Visual Studio 或 Rider 已启动\n"
+            "2. 对应的插件已安装并启用\n"
+            "3. 插件已正确加载（可能需要重启IDE）"
+        )
+    if "Preferred IDE" in error_msg:
+        return f"Preferred IDE constraint: {error_msg}"
+    if "Multiple IDE instances found" in error_msg:
         return error_msg  # Already formatted with instance list
     if "Failed to connect" in error_msg:
-        return f"无法连接到Visual Studio。请确保：\n1. Visual Studio已启动\n2. VSDebuggerMCP扩展已安装并启用\n3. 扩展已正确加载（可能需要重启VS）\n\n错误详情: {error_msg}"
+        return (
+            "无法连接到IDE。请确保：\n"
+            "1. Visual Studio 或 Rider 已启动\n"
+            "2. 对应的插件已安装并启用\n"
+            "3. 插件已正确加载（可能需要重启IDE）\n\n"
+            f"错误详情: {error_msg}"
+        )
     return f"执行 {operation} 时出错: {error_msg}"
-
-
 # ============== Instance Management Tools ==============
 
 @mcp.tool()
@@ -52,10 +67,10 @@ async def list_vs_instances() -> str:
     当有多个VS实例时，使用此工具查看所有实例，然后用select_vs_instance选择要操作的实例。
     """
     try:
-        instances = await vs_bridge.discover_instances()
+        instances = [i for i in await ide_bridge.discover_instances() if i.ide == "vs"]
         
         if not instances:
-            return "未找到任何Visual Studio实例。请确保VS已启动且VSDebuggerMCP扩展已加载。"
+            return "未找到任何Visual Studio实例。请确保VS已启动且AIDebugger扩展已加载。"
         
         result = {
             "instanceCount": len(instances),
@@ -82,8 +97,135 @@ async def list_vs_instances() -> str:
             result["autoSelected"] = f"自动选择了唯一的实例 (PID: {instances[0].process_id})"
         
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "list_vs_instances")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "list_vs_instances")
+
+
+@mcp.tool()
+async def list_ide_instances() -> str:
+    """
+    列出所有可用的IDE实例（Visual Studio + Rider）及其状态。
+    """
+    try:
+        instances = await ide_bridge.discover_instances()
+
+        if not instances:
+            return "未找到任何IDE实例。请确保Visual Studio或Rider已启动且插件已加载。"
+
+        result = {
+            "instanceCount": len(instances),
+            "instances": [inst.to_dict() for inst in instances],
+            "hint": "使用 select_ide_instance 选择要操作的实例（通过 ide + process_id 参数）"
+        }
+
+        paused = [i for i in instances if i.is_paused]
+        debugging = [i for i in instances if i.is_debugging and not i.is_paused]
+        idle = [i for i in instances if not i.is_debugging]
+
+        result["summary"] = {
+            "paused": len(paused),
+            "debugging": len(debugging),
+            "idle": len(idle)
+        }
+
+        if len(paused) == 1:
+            result["autoSelected"] = (
+                f"自动选择了唯一处于断点暂停状态的实例 ({paused[0].ide.upper()} PID: {paused[0].process_id})"
+            )
+        elif len(debugging) == 1 and len(paused) == 0:
+            result["autoSelected"] = (
+                f"自动选择了唯一正在调试的实例 ({debugging[0].ide.upper()} PID: {debugging[0].process_id})"
+            )
+        elif len(instances) == 1:
+            result["autoSelected"] = (
+                f"自动选择了唯一的实例 ({instances[0].ide.upper()} PID: {instances[0].process_id})"
+            )
+
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "list_ide_instances")
+
+
+@mcp.tool()
+async def detect_debug_sessions(prefer_ide: Optional[str] = None, select: bool = True) -> str:
+    """
+    检测是否存在 VS / Rider 调试现场，并根据规则自动选择最合适的实例。
+
+    Args:
+        prefer_ide: 可选，优先使用的 IDE（"vs" 或 "rider"）
+        select: 是否自动选择匹配的实例（默认 true）
+    """
+    try:
+        instances = await ide_bridge.discover_instances()
+
+        if not instances:
+            return "未找到任何IDE实例。请确保 Visual Studio 或 Rider 已启动且扩展已加载。"
+
+        bridge = ide_bridge.get_bridge()
+        candidates, resolved_preferred = bridge.get_candidate_instances(instances, preferred_ide=prefer_ide)
+        selected = bridge.auto_select_instance(candidates, preferred_ide=resolved_preferred)
+
+        result = {
+            "instanceCount": len(candidates),
+            "instances": [inst.to_dict() for inst in candidates],
+            "preferredIde": resolved_preferred or bridge.get_preferred_ide(),
+        }
+
+        if selected is not None:
+            if select:
+                ide_bridge.select_instance(ide=selected.ide, pipe_name=selected.pipe_name)
+            result["autoSelected"] = selected.to_dict()
+            result["selected"] = select
+        else:
+            result["autoSelected"] = None
+            result["selected"] = False
+            result["message"] = "发现多个实例且无法自动选择，请使用 list_ide_instances + select_ide_instance 进行选择。"
+
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "detect_debug_sessions")
+
+
+@mcp.tool()
+async def select_ide_instance(ide: str, process_id: int) -> str:
+    """
+    选择要操作的IDE实例（ide=vs|rider）。
+    """
+    try:
+        ide_key = (ide or "").lower()
+        if ide_key not in ("vs", "rider"):
+            return "ide 参数必须是 'vs' 或 'rider'"
+
+        instances = [i for i in await ide_bridge.discover_instances() if i.ide == ide_key]
+
+        if not instances:
+            return f"未找到 {ide} 实例。"
+
+        target = next((i for i in instances if i.process_id == process_id), None)
+        if target is None:
+            available = ", ".join([str(i.process_id) for i in instances if i.process_id != 0])
+            return f"未找到进程ID为 {process_id} 的 {ide} 实例。可用实例: {available if available else '无'}"
+
+        ide_bridge.select_instance(ide=ide_key, pipe_name=target.pipe_name)
+
+        result = {
+            "success": True,
+            "message": f"已选择 {ide} 实例",
+            "selectedInstance": target.to_dict()
+        }
+
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "select_ide_instance")
+
+
+@mcp.tool()
+async def clear_ide_selection() -> str:
+    """
+    清除已选择的IDE实例，恢复自动选择模式。
+    """
+    ide_bridge.clear_selection()
+    return "已清除IDE实例选择，恢复自动选择模式。"
 
 
 @mcp.tool()
@@ -96,10 +238,10 @@ async def select_vs_instance(process_id: int) -> str:
     """
     try:
         # Discover instances
-        instances = await vs_bridge.discover_instances()
+        instances = [i for i in await ide_bridge.discover_instances() if i.ide == "vs"]
         
         # Build pipe name from process_id
-        target_pipe = f"VSDebuggerMCP_{process_id}"
+        target_pipe = f"AIDebuggerVS_{process_id}"
         
         # Find the instance - match by process_id OR by pipe name containing the PID
         target = None
@@ -121,7 +263,7 @@ async def select_vs_instance(process_id: int) -> str:
             for inst in instances:
                 if inst.process_id != 0:
                     available_pids.append(str(inst.process_id))
-                elif inst.pipe_name.startswith("VSDebuggerMCP_"):
+                elif inst.pipe_name.startswith("AIDebuggerVS_"):
                     try:
                         pid = int(inst.pipe_name.split("_")[1])
                         available_pids.append(str(pid))
@@ -131,7 +273,7 @@ async def select_vs_instance(process_id: int) -> str:
             return f"未找到进程ID为 {process_id} 的VS实例。可用的实例: {available if available else '无'}"
         
         # Select using pipe name directly (more reliable)
-        vs_bridge.select_instance(pipe_name=target_pipe)
+        ide_bridge.select_instance(ide="vs", pipe_name=target_pipe)
         
         result = {
             "success": True,
@@ -140,8 +282,8 @@ async def select_vs_instance(process_id: int) -> str:
         }
         
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "select_vs_instance")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "select_vs_instance")
 
 
 @mcp.tool()
@@ -154,7 +296,7 @@ async def clear_vs_selection() -> str:
     3. 如果只有一个实例，自动使用它
     4. 否则需要手动选择
     """
-    vs_bridge.clear_selection()
+    ide_bridge.clear_selection()
     return "已清除VS实例选择，恢复自动选择模式。"
 
 
@@ -168,10 +310,10 @@ async def get_debug_status() -> str:
     **触发场景**: 当用户提到"调试"、"debug"、"断点"、"breakpoint"、"VS"、"Visual Studio"时，优先调用此工具了解当前状态。
     """
     try:
-        result = await vs_bridge.call("get_debug_status")
+        result = await ide_bridge.call("get_debug_status")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_debug_status")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_debug_status")
 
 
 # ============== Call Stack Tools ==============
@@ -185,10 +327,10 @@ async def get_callstack() -> str:
     **触发场景**: 当用户询问"怎么执行到这里的"、"调用链"、"堆栈"、"callstack"、"函数调用顺序"时调用此工具。
     """
     try:
-        result = await vs_bridge.call("get_callstack")
+        result = await ide_bridge.call("get_callstack")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_callstack")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_callstack")
 
 
 # ============== Variables Tools ==============
@@ -201,10 +343,10 @@ async def get_locals() -> str:
     **触发场景**: 当用户询问"变量值是什么"、"参数是多少"、"局部变量"、"当前状态"时调用此工具。
     """
     try:
-        result = await vs_bridge.call("get_locals")
+        result = await ide_bridge.call("get_locals")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_locals")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_locals")
 
 
 @mcp.tool()
@@ -225,14 +367,14 @@ async def evaluate_expression(
         max_depth: 展开子成员的最大深度，默认2
     """
     try:
-        result = await vs_bridge.call("evaluate_expression", {
+        result = await ide_bridge.call("evaluate_expression", {
             "expression": expression,
             "expandChildren": expand_children,
             "maxDepth": max_depth
         })
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "evaluate_expression")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "evaluate_expression")
 
 
 # ============== Thread Tools ==============
@@ -245,10 +387,10 @@ async def get_threads() -> str:
     **触发场景**: 当用户提到"线程"、"thread"、"多线程"、"并发"、"死锁"时调用此工具。
     """
     try:
-        result = await vs_bridge.call("get_threads")
+        result = await ide_bridge.call("get_threads")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_threads")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_threads")
 
 
 # ============== Module Tools ==============
@@ -259,10 +401,10 @@ async def get_modules() -> str:
     获取调试进程中已加载的所有模块/程序集信息。
     """
     try:
-        result = await vs_bridge.call("get_modules")
+        result = await ide_bridge.call("get_modules")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_modules")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_modules")
 
 
 # ============== Exception Tools ==============
@@ -275,10 +417,10 @@ async def get_exception() -> str:
     **触发场景**: 当用户提到"崩溃"、"crash"、"异常"、"exception"、"报错"、"出错了"、"抛异常"时，优先调用此工具。
     """
     try:
-        result = await vs_bridge.call("get_exception")
+        result = await ide_bridge.call("get_exception")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_exception")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_exception")
 
 
 # ============== Memory Tools ==============
@@ -299,13 +441,13 @@ async def read_memory(address: str, size: int = 256) -> str:
     size = max(1, min(size, 4096))
     
     try:
-        result = await vs_bridge.call("read_memory", {
+        result = await ide_bridge.call("read_memory", {
             "address": address,
             "size": size
         })
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "read_memory")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "read_memory")
 
 
 # ============== Disassembly Tools ==============
@@ -323,13 +465,13 @@ async def get_disassembly(lines_before: int = 20, lines_after: int = 20) -> str:
         lines_after: 当前指令之后要显示的行数，默认20
     """
     try:
-        result = await vs_bridge.call("get_disassembly", {
+        result = await ide_bridge.call("get_disassembly", {
             "linesBefore": lines_before,
             "linesAfter": lines_after
         })
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_disassembly")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_disassembly")
 
 
 @mcp.tool()
@@ -343,13 +485,13 @@ async def get_disassembly_at(address: str, count: int = 50) -> str:
         count: 要获取的指令数量，默认50
     """
     try:
-        result = await vs_bridge.call("get_disassembly_at", {
+        result = await ide_bridge.call("get_disassembly_at", {
             "address": address,
             "count": count
         })
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_disassembly_at")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_disassembly_at")
 
 
 # ============== Build Error Tools ==============
@@ -363,10 +505,10 @@ async def get_build_errors() -> str:
     **触发场景**: 当用户提到"编译错误"、"build error"、"构建失败"、"无法编译"、"语法错误"、"红色波浪线"时，优先调用此工具。
     """
     try:
-        result = await vs_bridge.call("get_build_errors")
+        result = await ide_bridge.call("get_build_errors")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_build_errors")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_build_errors")
 
 
 @mcp.tool()
@@ -375,10 +517,10 @@ async def get_errors_only() -> str:
     仅获取编译错误（不包括警告）。
     """
     try:
-        result = await vs_bridge.call("get_errors_only")
+        result = await ide_bridge.call("get_errors_only")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_errors_only")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_errors_only")
 
 
 @mcp.tool()
@@ -387,10 +529,10 @@ async def get_warnings_only() -> str:
     仅获取编译警告（不包括错误）。
     """
     try:
-        result = await vs_bridge.call("get_warnings_only")
+        result = await ide_bridge.call("get_warnings_only")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_warnings_only")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_warnings_only")
 
 
 # ============== Output Window Tools ==============
@@ -411,13 +553,13 @@ async def get_debug_output(
         tail_lines: 返回最后N行，0表示返回全部。默认50行
     """
     try:
-        result = await vs_bridge.call("get_output_window", {
+        result = await ide_bridge.call("get_output_window", {
             "pane": pane,
             "tailLines": tail_lines
         })
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_debug_output")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_debug_output")
 
 
 @mcp.tool()
@@ -439,7 +581,7 @@ async def search_output(
         max_matches: 最大返回匹配数，默认20
     """
     try:
-        result = await vs_bridge.call("search_output", {
+        result = await ide_bridge.call("search_output", {
             "pattern": pattern,
             "pane": pane,
             "isRegex": is_regex,
@@ -447,8 +589,8 @@ async def search_output(
             "maxMatches": max_matches
         })
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "search_output")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "search_output")
 
 
 # ============== Full Context Tools ==============
@@ -462,10 +604,10 @@ async def get_full_context() -> str:
     **触发场景**: 当用户说"帮我分析一下"、"看看发生了什么"、"调试现场"、"为什么会这样"等需要全面了解情况时调用此工具。
     """
     try:
-        result = await vs_bridge.call("get_full_context")
+        result = await ide_bridge.call("get_full_context")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_full_context")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_full_context")
 
 
 # ============== Debug Control Tools ==============
@@ -479,10 +621,10 @@ async def debug_continue() -> str:
     **触发场景**: 当用户说"继续"、"continue"、"运行"、"F5"、"执行下去"时调用此工具。
     """
     try:
-        result = await vs_bridge.call("continue")
+        result = await ide_bridge.call("continue")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "continue")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "continue")
 
 
 @mcp.tool()
@@ -494,10 +636,10 @@ async def debug_step_over() -> str:
     **触发场景**: 当用户说"单步"、"下一行"、"step over"、"F10"、"跳过这行"时调用此工具。
     """
     try:
-        result = await vs_bridge.call("step_over")
+        result = await ide_bridge.call("step_over")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "step_over")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "step_over")
 
 
 @mcp.tool()
@@ -509,10 +651,10 @@ async def debug_step_into() -> str:
     **触发场景**: 当用户说"进入函数"、"step into"、"F11"、"跟进去"时调用此工具。
     """
     try:
-        result = await vs_bridge.call("step_into")
+        result = await ide_bridge.call("step_into")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "step_into")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "step_into")
 
 
 @mcp.tool()
@@ -524,10 +666,10 @@ async def debug_step_out() -> str:
     **触发场景**: 当用户说"跳出函数"、"step out"、"Shift+F11"、"返回上层"时调用此工具。
     """
     try:
-        result = await vs_bridge.call("step_out")
+        result = await ide_bridge.call("step_out")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "step_out")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "step_out")
 
 
 @mcp.tool()
@@ -537,10 +679,10 @@ async def debug_break() -> str:
     仅在程序运行状态下有效。
     """
     try:
-        result = await vs_bridge.call("break")
+        result = await ide_bridge.call("break")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "break")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "break")
 
 
 @mcp.tool()
@@ -549,10 +691,10 @@ async def debug_stop() -> str:
     停止调试会话 (Shift+F5)。
     """
     try:
-        result = await vs_bridge.call("stop")
+        result = await ide_bridge.call("stop")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "stop")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "stop")
 
 
 @mcp.tool()
@@ -565,13 +707,13 @@ async def debug_run_to_cursor(file_path: str, line_number: int) -> str:
         line_number: 目标行号
     """
     try:
-        result = await vs_bridge.call("run_to_cursor", {
+        result = await ide_bridge.call("run_to_cursor", {
             "filePath": file_path,
             "lineNumber": line_number
         })
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "run_to_cursor")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "run_to_cursor")
 
 
 @mcp.tool()
@@ -585,13 +727,13 @@ async def debug_set_next_statement(file_path: str, line_number: int) -> str:
         line_number: 目标行号
     """
     try:
-        result = await vs_bridge.call("set_next_statement", {
+        result = await ide_bridge.call("set_next_statement", {
             "filePath": file_path,
             "lineNumber": line_number
         })
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "set_next_statement")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "set_next_statement")
 
 
 # ============== Breakpoint Tools ==============
@@ -605,10 +747,10 @@ async def get_breakpoints() -> str:
     **触发场景**: 当用户询问"断点在哪"、"有哪些断点"、"breakpoint列表"时调用此工具。
     """
     try:
-        result = await vs_bridge.call("get_breakpoints")
+        result = await ide_bridge.call("get_breakpoints")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_breakpoints")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_breakpoints")
 
 
 @mcp.tool()
@@ -634,10 +776,10 @@ async def set_breakpoint(
         }
         if condition:
             params["condition"] = condition
-        result = await vs_bridge.call("set_breakpoint", params)
+        result = await ide_bridge.call("set_breakpoint", params)
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "set_breakpoint")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "set_breakpoint")
 
 
 @mcp.tool()
@@ -656,10 +798,10 @@ async def set_function_breakpoint(
         params = {"functionName": function_name}
         if condition:
             params["condition"] = condition
-        result = await vs_bridge.call("set_function_breakpoint", params)
+        result = await ide_bridge.call("set_function_breakpoint", params)
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "set_function_breakpoint")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "set_function_breakpoint")
 
 
 @mcp.tool()
@@ -672,13 +814,13 @@ async def delete_breakpoint(file_path: str, line_number: int) -> str:
         line_number: 断点所在行号
     """
     try:
-        result = await vs_bridge.call("delete_breakpoint", {
+        result = await ide_bridge.call("delete_breakpoint", {
             "filePath": file_path,
             "lineNumber": line_number
         })
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "delete_breakpoint")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "delete_breakpoint")
 
 
 @mcp.tool()
@@ -687,10 +829,10 @@ async def delete_all_breakpoints() -> str:
     删除所有断点。谨慎使用。
     """
     try:
-        result = await vs_bridge.call("delete_all_breakpoints")
+        result = await ide_bridge.call("delete_all_breakpoints")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "delete_all_breakpoints")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "delete_all_breakpoints")
 
 
 @mcp.tool()
@@ -708,14 +850,14 @@ async def enable_breakpoint(
         enabled: True启用，False禁用
     """
     try:
-        result = await vs_bridge.call("enable_breakpoint", {
+        result = await ide_bridge.call("enable_breakpoint", {
             "filePath": file_path,
             "lineNumber": line_number,
             "enabled": enabled
         })
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "enable_breakpoint")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "enable_breakpoint")
 
 
 # ============== Navigation Tools ==============
@@ -730,12 +872,12 @@ async def switch_stack_frame(frame_index: int) -> str:
         frame_index: 栈帧索引（0为当前帧，越大越靠近调用起点）
     """
     try:
-        result = await vs_bridge.call("switch_stack_frame", {
+        result = await ide_bridge.call("switch_stack_frame", {
             "frameIndex": frame_index
         })
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "switch_stack_frame")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "switch_stack_frame")
 
 
 @mcp.tool()
@@ -748,12 +890,12 @@ async def switch_thread(thread_id: int) -> str:
         thread_id: 目标线程的ID
     """
     try:
-        result = await vs_bridge.call("switch_thread", {
+        result = await ide_bridge.call("switch_thread", {
             "threadId": thread_id
         })
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "switch_thread")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "switch_thread")
 
 
 # ============== Register Tools ==============
@@ -767,10 +909,10 @@ async def get_registers() -> str:
     **触发场景**: 当用户提到"寄存器"、"register"、"RAX"、"RSP"、"RIP"、"CPU状态"时调用此工具。
     """
     try:
-        result = await vs_bridge.call("get_registers")
+        result = await ide_bridge.call("get_registers")
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "get_registers")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_registers")
 
 
 # ============== Watch Tools ==============
@@ -784,12 +926,12 @@ async def add_watch(expression: str) -> str:
         expression: 要监视的表达式
     """
     try:
-        result = await vs_bridge.call("add_watch", {
+        result = await ide_bridge.call("add_watch", {
             "expression": expression
         })
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "add_watch")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "add_watch")
 
 
 # ============== Memory Search Tools ==============
@@ -811,15 +953,15 @@ async def search_memory(
         search_size: 搜索范围大小（字节），默认64KB
     """
     try:
-        result = await vs_bridge.call("search_memory", {
+        result = await ide_bridge.call("search_memory", {
             "startAddress": start_address,
             "pattern": pattern,
             "maxResults": max_results,
             "searchSize": search_size
         })
         return format_result(result)
-    except vs_bridge.VSBridgeError as e:
-        return handle_vs_error(e, "search_memory")
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "search_memory")
 
 
 # ============== Main Entry Point ==============
@@ -827,3 +969,7 @@ async def search_memory(
 if __name__ == "__main__":
     # Run the server using stdio transport
     mcp.run(transport="stdio")
+
+
+
+

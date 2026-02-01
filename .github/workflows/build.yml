@@ -1,4 +1,4 @@
-name: Build VSIX
+name: Build VSIX and Rider Plugin
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-vs:
     runs-on: windows-latest
 
     steps:
@@ -51,13 +51,58 @@ jobs:
     - name: Upload VSIX artifact
       uses: actions/upload-artifact@v4
       with:
-        name: VSDebuggerMCP-VSIX
+        name: AIDebugger-VSIX
         path: VSDebuggerMCP/bin/Release/VSDebuggerMCP.vsix
         if-no-files-found: error
 
+  build-rider:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup JDK 21
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '21'
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v4
+
+    - name: Build Rider plugin
+      run: .\\RiderDebuggerMCP\\gradlew.bat -p RiderDebuggerMCP buildPlugin
+
+    - name: Upload Rider plugin artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: AIDebuggerRider-ZIP
+        path: RiderDebuggerMCP/build/distributions/*.zip
+        if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-vs, build-rider]
+    runs-on: windows-latest
+
+    steps:
+    - name: Download VSIX artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: AIDebugger-VSIX
+        path: dist
+
+    - name: Download Rider plugin artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: AIDebuggerRider-ZIP
+        path: dist
+
     - name: Create GitHub Release
-      if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
       with:
-        files: VSDebuggerMCP/bin/Release/VSDebuggerMCP.vsix
+        files: |
+          dist/*.vsix
+          dist/*.zip
         generate_release_notes: true

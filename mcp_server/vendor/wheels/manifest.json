@@ -1,0 +1,84 @@
+﻿{
+    "platform":  "win_amd64",
+    "python":  [
+                   "cp310",
+                   "cp311",
+                   "cp312",
+                   "cp313"
+               ],
+    "generatedAt":  "2026-02-01",
+    "wheels":  [
+                   {
+                       "file":  "vendor/wheels/annotated_types-0.7.0-py3-none-any.whl",
+                       "sha256":  "1f02e8b43a8fbbc3f3e0d4f0f4bfc8131bcb4eebe8849b8e5c773f3a1c582a53"
+                   },
+                   {
+                       "file":  "vendor/wheels/anyio-4.12.1-py3-none-any.whl",
+                       "sha256":  "d405828884fc140aa80a3c667b8beed277f1dfedec42ba031bd6ac3db606ab6c"
+                   },
+                   {
+                       "file":  "vendor/wheels/certifi-2026.1.4-py3-none-any.whl",
+                       "sha256":  "9943707519e4add1115f44c2bc244f782c0249876bf51b6599fee1ffbedd685c"
+                   },
+                   {
+                       "file":  "vendor/wheels/h11-0.16.0-py3-none-any.whl",
+                       "sha256":  "63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86"
+                   },
+                   {
+                       "file":  "vendor/wheels/httpcore-1.0.9-py3-none-any.whl",
+                       "sha256":  "2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55"
+                   },
+                   {
+                       "file":  "vendor/wheels/httpx_sse-0.4.3-py3-none-any.whl",
+                       "sha256":  "0ac1c9fe3c0afad2e0ebb25a934a59f4c7823b60792691f779fad2c5568830fc"
+                   },
+                   {
+                       "file":  "vendor/wheels/httpx-0.28.1-py3-none-any.whl",
+                       "sha256":  "d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad"
+                   },
+                   {
+                       "file":  "vendor/wheels/idna-3.11-py3-none-any.whl",
+                       "sha256":  "771a87f49d9defaf64091e6e6fe9c18d4833f140bd19464795bc32d966ca37ea"
+                   },
+                   {
+                       "file":  "vendor/wheels/mcp-1.0.0-py3-none-any.whl",
+                       "sha256":  "bbe70ffa3341cd4da78b5eb504958355c68381fb29971471cea1e642a2af5b8a"
+                   },
+                   {
+                       "file":  "vendor/wheels/pydantic_core-2.41.5-cp310-cp310-win_amd64.whl",
+                       "sha256":  "62de39db01b8d593e45871af2af9e497295db8d73b085f6bfd0b18c83c70a8f9"
+                   },
+                   {
+                       "file":  "vendor/wheels/pydantic_core-2.41.5-cp311-cp311-win_amd64.whl",
+                       "sha256":  "76ee27c6e9c7f16f47db7a94157112a2f3a00e958bc626e2f4ee8bec5c328fbe"
+                   },
+                   {
+                       "file":  "vendor/wheels/pydantic_core-2.41.5-cp312-cp312-win_amd64.whl",
+                       "sha256":  "1962293292865bca8e54702b08a4f26da73adc83dd1fcf26fbc875b35d81c815"
+                   },
+                   {
+                       "file":  "vendor/wheels/pydantic_core-2.41.5-cp313-cp313-win_amd64.whl",
+                       "sha256":  "79ec52ec461e99e13791ec6508c722742ad745571f234ea6255bed38c6480f11"
+                   },
+                   {
+                       "file":  "vendor/wheels/pydantic-2.12.5-py3-none-any.whl",
+                       "sha256":  "e561593fccf61e8a20fc46dfc2dfe075b8be7d0188df33f221ad1f0139180f9d"
+                   },
+                   {
+                       "file":  "vendor/wheels/sse_starlette-3.2.0-py3-none-any.whl",
+                       "sha256":  "5876954bd51920fc2cd51baee47a080eb88a37b5b784e615abb0b283f801cdbf"
+                   },
+                   {
+                       "file":  "vendor/wheels/starlette-0.52.1-py3-none-any.whl",
+                       "sha256":  "0029d43eb3d273bc4f83a08720b4912ea4b071087a3b48db01b7c839f7954d74"
+                   },
+                   {
+                       "file":  "vendor/wheels/typing_extensions-4.15.0-py3-none-any.whl",
+                       "sha256":  "f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548"
+                   },
+                   {
+                       "file":  "vendor/wheels/typing_inspection-0.4.2-py3-none-any.whl",
+                       "sha256":  "4ed1cacbdc298c220f1bd249ed5287caa16f34d44ef4e9c3d0cbad5b521545e7"
+                   }
+               ]
+}

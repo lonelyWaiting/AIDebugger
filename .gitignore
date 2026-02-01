@@ -44,6 +44,12 @@ env/
 
 # IDE
 .idea/
+.gradle/
+.intellijPlatform/
+.cursor/
+.gradle-user/
+.tmp/
+*.iml
 *.swp
 *.swo
 *~
@@ -54,3 +60,7 @@ env/
 ._*
 .Spotlight-V100
 .Trashes
+
+# Rider/Gradle build outputs
+RiderDebuggerMCP/build/
+RiderDebuggerMCP/build-*/

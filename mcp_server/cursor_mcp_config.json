@@ -1,11 +1,20 @@
 {
-  "_comment": "This is a template. The VS extension automatically registers with Cursor using the correct path.",
-  "_note": "The Python MCP server files are bundled with the VSIX extension.",
+  "_comment": "Template only. VS registers AIDebuggerVS; Rider registers AIDebuggerRider.",
+  "_note": "The Python MCP server files are bundled with each extension (VSIX/Rider).",
   "mcpServers": {
-    "vs-debugger": {
+    "AIDebuggerVS": {
       "command": "python",
       "args": ["<auto-detected-by-extension>/mcp_server/server.py"],
-      "env": {}
+      "env": {
+        "AIDB_PREFERRED_IDE": "vs"
+      }
+    },
+    "AIDebuggerRider": {
+      "command": "python",
+      "args": ["<auto-detected-by-extension>/mcp_server/server.py"],
+      "env": {
+        "AIDB_PREFERRED_IDE": "rider"
+      }
     }
   }
 }

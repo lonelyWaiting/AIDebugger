@@ -20,7 +20,7 @@ namespace VSDebuggerMCP
     /// </summary>
     public class NamedPipeServer : IDisposable
     {
-        private const string PipeNamePrefix = "VSDebuggerMCP";
+        private const string PipeNamePrefix = "AIDebuggerVS";
         private const int MaxConnections = 10;
         
         // Unique pipe name for this VS instance (includes process ID)

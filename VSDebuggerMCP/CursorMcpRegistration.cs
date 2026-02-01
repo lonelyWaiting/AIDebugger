@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Web.Script.Serialization;
 using System.Collections.Generic;
 
@@ -12,14 +13,14 @@ namespace VSDebuggerMCP
     /// </summary>
     public static class CursorMcpRegistration
     {
-        private const string McpServerName = "vs-debugger";
-        private static readonly string[] RequiredPythonPackages = { "mcp" };
+        private const string McpServerNameVs = "AIDebuggerVS";
+        private const string LegacyMcpServerName = "AIDebugger";
 
         /// <summary>
         /// Server use instructions that help Cursor AI understand when and how to use this MCP.
         /// This is critical for AI to automatically invoke debugging tools when users ask about crashes, errors, etc.
         /// </summary>
-        private const string ServerUseInstructions = @"VS Debugger MCP - Visual Studio调试信息获取工具
+        private static readonly string ServerUseInstructionsTemplate = @"AIDebugger{0} - {0}调试信息获取工具
 
 ## 何时使用此MCP
 
@@ -32,6 +33,10 @@ namespace VSDebuggerMCP
 ### 调试分析
 - 关键词：调试、debug、断点、breakpoint、单步、step、堆栈、stack、变量、variable
 - 推荐操作：根据需求使用 get_debug_status、get_callstack、get_locals 等
+
+### 主动检测调试现场（推荐）
+- 在调用任何调试工具前，先调用 detect_debug_sessions(prefer_ide=""{1}"") 检测是否有 VS/Rider 调试现场
+- 若自动选择失败，使用 list_ide_instances + select_ide_instance 手动选择
 
 ### 编译问题
 - 关键词：编译错误、build error、编译失败、无法编译、syntax error、链接错误
@@ -57,10 +62,15 @@ namespace VSDebuggerMCP
 
 ## 重要注意事项
 
-- 支持多个VS实例，会自动选择处于断点暂停状态的实例
-- 如果有多个实例且无法自动选择，使用 list_vs_instances 查看，然后 select_vs_instance 选择
+- 支持多个IDE实例，会自动选择处于断点暂停状态的实例
+- 如果有多个实例且无法自动选择，使用 list_ide_instances 查看，然后 select_ide_instance 选择
 - 调试控制工具（如 debug_step_over）会改变程序状态，需谨慎使用
 - get_full_context 是最高效的起点，一次调用获取全部信息";
+
+        private static string BuildServerUseInstructions(string ideLabel, string preferredIde)
+        {
+            return string.Format(ServerUseInstructionsTemplate, ideLabel, preferredIde);
+        }
         
         /// <summary>
         /// Gets the path to the MCP server Python script.
@@ -86,6 +96,7 @@ namespace VSDebuggerMCP
                 // Parent directory (development: running from VSDebuggerMCP/bin/Debug)
                 Path.Combine(extensionDir, "..", "..", "..", "mcp_server", "server.py"),
                 // User profile location (manual installation)
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ai-debugger", "mcp_server", "server.py"),
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".vs-debugger-mcp", "mcp_server", "server.py"),
             };
 
@@ -120,7 +131,7 @@ namespace VSDebuggerMCP
         }
 
         /// <summary>
-        /// Registers the VS Debugger MCP server in Cursor's configuration.
+        /// Registers the AIDebugger server in Cursor's configuration.
         /// </summary>
         /// <returns>True if registration was successful or already registered, false on error.</returns>
         public static RegistrationResult RegisterWithCursor(Action<string> log = null)
@@ -174,74 +185,67 @@ namespace VSDebuggerMCP
 
                 // Use forward slashes for cross-platform compatibility in JSON
                 var normalizedPath = serverPath.Replace("\\", "/");
-                
-                // Check if already registered with correct configuration
-                if (mcpServers.ContainsKey(McpServerName))
+
+                var entryName = McpServerNameVs;
+                var preferredIde = "vs";
+                var instructions = BuildServerUseInstructions("VS", "vs");
+
+                bool allCorrect = true;
+                bool isCorrect = false;
+                if (mcpServers.ContainsKey(entryName))
                 {
-                    var existingConfig = mcpServers[McpServerName] as Dictionary<string, object>;
-                    if (existingConfig != null)
+                    var existingConfig = mcpServers[entryName] as Dictionary<string, object>;
+                    isCorrect = IsCorrectServerConfig(existingConfig, normalizedPath, preferredIde);
+                    if (!isCorrect)
                     {
-                        // Check if it's pointing to our Python script
-                        var existingCommand = existingConfig.ContainsKey("command") ? existingConfig["command"]?.ToString() : "";
-                        var existingArgs = existingConfig.ContainsKey("args") ? existingConfig["args"] : null;
-                        
-                        // Get first arg (could be object[] or ArrayList from JSON deserialization)
-                        string firstArg = null;
-                        if (existingArgs is object[] argsArray && argsArray.Length > 0)
-                        {
-                            firstArg = argsArray[0]?.ToString();
-                        }
-                        else if (existingArgs is System.Collections.ArrayList argsList && argsList.Count > 0)
-                        {
-                            firstArg = argsList[0]?.ToString();
-                        }
-                        
-                        // Check if serverUseInstructions is present
-                        var hasServerUseInstructions = existingConfig.ContainsKey("serverUseInstructions") 
-                            && !string.IsNullOrEmpty(existingConfig["serverUseInstructions"]?.ToString());
-                        
-                        bool isCorrectConfig = existingCommand == "python" && firstArg == normalizedPath && hasServerUseInstructions;
-                        
-                        if (isCorrectConfig)
-                        {
-                            log($"MCP server '{McpServerName}' is already correctly registered in Cursor");
-                            result.Success = true;
-                            result.AlreadyRegistered = true;
-                            result.Message = "Already registered";
-                            return result;
-                        }
-                        else
-                        {
-                            log($"MCP server '{McpServerName}' exists but needs update...");
-                            log($"  Existing command: {existingCommand}");
-                            log($"  Expected: python {normalizedPath}");
-                            log($"  Has serverUseInstructions: {hasServerUseInstructions}");
-                        }
+                        log($"MCP server '{entryName}' exists but needs update...");
                     }
                 }
-
-                // Add/Update our server configuration
-                var serverConfig = new Dictionary<string, object>
+                else
                 {
-                    { "command", "python" },
-                    { "args", new object[] { normalizedPath } },
-                    { "env", new Dictionary<string, object>() },
-                    { "serverUseInstructions", ServerUseInstructions }
-                };
+                    allCorrect = false;
+                }
 
-                mcpServers[McpServerName] = serverConfig;
+                if (!isCorrect)
+                {
+                    var serverConfig = new Dictionary<string, object>
+                    {
+                        { "command", "python" },
+                        { "args", new object[] { normalizedPath } },
+                        { "env", new Dictionary<string, object> { { "AIDB_PREFERRED_IDE", preferredIde } } },
+                        { "serverUseInstructions", instructions }
+                    };
+                    mcpServers[entryName] = serverConfig;
+                    allCorrect = false;
+                }
+
+                if (mcpServers.ContainsKey(LegacyMcpServerName))
+                {
+                    log($"Removing legacy MCP server entry '{LegacyMcpServerName}' to keep only VS entry.");
+                    mcpServers.Remove(LegacyMcpServerName);
+                    allCorrect = false;
+                }
+
+                if (allCorrect)
+                {
+                    log("MCP servers are already correctly registered in Cursor");
+                    result.Success = true;
+                    result.AlreadyRegistered = true;
+                    result.Message = "Already registered";
+                    return result;
+                }
 
                 // Write updated config
                 var serializer2 = new JavaScriptSerializer();
                 var json = FormatJson(serializer2.Serialize(config));
                 File.WriteAllText(configPath, json, Encoding.UTF8);
 
-                log($"Successfully registered '{McpServerName}' in Cursor MCP config");
+                log($"Successfully registered '{McpServerNameVs}' in Cursor MCP config");
                 log($"Server command: python {normalizedPath}");
                 
                 result.Success = true;
                 result.AlreadyRegistered = false;
-                result.Message = $"Successfully registered. Please restart Cursor to use the VS Debugger MCP tools.";
+                result.Message = $"Successfully registered. Please restart Cursor to use the AIDebugger tools.";
                 result.ConfigPath = configPath;
                 result.ServerPath = serverPath;
 
@@ -263,97 +267,8 @@ namespace VSDebuggerMCP
         public static bool InstallPythonDependencies(Action<string> log = null)
         {
             log = log ?? ((s) => { });
-            bool allSuccess = true;
-
-            foreach (var package in RequiredPythonPackages)
-            {
-                try
-                {
-                    log($"Checking Python package: {package}");
-                    
-                    // First check if package is already installed
-                    if (IsPythonPackageInstalled(package, log))
-                    {
-                        log($"Package '{package}' is already installed");
-                        continue;
-                    }
-
-                    log($"Installing Python package: {package}");
-                    
-                    var startInfo = new ProcessStartInfo
-                    {
-                        FileName = "python",
-                        Arguments = $"-m pip install --user {package}",
-                        UseShellExecute = false,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
-                        CreateNoWindow = true,
-                        WindowStyle = ProcessWindowStyle.Hidden
-                    };
-
-                    using (var process = Process.Start(startInfo))
-                    {
-                        if (process == null)
-                        {
-                            log($"Failed to start pip install process for {package}");
-                            allSuccess = false;
-                            continue;
-                        }
-
-                        var output = process.StandardOutput.ReadToEnd();
-                        var error = process.StandardError.ReadToEnd();
-                        process.WaitForExit(60000); // 60 second timeout
-
-                        if (process.ExitCode == 0)
-                        {
-                            log($"Successfully installed package '{package}'");
-                        }
-                        else
-                        {
-                            log($"Failed to install package '{package}': {error}");
-                            allSuccess = false;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    log($"Error installing package '{package}': {ex.Message}");
-                    allSuccess = false;
-                }
-            }
-
-            return allSuccess;
-        }
-
-        /// <summary>
-        /// Checks if a Python package is installed.
-        /// </summary>
-        private static bool IsPythonPackageInstalled(string packageName, Action<string> log)
-        {
-            try
-            {
-                var startInfo = new ProcessStartInfo
-                {
-                    FileName = "python",
-                    Arguments = $"-c \"import {packageName}\"",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    WindowStyle = ProcessWindowStyle.Hidden
-                };
-
-                using (var process = Process.Start(startInfo))
-                {
-                    if (process == null) return false;
-                    process.WaitForExit(10000); // 10 second timeout
-                    return process.ExitCode == 0;
-                }
-            }
-            catch
-            {
-                return false;
-            }
+            log("Bundled Python dependencies are included. No pip install is required.");
+            return true;
         }
 
         /// <summary>
@@ -384,8 +299,23 @@ namespace VSDebuggerMCP
                     var version = string.IsNullOrEmpty(output) ? error : output;
                     if (process.ExitCode == 0)
                     {
-                        log($"Python found: {version.Trim()}");
-                        return true;
+                        var trimmed = version.Trim();
+                        var match = Regex.Match(trimmed, @"Python\s+(\d+)\.(\d+)\.(\d+)");
+                        if (match.Success)
+                        {
+                            var major = int.Parse(match.Groups[1].Value);
+                            var minor = int.Parse(match.Groups[2].Value);
+                            if (major > 3 || (major == 3 && minor >= 10))
+                            {
+                                log($"Python found: {trimmed}");
+                                return true;
+                            }
+                            log($"Python version {major}.{minor} is not supported. Please install Python 3.10+.");
+                            return false;
+                        }
+
+                        log($"Python found but version could not be parsed: {trimmed}");
+                        return false;
                     }
                 }
             }
@@ -397,7 +327,7 @@ namespace VSDebuggerMCP
         }
 
         /// <summary>
-        /// Unregisters the VS Debugger MCP server from Cursor's configuration.
+        /// Unregisters the AIDebugger server from Cursor's configuration.
         /// </summary>
         public static bool UnregisterFromCursor(Action<string> log = null)
         {
@@ -424,18 +354,33 @@ namespace VSDebuggerMCP
                 }
 
                 var mcpServers = config["mcpServers"] as Dictionary<string, object>;
-                if (mcpServers == null || !mcpServers.ContainsKey(McpServerName))
+                if (mcpServers == null)
                 {
-                    log($"Server '{McpServerName}' not found in config, nothing to unregister");
+                    log("mcpServers is not a valid object, nothing to unregister");
                     return true;
                 }
 
-                mcpServers.Remove(McpServerName);
+                bool removed = false;
+                foreach (var name in new[] { McpServerNameVs, LegacyMcpServerName })
+                {
+                    if (mcpServers.ContainsKey(name))
+                    {
+                        mcpServers.Remove(name);
+                        removed = true;
+                        log($"Removed MCP server '{name}' from config");
+                    }
+                }
+
+                if (!removed)
+                {
+                    log("No AIDebugger MCP servers found in config, nothing to unregister");
+                    return true;
+                }
 
                 var json = FormatJson(serializer.Serialize(config));
                 File.WriteAllText(configPath, json, Encoding.UTF8);
 
-                log($"Successfully unregistered '{McpServerName}' from Cursor MCP config");
+                log($"Successfully unregistered AIDebugger VS MCP server from Cursor MCP config");
                 return true;
             }
             catch (Exception ex)
@@ -506,6 +451,62 @@ namespace VSDebuggerMCP
             }
 
             return sb.ToString();
+        }
+
+        private static bool IsCorrectServerConfig(Dictionary<string, object> existingConfig, string normalizedPath, string preferredIde)
+        {
+            if (existingConfig == null)
+            {
+                return false;
+            }
+
+            var existingCommand = existingConfig.ContainsKey("command") ? existingConfig["command"]?.ToString() : "";
+            if (existingCommand != "python")
+            {
+                return false;
+            }
+
+            var existingArgs = existingConfig.ContainsKey("args") ? existingConfig["args"] : null;
+            string firstArg = null;
+            if (existingArgs is object[] argsArray && argsArray.Length > 0)
+            {
+                firstArg = argsArray[0]?.ToString();
+            }
+            else if (existingArgs is System.Collections.ArrayList argsList && argsList.Count > 0)
+            {
+                firstArg = argsList[0]?.ToString();
+            }
+
+            if (!string.Equals(firstArg, normalizedPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var hasServerUseInstructions = existingConfig.ContainsKey("serverUseInstructions")
+                && !string.IsNullOrEmpty(existingConfig["serverUseInstructions"]?.ToString());
+
+            if (!hasServerUseInstructions)
+            {
+                return false;
+            }
+
+            if (!existingConfig.ContainsKey("env"))
+            {
+                return false;
+            }
+
+            var envObj = existingConfig["env"];
+            if (envObj is Dictionary<string, object> envDict)
+            {
+                if (!envDict.ContainsKey("AIDB_PREFERRED_IDE"))
+                {
+                    return false;
+                }
+                var envValue = envDict["AIDB_PREFERRED_IDE"]?.ToString();
+                return string.Equals(envValue, preferredIde, StringComparison.OrdinalIgnoreCase);
+            }
+
+            return false;
         }
     }
 

@@ -55,14 +55,14 @@ namespace VSDebuggerMCP
                 _pipeServer = new NamedPipeServer(_debuggerService, LogMessage);
                 _pipeServer.Start();
 
-                LogMessage("VSDebuggerMCP initialized successfully. Named Pipe server is running.");
+                LogMessage("AIDebugger initialized successfully. Named Pipe server is running.");
 
                 // Auto-register with Cursor MCP configuration
                 await Task.Run(() => AutoRegisterWithCursor());
             }
             catch (Exception ex)
             {
-                LogError($"Failed to initialize VSDebuggerMCP: {ex.Message}");
+                LogError($"Failed to initialize AIDebugger: {ex.Message}");
             }
         }
 
@@ -74,7 +74,7 @@ namespace VSDebuggerMCP
             if (outputWindow != null)
             {
                 var paneGuid = new Guid("A1B2C3D4-E5F6-7890-ABCD-EF1234567890");
-                outputWindow.CreatePane(ref paneGuid, "VSDebuggerMCP", 1, 1);
+                outputWindow.CreatePane(ref paneGuid, "AIDebugger", 1, 1);
                 outputWindow.GetPane(ref paneGuid, out _outputPane);
             }
         }
@@ -86,7 +86,7 @@ namespace VSDebuggerMCP
                 ThreadHelper.JoinableTaskFactory.Run(async () =>
                 {
                     await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
-                    _outputPane?.OutputStringThreadSafe($"[VSDebuggerMCP] {DateTime.Now:HH:mm:ss} - {message}\n");
+                    _outputPane?.OutputStringThreadSafe($"[AIDebugger] {DateTime.Now:HH:mm:ss} - {message}\n");
                 });
             }
             catch
@@ -111,17 +111,12 @@ namespace VSDebuggerMCP
                 LogMessage("Checking Python installation...");
                 if (!CursorMcpRegistration.IsPythonAvailable(LogMessage))
                 {
-                    LogError("Python is not installed or not in PATH. Please install Python 3.8+ and add it to PATH.");
+                    LogError("Python is not installed or not in PATH. Please install Python 3.10+ and add it to PATH.");
                     return;
                 }
 
-                // Step 2: Install Python dependencies
-                LogMessage("Checking/Installing Python dependencies...");
-                if (!CursorMcpRegistration.InstallPythonDependencies(LogMessage))
-                {
-                    LogError("Failed to install some Python dependencies. MCP server may not work correctly.");
-                    // Continue anyway, maybe some packages were installed
-                }
+                // Step 2: Use bundled Python dependencies
+                LogMessage("Using bundled Python dependencies (no pip install required).");
 
                 // Step 3: Register with Cursor
                 LogMessage("Checking Cursor MCP registration...");
@@ -131,12 +126,12 @@ namespace VSDebuggerMCP
                 {
                     if (result.AlreadyRegistered)
                     {
-                        LogMessage("VS Debugger MCP is already registered in Cursor.");
+                        LogMessage("AIDebugger is already registered in Cursor.");
                     }
                     else
                     {
                         LogMessage("==============================================");
-                        LogMessage("VS Debugger MCP has been registered with Cursor!");
+                        LogMessage("AIDebugger has been registered with Cursor!");
                         LogMessage($"Config file: {result.ConfigPath}");
                         LogMessage($"Server script: {result.ServerPath}");
                         LogMessage("Please restart Cursor to use the debugging tools.");
