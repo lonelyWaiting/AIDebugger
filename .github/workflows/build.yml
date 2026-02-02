@@ -34,16 +34,16 @@ jobs:
         
         # Update source.extension.vsixmanifest
         $manifestPath = "VSDebuggerMCP/source.extension.vsixmanifest"
-        $manifest = Get-Content $manifestPath -Raw
+        $manifest = Get-Content $manifestPath -Raw -Encoding UTF8
         $manifest = $manifest -replace 'Version="1\.0"', "Version=`"$version`""
-        Set-Content $manifestPath $manifest -NoNewline
+        Set-Content $manifestPath $manifest -NoNewline -Encoding UTF8
         
         # Update AssemblyInfo.cs
         $assemblyInfoPath = "VSDebuggerMCP/Properties/AssemblyInfo.cs"
-        $assemblyInfo = Get-Content $assemblyInfoPath -Raw
+        $assemblyInfo = Get-Content $assemblyInfoPath -Raw -Encoding UTF8
         $assemblyInfo = $assemblyInfo -replace 'AssemblyVersion\("1\.0\.0\.0"\)', "AssemblyVersion(`"$assemblyVersion`")"
         $assemblyInfo = $assemblyInfo -replace 'AssemblyFileVersion\("1\.0\.0\.0"\)', "AssemblyFileVersion(`"$assemblyVersion`")"
-        Set-Content $assemblyInfoPath $assemblyInfo -NoNewline
+        Set-Content $assemblyInfoPath $assemblyInfo -NoNewline -Encoding UTF8
 
     - name: Build VSIX (Release)
       run: msbuild VSDebuggerMCP/VSDebuggerMCP.csproj /p:Configuration=Release /p:DeployExtension=false
@@ -70,6 +70,8 @@ jobs:
 
     - name: Setup Gradle
       uses: gradle/actions/setup-gradle@v4
+      with:
+        validate-wrappers: false
 
     - name: Build Rider plugin
       run: .\\RiderDebuggerMCP\\gradlew.bat -p RiderDebuggerMCP buildPlugin
