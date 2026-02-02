@@ -40,7 +40,9 @@ jobs:
         
         $manifest = Get-Content -Path $manifestPath -Raw
         Write-Host "First 50 chars before: $($manifest.Substring(0, [Math]::Min(50, $manifest.Length)))"
-        $manifest = $manifest -replace 'Version="1\.0"', "Version=`"$version`""
+        # Use -creplace for case-sensitive replace to avoid changing xml declaration's lowercase "version"
+        # Match Identity element's Version attribute specifically (format: Version="X.Y" or Version="X.Y.Z")
+        $manifest = $manifest -creplace '(<Identity[^>]*Version=")[\d\.]+(")', "`$1$version`$2"
         # Write with UTF-8 no BOM - PowerShell 7 supports this natively
         Set-Content -Path $manifestPath -Value $manifest -Encoding utf8NoBOM -NoNewline
         
