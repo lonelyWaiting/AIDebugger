@@ -31,19 +31,29 @@ jobs:
         $version = "1.0.${{ github.run_number }}"
         $assemblyVersion = "1.0.${{ github.run_number }}.0"
         Write-Host "Setting version to $version"
+        Write-Host "Working directory: $PWD"
         
-        # Update source.extension.vsixmanifest
-        $manifestPath = "VSDebuggerMCP/source.extension.vsixmanifest"
-        $manifest = Get-Content $manifestPath -Raw -Encoding UTF8
+        # Update source.extension.vsixmanifest using PowerShell 7's utf8NoBOM encoding
+        $manifestPath = Join-Path $PWD "VSDebuggerMCP/source.extension.vsixmanifest"
+        Write-Host "Manifest path: $manifestPath"
+        Write-Host "File exists: $(Test-Path $manifestPath)"
+        
+        $manifest = Get-Content -Path $manifestPath -Raw
+        Write-Host "First 50 chars before: $($manifest.Substring(0, [Math]::Min(50, $manifest.Length)))"
         $manifest = $manifest -replace 'Version="1\.0"', "Version=`"$version`""
-        Set-Content $manifestPath $manifest -NoNewline -Encoding UTF8
+        # Write with UTF-8 no BOM - PowerShell 7 supports this natively
+        Set-Content -Path $manifestPath -Value $manifest -Encoding utf8NoBOM -NoNewline
+        
+        # Verify the file was written correctly
+        $bytes = [System.IO.File]::ReadAllBytes($manifestPath)
+        Write-Host "First 10 bytes after write: $($bytes[0..9] -join ',')"
         
         # Update AssemblyInfo.cs
-        $assemblyInfoPath = "VSDebuggerMCP/Properties/AssemblyInfo.cs"
-        $assemblyInfo = Get-Content $assemblyInfoPath -Raw -Encoding UTF8
+        $assemblyInfoPath = Join-Path $PWD "VSDebuggerMCP/Properties/AssemblyInfo.cs"
+        $assemblyInfo = Get-Content -Path $assemblyInfoPath -Raw
         $assemblyInfo = $assemblyInfo -replace 'AssemblyVersion\("1\.0\.0\.0"\)', "AssemblyVersion(`"$assemblyVersion`")"
         $assemblyInfo = $assemblyInfo -replace 'AssemblyFileVersion\("1\.0\.0\.0"\)', "AssemblyFileVersion(`"$assemblyVersion`")"
-        Set-Content $assemblyInfoPath $assemblyInfo -NoNewline -Encoding UTF8
+        Set-Content -Path $assemblyInfoPath -Value $assemblyInfo -Encoding utf8NoBOM -NoNewline
 
     - name: Build VSIX (Release)
       run: msbuild VSDebuggerMCP/VSDebuggerMCP.csproj /p:Configuration=Release /p:DeployExtension=false
