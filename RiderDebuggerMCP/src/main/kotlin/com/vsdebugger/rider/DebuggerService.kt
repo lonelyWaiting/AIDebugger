@@ -58,6 +58,8 @@ class DebuggerService {
     private var pipeName: String = ""
     private var selectedThreadId: Int? = null
     private var selectedFrameIndex: Int? = null
+    private val snapshotMaxAttempts = 2
+    private val snapshotRetryDelayMs = 40L
 
     fun setPipeName(value: String) {
         pipeName = value
@@ -77,6 +79,19 @@ class DebuggerService {
                 val expand = getParam(request.params, "expandChildren", false)
                 val maxDepth = getParam(request.params, "maxDepth", 2)
                 evaluateExpression(expression, expand, maxDepth)
+            }
+            "evaluate_expressions_batch" -> {
+                val expressions = getStringListParam(request.params, "expressions")
+                val expand = getParam(request.params, "expandChildren", false)
+                val maxDepth = getParam(request.params, "maxDepth", 2)
+                evaluateExpressionsBatch(expressions, expand, maxDepth)
+            }
+            "capture_debug_bundle" -> {
+                val expressions = getStringListParam(request.params, "expressions")
+                val expand = getParam(request.params, "expandChildren", false)
+                val maxDepth = getParam(request.params, "maxDepth", 2)
+                val outputTailLines = getParam(request.params, "outputTailLines", 80)
+                captureDebugBundle(expressions, expand, maxDepth, outputTailLines)
             }
             "read_memory" -> {
                 val address = getParam(request.params, "address", "")
@@ -183,119 +198,425 @@ class DebuggerService {
         val mode = if (isPaused) "Break" else if (isDebugging) "Running" else "Design"
         val location = getCurrentLocation(session)
         val processName = session.runProfile?.name
+        val (stopReason, stopReasonRaw) = determineStopReason(session)
 
         return DebugStatusResult(
             isDebugging = isDebugging,
             isPaused = isPaused,
             debugMode = mode,
             currentProcess = processName,
+            stopReason = stopReason,
+            stopReasonRaw = stopReasonRaw,
             currentLocation = location
         )
     }
 
+    private fun determineStopReason(session: XDebugSession): Pair<String, String?> {
+        if (!session.isSuspended) {
+            return "not_paused" to null
+        }
+
+        val rawReason = readRawStopReason(session)
+        val mappedFromRaw = mapStopReason(rawReason)
+        if (mappedFromRaw != "pause_unknown") {
+            return mappedFromRaw to rawReason
+        }
+
+        if (tryHasCurrentBreakpoint(session)) {
+            return "breakpoint" to rawReason
+        }
+
+        if (tryHasCurrentException(session)) {
+            return "exception" to rawReason
+        }
+
+        return "pause_unknown" to rawReason
+    }
+
+    private fun readRawStopReason(session: XDebugSession): String? {
+        val candidates = listOf("getSuspendReason", "getPauseReason", "getStopReason", "getCurrentReason")
+        for (name in candidates) {
+            try {
+                val method = session.javaClass.methods.firstOrNull { it.name == name && it.parameterCount == 0 } ?: continue
+                val value = method.invoke(session) ?: continue
+                return value.toString()
+            } catch (_: Exception) {
+            }
+        }
+        return null
+    }
+
+    private fun mapStopReason(rawReason: String?): String {
+        val normalized = rawReason?.trim()?.lowercase(Locale.ROOT) ?: return "pause_unknown"
+        return when {
+            "exception" in normalized -> "exception"
+            "step" in normalized -> "step"
+            "breakpoint" in normalized || "tracepoint" in normalized -> "breakpoint"
+            "user" in normalized || "pause" in normalized || "break" in normalized -> "user_break"
+            else -> "pause_unknown"
+        }
+    }
+
+    private fun tryHasCurrentBreakpoint(session: XDebugSession): Boolean {
+        val candidates = listOf("getCurrentBreakpoint", "getActiveBreakpoint", "getBreakpoint")
+        for (name in candidates) {
+            try {
+                val method = session.javaClass.methods.firstOrNull { it.name == name && it.parameterCount == 0 } ?: continue
+                val value = method.invoke(session)
+                if (value != null) {
+                    return true
+                }
+            } catch (_: Exception) {
+            }
+        }
+        return false
+    }
+
+    private fun tryHasCurrentException(session: XDebugSession): Boolean {
+        return try {
+            val evaluator = getEvaluator(session) ?: return false
+            val eval = evaluateValue(evaluator, "\$exception", session.currentPosition)
+            eval.value != null
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     private fun getCallStack(): CallStackResult {
-        val session = currentSession() ?: return CallStackResult()
-        val suspendContext = session.suspendContext ?: return CallStackResult()
-        val stack = getSelectedStack(suspendContext)
-        val frames = stack?.let { collectStackFrames(it) } ?: emptyList()
+        var bestEffort = CallStackResult(
+            snapshotStatus = "unavailable",
+            capability = "partial_frame_metadata"
+        )
 
-        val result = CallStackResult()
-        if (stack != null) {
-            result.threadId = threadId(stack)
-            result.threadName = stack.displayName
+        for (attempt in 1..snapshotMaxAttempts) {
+            val session = currentSession() ?: break
+            if (!session.isSuspended) {
+                bestEffort.snapshotAttempts = attempt
+                bestEffort.snapshotStatus = "unavailable"
+                return bestEffort
+            }
+            try {
+                val suspendContext = session.suspendContext ?: break
+                val tokenBefore = suspendSnapshotToken(session, suspendContext)
+                val snapshot = buildCallStackResult(suspendContext)
+                val currentContext = session.suspendContext
+                val stable = currentContext != null &&
+                    session.isSuspended &&
+                    tokenBefore == suspendSnapshotToken(session, currentContext)
+
+                snapshot.snapshotAttempts = attempt
+                snapshot.snapshotStable = stable
+                snapshot.snapshotStatus = if (stable) {
+                    "ok"
+                } else if (snapshot.frames.isNotEmpty()) {
+                    "unstable"
+                } else {
+                    "unavailable"
+                }
+                bestEffort = snapshot
+                if (stable) {
+                    return snapshot
+                }
+            } catch (ex: Exception) {
+                bestEffort.snapshotAttempts = attempt
+                if (bestEffort.frames.isNotEmpty()) {
+                    bestEffort.snapshotStatus = "unstable"
+                }
+            }
+            if (attempt < snapshotMaxAttempts) {
+                Thread.sleep(snapshotRetryDelayMs)
+            }
         }
 
-        frames.forEachIndexed { index, frame ->
-            val location = getFrameLocation(frame)
-            result.frames.add(
-                StackFrameInfo(
-                    index = index,
-                    functionName = getFrameName(frame),
-                    filePath = location?.filePath ?: "",
-                    lineNumber = location?.lineNumber ?: 0,
-                    lineNumberReliable = location != null,
-                    columnNumber = location?.columnNumber ?: 1
-                )
-            )
-        }
-
-        return result
+        return bestEffort
     }
 
     private fun getLocals(): LocalsResult {
         val session = currentSession() ?: return LocalsResult()
+        return buildLocalsResult(session, 2)
+    }
+
+    private fun buildLocalsResult(session: XDebugSession, maxDepth: Int): LocalsResult {
         val frame = getSelectedFrame(session) ?: return LocalsResult()
-        val variables = collectVariables(frame, 0, 2)
+        val variables = collectVariables(frame, 0, maxDepth.coerceIn(0, 4))
         return LocalsResult(frameIndex = selectedFrameIndex ?: 0, variables = variables.toMutableList())
     }
 
     private fun getThreads(): ThreadsResult {
-        val session = currentSession() ?: return ThreadsResult()
-        val suspendContext = session.suspendContext ?: return ThreadsResult()
-        val stacks = suspendContext.executionStacks?.toList() ?: emptyList()
-        val active = suspendContext.activeExecutionStack
+        var bestEffort = ThreadsResult(
+            snapshotStatus = "unavailable",
+            capability = "partial_thread_metadata"
+        )
 
-        val result = ThreadsResult()
-        stacks.forEach { stack ->
-            val id = threadId(stack)
-            val location = getStackLocation(stack)
-            result.threads.add(
-                ThreadInfo(
-                    id = id,
-                    name = stack.displayName,
-                    isCurrent = stack == active,
-                    isFrozen = false,
-                    location = location
-                )
-            )
+        for (attempt in 1..snapshotMaxAttempts) {
+            val session = currentSession() ?: return bestEffort
+            if (!session.isSuspended) {
+                bestEffort.snapshotAttempts = attempt
+                bestEffort.snapshotStatus = "unavailable"
+                return bestEffort
+            }
+            try {
+                val suspendContext = session.suspendContext ?: return bestEffort
+                val tokenBefore = suspendSnapshotToken(session, suspendContext)
+                val snapshot = buildThreadsResult(suspendContext)
+                val currentContext = session.suspendContext
+                val stable = currentContext != null &&
+                    session.isSuspended &&
+                    tokenBefore == suspendSnapshotToken(session, currentContext)
+
+                snapshot.snapshotAttempts = attempt
+                snapshot.snapshotStable = stable
+                snapshot.snapshotStatus = if (stable) {
+                    "ok"
+                } else if (snapshot.threads.isNotEmpty()) {
+                    "unstable"
+                } else {
+                    "unavailable"
+                }
+                bestEffort = snapshot
+                if (stable) {
+                    return snapshot
+                }
+            } catch (ex: Exception) {
+                bestEffort.snapshotAttempts = attempt
+                if (bestEffort.threads.isNotEmpty()) {
+                    bestEffort.snapshotStatus = "unstable"
+                }
+            }
+            if (attempt < snapshotMaxAttempts) {
+                Thread.sleep(snapshotRetryDelayMs)
+            }
         }
 
-        result.currentThreadId = selectedThreadId ?: (active?.let { threadId(it) } ?: 0)
-        return result
+        return bestEffort
     }
 
     private fun getModules(): ModulesResult {
-        val session = currentSession() ?: return ModulesResult(error = "No debug session")
-        val evaluator = getEvaluator(session) ?: return ModulesResult(error = "No evaluator available")
+        val capability = "managed_appdomain_only"
+        val session = currentSession() ?: return ModulesResult(capability = capability, error = "No debug session")
+        val evaluator = getEvaluator(session) ?: return ModulesResult(capability = capability, error = "No evaluator available")
         val eval = evaluateValue(evaluator, "System.AppDomain.CurrentDomain.GetAssemblies()", session.currentPosition)
         if (eval.value == null) {
-            return ModulesResult(error = eval.errorMessage ?: "Unable to enumerate modules")
+            return ModulesResult(capability = capability, error = eval.errorMessage ?: "Unable to enumerate modules")
         }
 
         val modules = mutableListOf<ModuleInfo>()
-        val children = collectVariables(eval.value, 0, 1)
+        val children = collectVariables(eval.value, 0, 2)
         children.forEachIndexed { index, variable ->
-            val name = variable.value ?: variable.name
-            val path = variable.value?.takeIf { it.contains(":\\") || it.contains("/") }
+            val fullName = extractVariableChildValue(variable, "FullName")
+            val location = extractVariableChildValue(variable, "Location", "CodeBase")
+            val moduleName = fullName?.substringBefore(",")?.trim()
+                ?: variable.value?.trim('"')
+                ?: variable.name
+            val version = Regex("Version=([^,]+)", RegexOption.IGNORE_CASE).find(fullName ?: "")
+                ?.groupValues?.getOrNull(1)
+            val path = location?.takeIf { it.contains(":\\") || it.contains("/") }
             modules.add(
                 ModuleInfo(
-                    name = name ?: variable.name,
+                    name = moduleName,
                     path = path,
-                    order = index
+                    symbolsLoaded = !path.isNullOrBlank(),
+                    order = index,
+                    version = version,
+                    isSystemModule = isSystemPath(path)
                 )
             )
         }
 
-        return ModulesResult(modules = modules, totalCount = modules.size)
+        return ModulesResult(modules = modules, totalCount = modules.size, capability = capability)
     }
 
     private fun getException(): ExceptionResult {
-        val session = currentSession() ?: return ExceptionResult(hasException = false)
-        val evaluator = getEvaluator(session) ?: return ExceptionResult(hasException = false)
-        val result = evaluateExpression("\$exception", expandChildren = true, maxDepth = 2)
+        val defaultCapability = "limited_exception_details"
+        val session = currentSession() ?: return ExceptionResult(hasException = false, capability = defaultCapability)
+        val evaluator = getEvaluator(session) ?: return ExceptionResult(hasException = false, capability = defaultCapability)
+        val result = evaluateExpression("\$exception", expandChildren = true, maxDepth = 3)
         if (!result.isValid || result.value == null) {
-            return ExceptionResult(hasException = false)
+            return ExceptionResult(hasException = false, capability = defaultCapability)
         }
+
+        val stackTrace = extractVariableValueByName(result.children, "StackTrace")
+        val source = extractVariableValueByName(result.children, "Source")
+        val hResult = extractVariableValueByName(result.children, "HResult")
+        val inner = toInnerException(extractVariableByName(result.children, "InnerException"))
+        val capability = if (!stackTrace.isNullOrBlank() || !source.isNullOrBlank() || !hResult.isNullOrBlank() || inner != null) {
+            "expanded_exception_details"
+        } else {
+            defaultCapability
+        }
+
         return ExceptionResult(
             hasException = true,
+            capability = capability,
             type = result.type,
-            message = result.value
+            message = result.value,
+            stackTrace = stackTrace,
+            source = source,
+            innerException = inner,
+            hResult = hResult
         )
     }
 
     private fun evaluateExpression(expression: String, expandChildren: Boolean, maxDepth: Int): EvaluateResult {
         val session = currentSession() ?: return EvaluateResult(expression = expression, isValid = false, errorMessage = "No debug session")
         val evaluator = getEvaluator(session) ?: return EvaluateResult(expression = expression, isValid = false, errorMessage = "No evaluator available")
+        return evaluateExpressionCore(expression, expandChildren, maxDepth, session, evaluator)
+    }
+
+    private fun evaluateExpressionsBatch(expressions: List<String>, expandChildren: Boolean, maxDepth: Int): BatchEvaluateResult {
+        val snapshotId = java.util.UUID.randomUUID().toString().replace("-", "")
+        val capturedAt = Instant.now().toString()
+        return evaluateExpressionsBatchInternal(
+            normalizeExpressions(expressions),
+            expandChildren,
+            maxDepth,
+            snapshotId,
+            capturedAt
+        )
+    }
+
+    private fun evaluateExpressionsBatchInternal(
+        normalizedExpressions: List<String>,
+        expandChildren: Boolean,
+        maxDepth: Int,
+        snapshotId: String,
+        capturedAt: String
+    ): BatchEvaluateResult {
+        val normalizedDepth = maxDepth.coerceIn(0, 4)
+        var bestEffort = BatchEvaluateResult(
+            snapshotId = snapshotId,
+            capturedAt = capturedAt,
+            requestedCount = normalizedExpressions.size,
+            snapshotStatus = "unavailable",
+            partial = true
+        )
+
+        if (normalizedExpressions.isEmpty()) {
+            return buildUnavailableBatchEvaluateResult(
+                snapshotId = snapshotId,
+                capturedAt = capturedAt,
+                requestedCount = 0,
+                error = "No expressions provided"
+            )
+        }
+
+        for (attempt in 1..snapshotMaxAttempts) {
+            val session = currentSession() ?: return bestEffort.copy(
+                snapshotAttempts = attempt,
+                error = "No debug session"
+            )
+            if (!session.isSuspended) {
+                return bestEffort.copy(
+                    snapshotAttempts = attempt,
+                    error = "Not in break mode"
+                )
+            }
+
+            try {
+                val suspendContext = session.suspendContext ?: return bestEffort.copy(
+                    snapshotAttempts = attempt,
+                    error = "No suspend context"
+                )
+                val evaluator = getEvaluator(session)
+                    ?: return bestEffort.copy(snapshotAttempts = attempt, error = "No evaluator available")
+                val tokenBefore = suspendSnapshotToken(session, suspendContext)
+                val snapshot = buildBatchEvaluateSnapshot(
+                    normalizedExpressions = normalizedExpressions,
+                    expandChildren = expandChildren,
+                    maxDepth = normalizedDepth,
+                    session = session,
+                    evaluator = evaluator,
+                    snapshotId = snapshotId,
+                    capturedAt = capturedAt
+                )
+                val currentContext = session.suspendContext
+                val stable = currentContext != null &&
+                    session.isSuspended &&
+                    tokenBefore == suspendSnapshotToken(session, currentContext)
+                val status = if (stable) {
+                    if (snapshot.partial) "partial" else "ok"
+                } else {
+                    "unstable"
+                }
+                val withSnapshotState = snapshot.copy(
+                    snapshotStable = stable,
+                    snapshotAttempts = attempt,
+                    snapshotStatus = status
+                )
+                bestEffort = withSnapshotState
+                if (stable) {
+                    return withSnapshotState
+                }
+            } catch (ex: Exception) {
+                bestEffort = bestEffort.copy(
+                    snapshotAttempts = attempt,
+                    error = ex.message ?: bestEffort.error
+                )
+                if (bestEffort.results.isNotEmpty()) {
+                    bestEffort = bestEffort.copy(snapshotStatus = "unstable")
+                }
+            }
+
+            if (attempt < snapshotMaxAttempts) {
+                Thread.sleep(snapshotRetryDelayMs)
+            }
+        }
+
+        return bestEffort
+    }
+
+    private fun buildBatchEvaluateSnapshot(
+        normalizedExpressions: List<String>,
+        expandChildren: Boolean,
+        maxDepth: Int,
+        session: XDebugSession,
+        evaluator: XDebuggerEvaluator,
+        snapshotId: String,
+        capturedAt: String
+    ): BatchEvaluateResult {
+        val results = normalizedExpressions.map { expression ->
+            evaluateExpressionCore(expression, expandChildren, maxDepth, session, evaluator)
+        }.toMutableList()
+        val successCount = results.count { it.isValid }
+        val failedCount = results.size - successCount
+        val partial = failedCount > 0
+
+        return BatchEvaluateResult(
+            snapshotId = snapshotId,
+            capturedAt = capturedAt,
+            requestedCount = normalizedExpressions.size,
+            successCount = successCount,
+            failedCount = failedCount,
+            partial = partial,
+            results = results
+        )
+    }
+
+    private fun buildUnavailableBatchEvaluateResult(
+        snapshotId: String,
+        capturedAt: String,
+        requestedCount: Int,
+        error: String
+    ): BatchEvaluateResult {
+        return BatchEvaluateResult(
+            snapshotId = snapshotId,
+            capturedAt = capturedAt,
+            snapshotStatus = "unavailable",
+            requestedCount = requestedCount,
+            successCount = 0,
+            failedCount = requestedCount,
+            partial = requestedCount > 0,
+            error = error
+        )
+    }
+
+    private fun evaluateExpressionCore(
+        expression: String,
+        expandChildren: Boolean,
+        maxDepth: Int,
+        session: XDebugSession,
+        evaluator: XDebuggerEvaluator
+    ): EvaluateResult {
         val eval = evaluateValue(evaluator, expression, session.currentPosition)
         if (eval.value == null) {
             return EvaluateResult(expression = expression, isValid = false, errorMessage = eval.errorMessage)
@@ -318,36 +639,97 @@ class DebuggerService {
         )
     }
 
+    private fun normalizeExpressions(expressions: List<String>?): List<String> {
+        if (expressions.isNullOrEmpty()) {
+            return emptyList()
+        }
+        return expressions
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .take(100)
+    }
+
     private fun readMemory(address: String, size: Int): MemoryResult {
-        val session = currentSession() ?: return MemoryResult(address = address, size = size)
-        val evaluator = getEvaluator(session) ?: return MemoryResult(address = address, size = size)
         val normalizedSize = size.coerceIn(1, 4096)
+        var bestEffort = buildUnavailableMemoryResult(address, normalizedSize)
+
+        for (attempt in 1..snapshotMaxAttempts) {
+            val session = currentSession() ?: return bestEffort
+            if (!session.isSuspended) {
+                return bestEffort
+            }
+
+            try {
+                val suspendContext = session.suspendContext ?: return bestEffort
+                val tokenBefore = suspendSnapshotToken(session, suspendContext)
+                val snapshot = readMemoryOnce(address, normalizedSize, session)
+                val currentContext = session.suspendContext
+                val stable = currentContext != null &&
+                    session.isSuspended &&
+                    tokenBefore == suspendSnapshotToken(session, currentContext)
+
+                if (stable) {
+                    return snapshot
+                }
+
+                bestEffort = if (snapshot.bytesRead > 0) {
+                    snapshot.copy(status = "unstable")
+                } else {
+                    snapshot
+                }
+            } catch (_: Exception) {
+                // Keep best effort unavailable/partial result and retry once.
+            }
+
+            if (attempt < snapshotMaxAttempts) {
+                Thread.sleep(snapshotRetryDelayMs)
+            }
+        }
+
+        return bestEffort
+    }
+
+    private fun buildUnavailableMemoryResult(address: String, requestedSize: Int): MemoryResult {
+        return MemoryResult(
+            address = address,
+            status = "unavailable",
+            requestedSize = requestedSize,
+            failedReads = requestedSize
+        )
+    }
+
+    private fun readMemoryOnce(address: String, normalizedSize: Int, session: XDebugSession): MemoryResult {
+        val evaluator = getEvaluator(session) ?: return buildUnavailableMemoryResult(address, normalizedSize)
         val addressExpr = resolveAddressExpression(address, evaluator, session.currentPosition)
-        if (addressExpr == null) {
-            return MemoryResult(address = address, size = normalizedSize)
+            ?: return buildUnavailableMemoryResult(address, normalizedSize)
+        val baseAddress = parseNumber(addressExpr)
+            ?: return buildUnavailableMemoryResult(addressExpr, normalizedSize)
+
+        val snapshot = readMemorySnapshot(baseAddress, normalizedSize, evaluator, session.currentPosition)
+        if (snapshot.bytesRead == 0) {
+            return buildUnavailableMemoryResult("0x" + formatAddressValue(baseAddress), normalizedSize)
         }
 
-        val bytes = mutableListOf<Byte>()
-        for (offset in 0 until normalizedSize) {
-            val expr = "System.Runtime.InteropServices.Marshal.ReadByte((System.IntPtr)($addressExpr), $offset)"
-            val eval = evaluateValue(evaluator, expr, session.currentPosition)
-            val value = eval.value?.let { describeValue(it).value }
-            val parsed = parseNumber(value)
-            bytes.add((parsed ?: 0).toByte())
-        }
-
-        val hexDump = bytes.joinToString(" ") { String.format("%02X", it) }
-        val asciiView = bytes.map { b ->
+        val bytesArray = snapshot.bytes
+        val bytes = bytesArray.toMutableList()
+        val hexDump = bytesArray.joinToString(" ") { String.format("%02X", it.toInt() and 0xFF) }
+        val asciiView = bytesArray.map { b ->
             val c = b.toInt().toChar()
             if (c.isLetterOrDigit() || c in " .-_:;!?") c else 0x2E.toChar()
         }.joinToString("")
 
         return MemoryResult(
-            address = addressExpr,
-            size = normalizedSize,
+            address = "0x" + formatAddressValue(baseAddress),
+            status = if (snapshot.partial) "partial" else "ok",
+            size = snapshot.bytesRead,
+            requestedSize = normalizedSize,
+            bytesRead = snapshot.bytesRead,
+            failedReads = snapshot.failedReads,
+            partial = snapshot.partial,
             bytes = bytes,
             hexDump = hexDump,
-            asciiView = asciiView
+            asciiView = asciiView,
+            formattedView = formatMemoryRows(baseAddress, bytesArray)
         )
     }
 
@@ -471,6 +853,201 @@ class DebuggerService {
             threads = getThreads(),
             modules = getModules()
         )
+    }
+
+    private fun captureDebugBundle(
+        expressions: List<String>,
+        expandChildren: Boolean,
+        maxDepth: Int,
+        outputTailLines: Int
+    ): DebugBundleResult {
+        val normalizedExpressions = normalizeExpressions(expressions)
+        val normalizedDepth = maxDepth.coerceIn(0, 4)
+        val normalizedTailLines = outputTailLines.coerceIn(0, 500)
+        val snapshotId = java.util.UUID.randomUUID().toString().replace("-", "")
+        val capturedAt = Instant.now().toString()
+        var bestEffort = DebugBundleResult(
+            snapshotId = snapshotId,
+            capturedAt = capturedAt,
+            snapshotStatus = "unavailable",
+            partial = true
+        )
+
+        for (attempt in 1..snapshotMaxAttempts) {
+            val session = currentSession() ?: return bestEffort.copy(
+                snapshotAttempts = attempt,
+                status = DebugStatusResult(),
+                stopReason = "not_paused",
+                expressions = buildUnavailableBatchEvaluateResult(
+                    snapshotId = snapshotId,
+                    capturedAt = capturedAt,
+                    requestedCount = normalizedExpressions.size,
+                    error = "No debug session"
+                ),
+                error = "No debug session"
+            )
+
+            val status = getDebugStatus()
+            if (!session.isSuspended) {
+                return bestEffort.copy(
+                    snapshotAttempts = attempt,
+                    stopReason = status.stopReason,
+                    status = status,
+                    expressions = buildUnavailableBatchEvaluateResult(
+                        snapshotId = snapshotId,
+                        capturedAt = capturedAt,
+                        requestedCount = normalizedExpressions.size,
+                        error = "Not in break mode"
+                    ),
+                    error = "Not in break mode"
+                )
+            }
+
+            try {
+                val suspendContext = session.suspendContext ?: return bestEffort.copy(
+                    snapshotAttempts = attempt,
+                    status = status,
+                    stopReason = status.stopReason,
+                    expressions = buildUnavailableBatchEvaluateResult(
+                        snapshotId = snapshotId,
+                        capturedAt = capturedAt,
+                        requestedCount = normalizedExpressions.size,
+                        error = "No suspend context"
+                    ),
+                    error = "No suspend context"
+                )
+                val tokenBefore = suspendSnapshotToken(session, suspendContext)
+
+                val callstack = buildCallStackResult(suspendContext).also {
+                    it.snapshotAttempts = 1
+                    it.snapshotStable = true
+                    it.snapshotStatus = if (it.frames.isNotEmpty()) "ok" else "unavailable"
+                }
+                val locals = buildLocalsResult(session, normalizedDepth)
+                val exception = getException()
+                val threads = buildThreadsResult(suspendContext).also {
+                    it.snapshotAttempts = 1
+                    it.snapshotStable = true
+                    it.snapshotStatus = if (it.threads.isNotEmpty()) "ok" else "unavailable"
+                }
+                val modules = getModules()
+                val registers = getRegisters()
+                val output = getOutputWindow("Debug", normalizedTailLines)
+                val evaluator = getEvaluator(session)
+                val expressionBatch = when {
+                    normalizedExpressions.isEmpty() -> BatchEvaluateResult(
+                        snapshotId = snapshotId,
+                        capturedAt = capturedAt,
+                        snapshotStable = true,
+                        snapshotAttempts = 1,
+                        snapshotStatus = "ok",
+                        requestedCount = 0,
+                        successCount = 0,
+                        failedCount = 0,
+                        partial = false
+                    )
+                    evaluator == null -> buildUnavailableBatchEvaluateResult(
+                        snapshotId = snapshotId,
+                        capturedAt = capturedAt,
+                        requestedCount = normalizedExpressions.size,
+                        error = "No evaluator available"
+                    )
+                    else -> buildBatchEvaluateSnapshot(
+                        normalizedExpressions = normalizedExpressions,
+                        expandChildren = expandChildren,
+                        maxDepth = normalizedDepth,
+                        session = session,
+                        evaluator = evaluator,
+                        snapshotId = snapshotId,
+                        capturedAt = capturedAt
+                    )
+                }
+
+                val currentContext = session.suspendContext
+                val stable = currentContext != null &&
+                    session.isSuspended &&
+                    tokenBefore == suspendSnapshotToken(session, currentContext)
+                val expressionStatus = if (stable) {
+                    if (expressionBatch.partial) "partial" else "ok"
+                } else {
+                    "unstable"
+                }
+                val expressionSnapshot = expressionBatch.copy(
+                    snapshotStable = stable,
+                    snapshotAttempts = attempt,
+                    snapshotStatus = expressionStatus
+                )
+                val partial = isBundlePartial(callstack, threads, modules, registers, output, expressionBatch)
+                val snapshotStatus = if (stable) {
+                    if (partial) "partial" else "ok"
+                } else {
+                    "unstable"
+                }
+
+                val errorParts = mutableListOf<String>()
+                modules.error?.let { if (it.isNotBlank()) errorParts.add("modules: $it") }
+                registers.error?.let { if (it.isNotBlank()) errorParts.add("registers: $it") }
+                output.error?.let { if (it.isNotBlank()) errorParts.add("output: $it") }
+                expressionBatch.error?.let { if (it.isNotBlank()) errorParts.add("expressions: $it") }
+
+                val snapshot = DebugBundleResult(
+                    snapshotId = snapshotId,
+                    capturedAt = capturedAt,
+                    snapshotStable = stable,
+                    snapshotAttempts = attempt,
+                    snapshotStatus = snapshotStatus,
+                    partial = partial,
+                    stopReason = status.stopReason,
+                    status = status,
+                    callstack = callstack,
+                    locals = locals,
+                    exception = exception,
+                    threads = threads,
+                    modules = modules,
+                    registers = registers,
+                    output = output,
+                    expressions = expressionSnapshot,
+                    error = if (errorParts.isEmpty()) null else errorParts.joinToString("; ")
+                )
+                bestEffort = snapshot
+                if (stable) {
+                    return snapshot
+                }
+            } catch (ex: Exception) {
+                bestEffort = bestEffort.copy(
+                    snapshotAttempts = attempt,
+                    status = status,
+                    stopReason = status.stopReason,
+                    error = ex.message ?: bestEffort.error
+                )
+                if (bestEffort.status != null) {
+                    bestEffort = bestEffort.copy(snapshotStatus = "unstable")
+                }
+            }
+
+            if (attempt < snapshotMaxAttempts) {
+                Thread.sleep(snapshotRetryDelayMs)
+            }
+        }
+
+        return bestEffort
+    }
+
+    private fun isBundlePartial(
+        callstack: CallStackResult,
+        threads: ThreadsResult,
+        modules: ModulesResult,
+        registers: RegistersResult,
+        output: OutputWindowResult,
+        expressions: BatchEvaluateResult
+    ): Boolean {
+        if (callstack.snapshotStatus != "ok") return true
+        if (threads.snapshotStatus != "ok") return true
+        if (!modules.error.isNullOrBlank()) return true
+        if (!registers.error.isNullOrBlank()) return true
+        if (!output.error.isNullOrBlank()) return true
+        if (expressions.partial || expressions.failedCount > 0) return true
+        return false
     }
 
     private fun getInstanceInfo(pipeName: String): InstanceInfoResult {
@@ -656,13 +1233,24 @@ class DebuggerService {
     }
 
     private fun getRegisters(): RegistersResult {
-        val session = currentSession() ?: return RegistersResult(error = "No debug session")
-        val evaluator = getEvaluator(session) ?: return RegistersResult(error = "No evaluator available")
+        val capability = "general_registers_plus_best_effort_extended"
+        val categories = mutableSetOf<String>()
+        val session = currentSession() ?: return RegistersResult(
+            capability = capability,
+            availableCategories = mutableListOf("General Purpose"),
+            error = "No debug session"
+        )
+        val evaluator = getEvaluator(session) ?: return RegistersResult(
+            capability = capability,
+            availableCategories = mutableListOf("General Purpose"),
+            error = "No evaluator available"
+        )
         val registers = mutableListOf<RegisterInfo>()
         var is64 = false
 
         val candidates64 = listOf("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "rip", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rflags")
         val candidates32 = listOf("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags")
+        val segmentRegs = listOf("cs", "ds", "es", "fs", "gs", "ss")
 
         fun tryRegister(name: String): String? {
             val expr = "@$name"
@@ -670,60 +1258,160 @@ class DebuggerService {
             return eval.value?.let { describeValue(it).value }
         }
 
+        fun addRegister(name: String, value: String?, category: String) {
+            if (value.isNullOrBlank()) return
+            categories.add(category)
+            registers.add(
+                RegisterInfo(
+                    name = name.uppercase(Locale.ROOT),
+                    value = value,
+                    hexValue = value,
+                    category = category
+                )
+            )
+        }
+
         candidates64.forEach { reg ->
             val value = tryRegister(reg)
             if (!value.isNullOrBlank()) {
                 is64 = true
-                registers.add(RegisterInfo(name = reg.uppercase(Locale.ROOT), value = value, hexValue = value))
+                addRegister(reg, value, registerCategory(reg))
             }
         }
 
         if (!is64) {
             candidates32.forEach { reg ->
                 val value = tryRegister(reg)
-                if (!value.isNullOrBlank()) {
-                    registers.add(RegisterInfo(name = reg.uppercase(Locale.ROOT), value = value, hexValue = value))
-                }
+                addRegister(reg, value, registerCategory(reg))
             }
         }
 
-        return RegistersResult(registers = registers, is64Bit = is64)
+        segmentRegs.forEach { reg ->
+            val value = tryRegister(reg)
+            addRegister(reg, value, "Segment")
+        }
+
+        // Best effort: not every engine exposes SSE registers.
+        for (i in 0 until 16) {
+            val reg = "xmm$i"
+            val value = tryRegister(reg)
+            addRegister(reg, value, "SSE")
+        }
+
+        if (categories.isEmpty()) {
+            categories.add("General Purpose")
+        }
+
+        return RegistersResult(
+            registers = registers,
+            is64Bit = is64,
+            capability = capability,
+            availableCategories = categories.sorted().toMutableList()
+        )
     }
 
     private fun addWatch(expression: String): WatchResult {
-        val session = currentSession() ?: return WatchResult(expression = expression, isValid = false, error = "No debug session")
-        val evaluator = getEvaluator(session) ?: return WatchResult(expression = expression, isValid = false, error = "No evaluator available")
+        val behavior = "evaluate_only"
+        val session = currentSession()
+            ?: return WatchResult(expression = expression, behavior = behavior, isValid = false, error = "No debug session")
+        val evaluator = getEvaluator(session)
+            ?: return WatchResult(expression = expression, behavior = behavior, isValid = false, error = "No evaluator available")
         val eval = evaluateValue(evaluator, expression, session.currentPosition)
         if (eval.value == null) {
-            return WatchResult(expression = expression, isValid = false, error = eval.errorMessage)
+            return WatchResult(expression = expression, behavior = behavior, isValid = false, error = eval.errorMessage)
         }
         val presentation = describeValue(eval.value)
-        return WatchResult(expression = expression, value = presentation.value, type = presentation.type, isValid = true)
+        return WatchResult(
+            expression = expression,
+            behavior = behavior,
+            value = presentation.value,
+            type = presentation.type,
+            isValid = true
+        )
     }
 
     private fun searchMemory(startAddress: String, pattern: String, maxResults: Int, searchSize: Int): MemorySearchResult {
-        val session = currentSession() ?: return MemorySearchResult(pattern = pattern, error = "No debug session")
-        val evaluator = getEvaluator(session) ?: return MemorySearchResult(pattern = pattern, error = "No evaluator available")
-        val addressExpr = resolveAddressExpression(startAddress, evaluator, session.currentPosition)
-            ?: return MemorySearchResult(pattern = pattern, error = "Invalid address")
-
         val bytesToScan = searchSize.coerceIn(1, 0x100000)
-        val bytes = ByteArray(bytesToScan)
-        for (offset in 0 until bytesToScan) {
-            val expr = "System.Runtime.InteropServices.Marshal.ReadByte((System.IntPtr)($addressExpr), $offset)"
-            val eval = evaluateValue(evaluator, expr, session.currentPosition)
-            val value = eval.value?.let { describeValue(it).value }
-            val parsed = parseNumber(value) ?: 0
-            bytes[offset] = parsed.toByte()
+        val normalizedMaxResults = maxResults.coerceIn(1, 10000)
+        var bestEffort = buildUnavailableMemorySearchResult(pattern, bytesToScan)
+
+        for (attempt in 1..snapshotMaxAttempts) {
+            val session = currentSession() ?: return bestEffort
+            if (!session.isSuspended) {
+                return bestEffort
+            }
+
+            try {
+                val suspendContext = session.suspendContext ?: return bestEffort
+                val tokenBefore = suspendSnapshotToken(session, suspendContext)
+                val snapshot = searchMemoryOnce(
+                    startAddress = startAddress,
+                    pattern = pattern,
+                    maxResults = normalizedMaxResults,
+                    bytesToScan = bytesToScan,
+                    session = session
+                )
+                val currentContext = session.suspendContext
+                val stable = currentContext != null &&
+                    session.isSuspended &&
+                    tokenBefore == suspendSnapshotToken(session, currentContext)
+
+                if (stable) {
+                    return snapshot
+                }
+
+                bestEffort = if (snapshot.bytesSearched > 0) {
+                    snapshot.copy(status = "unstable")
+                } else {
+                    snapshot
+                }
+            } catch (_: Exception) {
+                // Keep best effort unavailable/partial result and retry once.
+            }
+
+            if (attempt < snapshotMaxAttempts) {
+                Thread.sleep(snapshotRetryDelayMs)
+            }
         }
+
+        return bestEffort
+    }
+
+    private fun buildUnavailableMemorySearchResult(pattern: String, bytesToScan: Int): MemorySearchResult {
+        return MemorySearchResult(
+            pattern = pattern,
+            status = "unavailable",
+            requestedBytes = bytesToScan,
+            failedReads = bytesToScan
+        )
+    }
+
+    private fun searchMemoryOnce(
+        startAddress: String,
+        pattern: String,
+        maxResults: Int,
+        bytesToScan: Int,
+        session: XDebugSession
+    ): MemorySearchResult {
+        val evaluator = getEvaluator(session) ?: return buildUnavailableMemorySearchResult(pattern, bytesToScan)
+        val addressExpr = resolveAddressExpression(startAddress, evaluator, session.currentPosition)
+            ?: return buildUnavailableMemorySearchResult(pattern, bytesToScan)
+        val baseAddress = parseNumber(addressExpr)
+            ?: return buildUnavailableMemorySearchResult(pattern, bytesToScan)
 
         val patternBytes = parsePattern(pattern)
         if (patternBytes.isEmpty()) {
-            return MemorySearchResult(pattern = pattern, error = "Invalid pattern")
+            return buildUnavailableMemorySearchResult(pattern, bytesToScan)
         }
+        val formattedPattern = patternBytes.map { String.format("%02X", it.toInt() and 0xFF) }.toTypedArray()
+
+        val snapshot = readMemorySnapshot(baseAddress, bytesToScan, evaluator, session.currentPosition)
+        if (snapshot.bytesRead == 0) {
+            return buildUnavailableMemorySearchResult(pattern, bytesToScan).copy(patternBytes = formattedPattern)
+        }
+        val bytes = snapshot.bytes
 
         val matches = mutableListOf<String>()
-        val baseAddress = parseNumber(addressExpr) ?: 0L
         var i = 0
         while (i <= bytes.size - patternBytes.size && matches.size < maxResults) {
             var match = true
@@ -735,17 +1423,21 @@ class DebuggerService {
             }
             if (match) {
                 val address = baseAddress + i
-                matches.add("0x" + address.toString(16))
+                matches.add("0x" + formatAddressValue(address))
             }
             i++
         }
 
         return MemorySearchResult(
             pattern = pattern,
-            patternBytes = patternBytes.map { String.format("%02X", it) }.toTypedArray(),
+            status = if (snapshot.partial) "partial" else "ok",
+            patternBytes = formattedPattern,
             matches = matches,
             totalFound = matches.size,
-            bytesSearched = bytes.size
+            bytesSearched = bytes.size,
+            requestedBytes = bytesToScan,
+            failedReads = snapshot.failedReads,
+            partial = snapshot.partial
         )
     }
 
@@ -848,14 +1540,29 @@ class DebuggerService {
     }
 
     private fun getOutputWindow(pane: String, tailLines: Int): OutputWindowResult {
-        val session = currentSession() ?: return OutputWindowResult(pane = pane, error = "No debug session")
-        val console = session.consoleView ?: return OutputWindowResult(pane = pane, error = "No console")
-        val text = getConsoleText(console) ?: return OutputWindowResult(pane = pane, error = "Console does not expose text")
+        val capability = "limited_to_debug_console"
+        val requestedPane = pane.ifBlank { "Debug" }
+        if (!requestedPane.equals("Debug", ignoreCase = true)) {
+            return OutputWindowResult(
+                pane = requestedPane,
+                capability = capability,
+                availablePanes = mutableListOf("Debug"),
+                error = "Pane '$requestedPane' is not supported in Rider. Only 'Debug' is available."
+            )
+        }
+
+        val session = currentSession()
+            ?: return OutputWindowResult(pane = "Debug", capability = capability, availablePanes = mutableListOf("Debug"), error = "No debug session")
+        val console = session.consoleView
+            ?: return OutputWindowResult(pane = "Debug", capability = capability, availablePanes = mutableListOf("Debug"), error = "No console")
+        val text = getConsoleText(console)
+            ?: return OutputWindowResult(pane = "Debug", capability = capability, availablePanes = mutableListOf("Debug"), error = "Console does not expose text")
         val lines = text.split("\n")
         val count = if (tailLines <= 0) lines.size else tailLines.coerceAtMost(lines.size)
         val slice = if (tailLines <= 0) lines else lines.takeLast(count)
         return OutputWindowResult(
-            pane = pane,
+            pane = "Debug",
+            capability = capability,
             content = slice.joinToString("\n"),
             lineCount = lines.size,
             requestedLines = tailLines,
@@ -865,9 +1572,10 @@ class DebuggerService {
     }
 
     private fun searchOutput(pattern: String, pane: String, isRegex: Boolean, contextLines: Int, maxMatches: Int): SearchOutputResult {
+        val capability = "limited_to_debug_console"
         val output = getOutputWindow(pane, 0)
         if (output.content == null) {
-            return SearchOutputResult(pane = pane, pattern = pattern, isRegex = isRegex, error = output.error)
+            return SearchOutputResult(pane = pane, capability = capability, pattern = pattern, isRegex = isRegex, error = output.error)
         }
         val lines = output.content.split("\n")
         val matches = mutableListOf<OutputMatch>()
@@ -875,7 +1583,13 @@ class DebuggerService {
             try {
                 Regex(pattern)
             } catch (ex: Exception) {
-                return SearchOutputResult(pane = pane, pattern = pattern, isRegex = isRegex, error = "Invalid regex: ${ex.message}")
+                return SearchOutputResult(
+                    pane = pane,
+                    capability = capability,
+                    pattern = pattern,
+                    isRegex = isRegex,
+                    error = "Invalid regex: ${ex.message}"
+                )
             }
         } else {
             null
@@ -894,6 +1608,7 @@ class DebuggerService {
 
         return SearchOutputResult(
             pane = pane,
+            capability = capability,
             pattern = pattern,
             isRegex = isRegex,
             matches = matches,
@@ -928,6 +1643,70 @@ class DebuggerService {
             )
         }
         return null
+    }
+
+    private fun buildCallStackResult(suspendContext: XSuspendContext): CallStackResult {
+        val stack = getSelectedStack(suspendContext)
+        val frames = stack?.let { collectStackFrames(it) } ?: emptyList()
+        val result = CallStackResult(capability = "partial_frame_metadata")
+        if (stack != null) {
+            result.threadId = threadId(stack)
+            result.threadName = stack.displayName
+        }
+        frames.forEachIndexed { index, frame ->
+            val location = getFrameLocation(frame)
+            val frameName = getFrameName(frame)
+            val inferredLanguage = inferLanguage(location?.filePath, frameName)
+            result.frames.add(
+                StackFrameInfo(
+                    index = index,
+                    functionName = frameName,
+                    filePath = location?.filePath ?: "",
+                    lineNumber = location?.lineNumber ?: 0,
+                    lineNumberReliable = location != null,
+                    columnNumber = location?.columnNumber ?: 1,
+                    module = parseModuleFromFrameName(frameName),
+                    language = inferredLanguage,
+                    returnType = null
+                )
+            )
+        }
+        return result
+    }
+
+    private fun buildThreadsResult(suspendContext: XSuspendContext): ThreadsResult {
+        val stacks = suspendContext.executionStacks?.toList() ?: emptyList()
+        val active = suspendContext.activeExecutionStack
+        val result = ThreadsResult(capability = "partial_thread_metadata")
+        stacks.forEach { stack ->
+            val id = threadId(stack)
+            val location = getStackLocation(stack)
+            result.threads.add(
+                ThreadInfo(
+                    id = id,
+                    name = stack.displayName,
+                    isCurrent = stack == active,
+                    isFrozen = false,
+                    location = location,
+                    priority = "unknown",
+                    suspendCount = -1
+                )
+            )
+        }
+        result.currentThreadId = selectedThreadId ?: (active?.let { threadId(it) } ?: 0)
+        return result
+    }
+
+    private fun suspendSnapshotToken(session: XDebugSession, suspendContext: XSuspendContext): String {
+        val active = suspendContext.activeExecutionStack
+        val activeId = active?.let { threadId(it) } ?: 0
+        val frame = getSelectedFrame(session)
+        val frameName = frame?.let { getFrameName(it) } ?: ""
+        val frameLine = frame?.sourcePosition?.line?.plus(1) ?: 0
+        val position = session.currentPosition ?: session.topFramePosition
+        val filePath = position?.file?.path ?: ""
+        val line = position?.line?.plus(1) ?: 0
+        return "$activeId|$filePath|$line|$frameName|$frameLine"
     }
 
     private fun getSelectedStack(suspendContext: XSuspendContext): XExecutionStack? {
@@ -1208,6 +1987,33 @@ class DebuggerService {
         return builder.toString().ifBlank { frame.toString() }
     }
 
+    private fun parseModuleFromFrameName(frameName: String): String? {
+        val normalized = frameName.trim()
+        if (normalized.isEmpty()) return null
+        val bangIndex = normalized.indexOf('!')
+        if (bangIndex > 0) {
+            return normalized.substring(0, bangIndex)
+        }
+        return null
+    }
+
+    private fun inferLanguage(filePath: String?, frameName: String): String? {
+        val lowerPath = filePath?.lowercase(Locale.ROOT) ?: ""
+        return when {
+            lowerPath.endsWith(".cs") -> "C#"
+            lowerPath.endsWith(".vb") -> "VB"
+            lowerPath.endsWith(".fs") -> "F#"
+            lowerPath.endsWith(".cpp") || lowerPath.endsWith(".cc") || lowerPath.endsWith(".cxx") -> "C++"
+            lowerPath.endsWith(".c") -> "C"
+            lowerPath.endsWith(".rs") -> "Rust"
+            lowerPath.endsWith(".go") -> "Go"
+            lowerPath.endsWith(".java") -> "Java"
+            lowerPath.endsWith(".kt") || lowerPath.endsWith(".kts") -> "Kotlin"
+            frameName.contains("::") -> "C++"
+            else -> null
+        }
+    }
+
     private fun currentProject(): Project? {
         return ProjectManager.getInstance().openProjects.firstOrNull { !it.isDisposed }
     }
@@ -1239,6 +2045,72 @@ class DebuggerService {
         val display = stack.displayName
         val match = Regex("\\d+").find(display ?: "")
         return match?.value?.toIntOrNull() ?: stack.hashCode()
+    }
+
+    private fun normalizeVariableValue(value: String?): String? {
+        val normalized = value?.trim()?.trim('"')
+        if (normalized.isNullOrBlank()) return null
+        if (normalized.equals("null", ignoreCase = true)) return null
+        return normalized
+    }
+
+    private fun extractVariableByName(children: List<VariableInfo>?, vararg names: String): VariableInfo? {
+        if (children.isNullOrEmpty()) return null
+        val candidates = names.map { it.trim() }.filter { it.isNotEmpty() }
+        if (candidates.isEmpty()) return null
+
+        return children.firstOrNull { variable ->
+            val rawName = variable.name.trim()
+            candidates.any { candidate ->
+                rawName.equals(candidate, ignoreCase = true) ||
+                    rawName.endsWith(".$candidate", ignoreCase = true)
+            }
+        }
+    }
+
+    private fun extractVariableValueByName(children: List<VariableInfo>?, vararg names: String): String? {
+        val variable = extractVariableByName(children, *names) ?: return null
+        return normalizeVariableValue(variable.value)
+    }
+
+    private fun extractVariableChildValue(variable: VariableInfo, vararg names: String): String? {
+        return extractVariableValueByName(variable.children, *names)
+    }
+
+    private fun toInnerException(variable: VariableInfo?): ExceptionResult? {
+        if (variable == null) return null
+        val message = extractVariableChildValue(variable, "Message") ?: normalizeVariableValue(variable.value)
+        if (message.isNullOrBlank()) return null
+
+        return ExceptionResult(
+            hasException = true,
+            capability = "limited_exception_details",
+            type = variable.type,
+            message = message,
+            stackTrace = extractVariableChildValue(variable, "StackTrace"),
+            source = extractVariableChildValue(variable, "Source"),
+            hResult = extractVariableChildValue(variable, "HResult")
+        )
+    }
+
+    private fun isSystemPath(path: String?): Boolean {
+        val normalized = path?.lowercase(Locale.ROOT) ?: return false
+        return normalized.contains("\\windows\\") ||
+            normalized.contains("/windows/") ||
+            normalized.contains("\\system32\\") ||
+            normalized.contains("/system32/") ||
+            normalized.contains("\\syswow64\\") ||
+            normalized.contains("/syswow64/")
+    }
+
+    private fun registerCategory(name: String): String {
+        val normalized = name.lowercase(Locale.ROOT)
+        return when {
+            normalized == "rip" || normalized == "eip" || normalized.contains("ip") -> "Instruction Pointer"
+            normalized == "rsp" || normalized == "esp" || normalized == "rbp" || normalized == "ebp" -> "Stack"
+            normalized.contains("flag") -> "Flags"
+            else -> "General Purpose"
+        }
     }
 
     private data class EvaluationResult(
@@ -1303,11 +2175,13 @@ class DebuggerService {
 
     private fun parseNumber(value: String?): Long? {
         if (value.isNullOrBlank()) return null
-        val text = value.trim()
+        val text = value.trim().trim('"')
 
-        val hexMatch = Regex("0x[0-9a-fA-F]+").find(text)
+        // Only parse values that clearly start with a numeric literal.
+        // This avoids mis-parsing arbitrary strings like "ptr1" as address 1.
+        val hexMatch = Regex("^0x([0-9a-fA-F]+)", RegexOption.IGNORE_CASE).find(text)
         if (hexMatch != null) {
-            val hex = hexMatch.value.removePrefix("0x")
+            val hex = hexMatch.groupValues[1]
             return try {
                 java.lang.Long.parseUnsignedLong(hex, 16)
             } catch (_: Exception) {
@@ -1315,7 +2189,7 @@ class DebuggerService {
             }
         }
 
-        val decMatch = Regex("-?\\d+").find(text)
+        val decMatch = Regex("^[+-]?\\d+").find(text)
         return decMatch?.value?.toLongOrNull()
     }
 
@@ -1521,47 +2395,126 @@ class DebuggerService {
         return null
     }
 
+    private data class MemoryReadSnapshot(
+        val bytes: ByteArray,
+        val requestedSize: Int,
+        val bytesRead: Int,
+        val failedReads: Int,
+        val partial: Boolean
+    )
+
+    private fun readMemorySnapshot(
+        address: Long,
+        size: Int,
+        evaluator: XDebuggerEvaluator,
+        position: XSourcePosition?
+    ): MemoryReadSnapshot {
+        val readSize = size.coerceIn(1, 0x100000)
+        val addressHex = formatAddressValue(address)
+        val collected = ArrayList<Byte>(readSize)
+        var offset = 0
+
+        while (offset < readSize) {
+            val remaining = readSize - offset
+            val chunk = when {
+                remaining >= 256 -> 256
+                remaining >= 64 -> 64
+                remaining >= 16 -> 16
+                else -> remaining
+            }
+
+            var block = tryReadMemoryBlock(addressHex, offset, chunk, evaluator, position)
+            if (block == null || block.isEmpty()) {
+                if (chunk > 1) {
+                    val fallbackSize = minOf(16, remaining)
+                    block = tryReadMemoryBlock(addressHex, offset, fallbackSize, evaluator, position)
+                }
+                if (block == null || block.isEmpty()) {
+                    block = tryReadMemoryBlock(addressHex, offset, 1, evaluator, position)
+                }
+            }
+
+            if (block == null || block.isEmpty()) {
+                break
+            }
+
+            block.forEach { collected.add(it) }
+            offset += block.size
+        }
+
+        val bytes = collected.toByteArray()
+        val failed = (readSize - bytes.size).coerceAtLeast(0)
+        return MemoryReadSnapshot(
+            bytes = bytes,
+            requestedSize = readSize,
+            bytesRead = bytes.size,
+            failedReads = failed,
+            partial = failed > 0
+        )
+    }
+
+    private fun tryReadMemoryBlock(
+        addressHex: String,
+        offset: Int,
+        size: Int,
+        evaluator: XDebuggerEvaluator,
+        position: XSourcePosition?
+    ): ByteArray? {
+        if (size <= 0) return null
+        val expr =
+            "System.Convert.ToBase64String(System.Linq.Enumerable.Range($offset, $size).Select(i => " +
+                "System.Runtime.InteropServices.Marshal.ReadByte((System.IntPtr)(0x$addressHex), i)).ToArray())"
+        val eval = evaluateValue(evaluator, expr, position)
+        val raw = eval.value?.let { describeValue(it).value }?.trim()
+        val base64 = raw?.trim('"')
+        if (base64.isNullOrBlank()) {
+            return null
+        }
+        return try {
+            val decoded = Base64.getDecoder().decode(base64)
+            if (decoded.isEmpty()) null else decoded
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun readMemoryBytes(
         address: Long,
         size: Int,
         evaluator: XDebuggerEvaluator,
         position: XSourcePosition?
     ): ByteArray? {
-        val readSize = size.coerceIn(1, 4096)
-        val addressHex = formatAddressValue(address)
-        val expr = "System.Convert.ToBase64String(System.Linq.Enumerable.Range(0, $readSize).Select(i => System.Runtime.InteropServices.Marshal.ReadByte((System.IntPtr)(0x$addressHex), i)).ToArray())"
-        val eval = evaluateValue(evaluator, expr, position)
-        val raw = eval.value?.let { describeValue(it).value }?.trim()
-        val base64 = raw?.trim('"')
-        if (!base64.isNullOrBlank()) {
-            try {
-                val decoded = Base64.getDecoder().decode(base64)
-                if (decoded.isNotEmpty()) {
-                    return decoded
-                }
-            } catch (_: Exception) {
-            }
-        }
-
-        val bytes = ByteArray(readSize)
-        var actual = 0
-        for (offset in 0 until readSize) {
-            val byteExpr = "System.Runtime.InteropServices.Marshal.ReadByte((System.IntPtr)(0x$addressHex), $offset)"
-            val byteEval = evaluateValue(evaluator, byteExpr, position)
-            val value = byteEval.value?.let { describeValue(it).value }
-            val parsed = parseNumber(value)
-            if (parsed == null) {
-                break
-            }
-            bytes[offset] = parsed.toByte()
-            actual++
-        }
-
-        return if (actual > 0) bytes.copyOf(actual) else null
+        val snapshot = readMemorySnapshot(address, size.coerceIn(1, 4096), evaluator, position)
+        return if (snapshot.bytesRead > 0) snapshot.bytes else null
     }
 
     private fun formatBytes(bytes: ByteArray): String {
         return bytes.joinToString(" ") { b -> String.format("%02X", b.toInt() and 0xFF) }
+    }
+
+    private fun formatMemoryRows(baseAddress: Long, bytes: ByteArray): String {
+        if (bytes.isEmpty()) return ""
+        val rows = StringBuilder()
+        val bytesPerRow = 16
+        var offset = 0
+        while (offset < bytes.size) {
+            val count = minOf(bytesPerRow, bytes.size - offset)
+            val lineBytes = bytes.copyOfRange(offset, offset + count)
+            val hex = lineBytes.joinToString(" ") { String.format("%02X", it.toInt() and 0xFF) }
+            val ascii = lineBytes.map { b ->
+                val c = (b.toInt() and 0xFF).toChar()
+                if (c in '\u0020'..'\u007E') c else '.'
+            }.joinToString("")
+            rows.append("0x")
+                .append(formatAddressValue(baseAddress + offset.toLong()))
+                .append(": ")
+                .append(hex)
+                .append(" | ")
+                .append(ascii)
+                .append('\n')
+            offset += count
+        }
+        return rows.toString().trimEnd()
     }
 
     private fun formatAddress(address: Long, is64Bit: Boolean): String {
@@ -1722,6 +2675,16 @@ class DebuggerService {
             }
         }
         return false
+    }
+
+    private fun getStringListParam(params: Map<String, Any?>?, key: String): List<String> {
+        val value = params?.get(key) ?: return emptyList()
+        return when (value) {
+            is String -> listOf(value)
+            is Collection<*> -> value.mapNotNull { it?.toString() }
+            is Array<*> -> value.mapNotNull { it?.toString() }
+            else -> emptyList()
+        }
     }
 
     private inline fun <reified T> getParam(params: Map<String, Any?>?, key: String, default: T): T {

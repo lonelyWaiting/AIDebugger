@@ -9,6 +9,8 @@ data class DebugStatusResult(
     @SerializedName("isPaused") val isPaused: Boolean = false,
     @SerializedName("debugMode") val debugMode: String = "",
     @SerializedName("currentProcess") val currentProcess: String? = null,
+    @SerializedName("stopReason") val stopReason: String = "not_paused",
+    @SerializedName("stopReasonRaw") val stopReasonRaw: String? = null,
     @SerializedName("currentLocation") val currentLocation: LocationInfo? = null
 )
 
@@ -24,6 +26,10 @@ data class LocationInfo(
 data class CallStackResult(
     @SerializedName("threadId") var threadId: Int = 0,
     @SerializedName("threadName") var threadName: String = "",
+    @SerializedName("capability") var capability: String? = null,
+    @SerializedName("snapshotStable") var snapshotStable: Boolean = false,
+    @SerializedName("snapshotAttempts") var snapshotAttempts: Int = 0,
+    @SerializedName("snapshotStatus") var snapshotStatus: String = "unavailable",
     @SerializedName("frames") val frames: MutableList<StackFrameInfo> = mutableListOf()
 )
 
@@ -59,6 +65,10 @@ data class VariableInfo(
 
 data class ThreadsResult(
     @SerializedName("currentThreadId") var currentThreadId: Int = 0,
+    @SerializedName("capability") var capability: String? = null,
+    @SerializedName("snapshotStable") var snapshotStable: Boolean = false,
+    @SerializedName("snapshotAttempts") var snapshotAttempts: Int = 0,
+    @SerializedName("snapshotStatus") var snapshotStatus: String = "unavailable",
     @SerializedName("threads") val threads: MutableList<ThreadInfo> = mutableListOf()
 )
 
@@ -77,6 +87,7 @@ data class ThreadInfo(
 data class ModulesResult(
     @SerializedName("modules") val modules: MutableList<ModuleInfo> = mutableListOf(),
     @SerializedName("totalCount") val totalCount: Int = 0,
+    @SerializedName("capability") val capability: String? = null,
     @SerializedName("error") val error: String? = null
 )
 
@@ -98,6 +109,7 @@ data class ModuleInfo(
 
 data class ExceptionResult(
     @SerializedName("hasException") val hasException: Boolean = false,
+    @SerializedName("capability") val capability: String? = null,
     @SerializedName("type") val type: String? = null,
     @SerializedName("message") val message: String? = null,
     @SerializedName("stackTrace") val stackTrace: String? = null,
@@ -119,15 +131,35 @@ data class EvaluateResult(
     @SerializedName("children") val children: MutableList<VariableInfo>? = null
 )
 
+data class BatchEvaluateResult(
+    @SerializedName("snapshotId") val snapshotId: String = "",
+    @SerializedName("capturedAt") val capturedAt: String = "",
+    @SerializedName("snapshotStable") val snapshotStable: Boolean = false,
+    @SerializedName("snapshotAttempts") val snapshotAttempts: Int = 0,
+    @SerializedName("snapshotStatus") val snapshotStatus: String = "unavailable",
+    @SerializedName("requestedCount") val requestedCount: Int = 0,
+    @SerializedName("successCount") val successCount: Int = 0,
+    @SerializedName("failedCount") val failedCount: Int = 0,
+    @SerializedName("partial") val partial: Boolean = false,
+    @SerializedName("results") val results: MutableList<EvaluateResult> = mutableListOf(),
+    @SerializedName("error") val error: String? = null
+)
+
 // Memory
 
 data class MemoryResult(
     @SerializedName("address") val address: String = "",
+    @SerializedName("status") val status: String = "unavailable",
     @SerializedName("size") val size: Int = 0,
+    @SerializedName("requestedSize") val requestedSize: Int = 0,
+    @SerializedName("bytesRead") val bytesRead: Int = 0,
+    @SerializedName("failedReads") val failedReads: Int = 0,
+    @SerializedName("partial") val partial: Boolean = false,
     @SerializedName("hexDump") val hexDump: String? = null,
     @SerializedName("asciiView") val asciiView: String? = null,
     @SerializedName("bytes") val bytes: MutableList<Byte> = mutableListOf(),
-    @SerializedName("formattedView") val formattedView: String? = null
+    @SerializedName("formattedView") val formattedView: String? = null,
+    @SerializedName("error") val error: String? = null
 )
 
 // Disassembly
@@ -185,6 +217,26 @@ data class FullContextResult(
     @SerializedName("exception") val exception: ExceptionResult? = null,
     @SerializedName("threads") val threads: ThreadsResult? = null,
     @SerializedName("modules") val modules: ModulesResult? = null
+)
+
+data class DebugBundleResult(
+    @SerializedName("snapshotId") val snapshotId: String = "",
+    @SerializedName("capturedAt") val capturedAt: String = "",
+    @SerializedName("snapshotStable") val snapshotStable: Boolean = false,
+    @SerializedName("snapshotAttempts") val snapshotAttempts: Int = 0,
+    @SerializedName("snapshotStatus") val snapshotStatus: String = "unavailable",
+    @SerializedName("partial") val partial: Boolean = false,
+    @SerializedName("stopReason") val stopReason: String = "not_paused",
+    @SerializedName("status") val status: DebugStatusResult? = null,
+    @SerializedName("callstack") val callstack: CallStackResult? = null,
+    @SerializedName("locals") val locals: LocalsResult? = null,
+    @SerializedName("exception") val exception: ExceptionResult? = null,
+    @SerializedName("threads") val threads: ThreadsResult? = null,
+    @SerializedName("modules") val modules: ModulesResult? = null,
+    @SerializedName("registers") val registers: RegistersResult? = null,
+    @SerializedName("output") val output: OutputWindowResult? = null,
+    @SerializedName("expressions") val expressions: BatchEvaluateResult? = null,
+    @SerializedName("error") val error: String? = null
 )
 
 // Ping
@@ -255,6 +307,8 @@ data class BreakpointOperationResult(
 data class RegistersResult(
     @SerializedName("registers") val registers: MutableList<RegisterInfo> = mutableListOf(),
     @SerializedName("is64Bit") val is64Bit: Boolean = false,
+    @SerializedName("capability") val capability: String? = null,
+    @SerializedName("availableCategories") val availableCategories: MutableList<String> = mutableListOf(),
     @SerializedName("error") val error: String? = null
 )
 
@@ -269,6 +323,7 @@ data class RegisterInfo(
 
 data class WatchResult(
     @SerializedName("expression") val expression: String = "",
+    @SerializedName("behavior") val behavior: String? = null,
     @SerializedName("value") val value: String? = null,
     @SerializedName("type") val type: String? = null,
     @SerializedName("isValid") val isValid: Boolean = false,
@@ -279,10 +334,14 @@ data class WatchResult(
 
 data class MemorySearchResult(
     @SerializedName("pattern") val pattern: String = "",
+    @SerializedName("status") val status: String = "unavailable",
     @SerializedName("patternBytes") val patternBytes: Array<String> = emptyArray(),
     @SerializedName("matches") val matches: MutableList<String> = mutableListOf(),
     @SerializedName("totalFound") val totalFound: Int = 0,
     @SerializedName("bytesSearched") val bytesSearched: Int = 0,
+    @SerializedName("requestedBytes") val requestedBytes: Int = 0,
+    @SerializedName("failedReads") val failedReads: Int = 0,
+    @SerializedName("partial") val partial: Boolean = false,
     @SerializedName("error") val error: String? = null
 )
 
@@ -290,6 +349,7 @@ data class MemorySearchResult(
 
 data class OutputWindowResult(
     @SerializedName("pane") val pane: String = "",
+    @SerializedName("capability") val capability: String? = null,
     @SerializedName("content") val content: String? = null,
     @SerializedName("lineCount") val lineCount: Int = 0,
     @SerializedName("requestedLines") val requestedLines: Int = 0,
@@ -300,6 +360,7 @@ data class OutputWindowResult(
 
 data class SearchOutputResult(
     @SerializedName("pane") val pane: String = "",
+    @SerializedName("capability") val capability: String? = null,
     @SerializedName("pattern") val pattern: String = "",
     @SerializedName("isRegex") val isRegex: Boolean = false,
     @SerializedName("matches") val matches: MutableList<OutputMatch> = mutableListOf(),

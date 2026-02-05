@@ -144,6 +144,11 @@ class NamedPipeServer(
         return System.getProperty("os.name").lowercase().contains("win")
     }
 
+    private fun isStrictPipeSecurityEnabled(): Boolean {
+        val value = System.getenv("AIDB_PIPE_SECURITY")?.trim()?.lowercase() ?: return false
+        return value == "strict" || value == "same_user" || value == "owner_only"
+    }
+
     private data class PipeSecurity(val attributes: WinBase.SECURITY_ATTRIBUTES, val descriptor: Pointer)
 
     private interface Advapi32Ex : com.sun.jna.win32.StdCallLibrary {
@@ -160,11 +165,19 @@ class NamedPipeServer(
     }
 
     private fun createPipeSecurity(): PipeSecurity? {
-        val sddlCandidates = listOf(
-            "D:(A;;GA;;;WD)S:(ML;;NW;;;ME)",
-            "D:(A;;GA;;;WD)S:(ML;;NW;;;LW)",
-            "D:(A;;GA;;;WD)"
-        )
+        val strict = isStrictPipeSecurityEnabled()
+        val sddlCandidates = if (strict) {
+            listOf(
+                // Owner-only access for stronger local isolation.
+                "D:(A;;GA;;;OW)"
+            )
+        } else {
+            listOf(
+                "D:(A;;GA;;;WD)S:(ML;;NW;;;ME)",
+                "D:(A;;GA;;;WD)S:(ML;;NW;;;LW)",
+                "D:(A;;GA;;;WD)"
+            )
+        }
 
         var chosenSddl: String? = null
         var securityDescriptor: PointerByReference? = null
@@ -190,6 +203,9 @@ class NamedPipeServer(
 
         if (chosenSddl != sddlCandidates.first()) {
             log("Using fallback pipe security descriptor: $chosenSddl")
+        }
+        if (strict) {
+            log("Named pipe security mode: strict (same-user/owner-only).")
         }
 
         val attributes = WinBase.SECURITY_ATTRIBUTES()

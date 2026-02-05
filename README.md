@@ -90,6 +90,7 @@ A Python-based MCP server that connects to the VS extension and Rider plugin and
 | `get_modules` | Get loaded modules/assemblies |
 | `get_exception` | Get current exception details |
 | `evaluate_expression` | Evaluate arbitrary expressions in debug context |
+| `evaluate_expressions_batch` | Evaluate multiple expressions in one snapshot to reduce drift |
 | `read_memory` | Read raw memory at specified address |
 | `get_disassembly` | Get disassembly at current location |
 | `get_disassembly_at` | Get disassembly at specified address |
@@ -97,6 +98,9 @@ A Python-based MCP server that connects to the VS extension and Rider plugin and
 | `get_errors_only` | Get only build errors |
 | `get_warnings_only` | Get only build warnings |
 | `get_full_context` | Get all debugging information at once |
+| `capture_debug_bundle` | Capture a stable debug bundle with snapshot metadata for AI diagnosis |
+
+`get_debug_status` and `capture_debug_bundle` include standardized `stopReason` values (`not_paused`, `breakpoint`, `exception`, `step`, `user_break`, `pause_unknown`) so AI prompts can branch on a stable schema.
 
 ### Debug Control
 

@@ -12,7 +12,7 @@ Supports multiple IDE instances with automatic discovery and smart selection:
 
 import sys
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import bootstrap
 
@@ -305,7 +305,7 @@ async def clear_vs_selection() -> str:
 @mcp.tool()
 async def get_debug_status() -> str:
     """
-    获取Visual Studio当前的调试状态，包括是否正在调试、是否暂停、当前位置等信息。
+    获取当前调试状态，包括是否暂停、当前位置，以及标准化的 stopReason（breakpoint/exception/step/user_break/...）。
     
     **触发场景**: 当用户提到"调试"、"debug"、"断点"、"breakpoint"、"VS"、"Visual Studio"时，优先调用此工具了解当前状态。
     """
@@ -375,6 +375,31 @@ async def evaluate_expression(
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "evaluate_expression")
+
+
+@mcp.tool()
+async def evaluate_expressions_batch(
+    expressions: List[str],
+    expand_children: bool = False,
+    max_depth: int = 2
+) -> str:
+    """
+    在同一调试快照中批量求值多个表达式，减少逐条请求导致的上下文漂移。
+
+    Args:
+        expressions: 表达式列表（最多100条）
+        expand_children: 是否展开对象子成员，默认False
+        max_depth: 子成员展开深度，默认2
+    """
+    try:
+        result = await ide_bridge.call("evaluate_expressions_batch", {
+            "expressions": expressions,
+            "expandChildren": expand_children,
+            "maxDepth": max_depth
+        })
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "evaluate_expressions_batch")
 
 
 # ============== Thread Tools ==============
@@ -600,6 +625,7 @@ async def get_full_context() -> str:
     """
     一次性获取所有调试上下文信息，包括状态、堆栈、变量、异常、线程和模块。
     当你需要完整分析调试现场时使用此工具。
+    如需更强一致性（带 snapshotId 与批量表达式求值），优先使用 capture_debug_bundle。
     
     **触发场景**: 当用户说"帮我分析一下"、"看看发生了什么"、"调试现场"、"为什么会这样"等需要全面了解情况时调用此工具。
     """
@@ -608,6 +634,35 @@ async def get_full_context() -> str:
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_full_context")
+
+
+@mcp.tool()
+async def capture_debug_bundle(
+    expressions: Optional[List[str]] = None,
+    expand_children: bool = False,
+    max_depth: int = 2,
+    output_tail_lines: int = 80
+) -> str:
+    """
+    一次性抓取“可分析快照包”（status/callstack/locals/exception/threads/modules/registers/output + 可选批量表达式）。
+    返回 snapshotId/capturedAt/snapshotStatus/partial，可直接用于AI诊断。
+
+    Args:
+        expressions: 可选表达式列表，会在同一快照中批量求值
+        expand_children: 表达式是否展开子成员，默认False
+        max_depth: 表达式子成员展开深度，默认2
+        output_tail_lines: Debug Output 末尾行数，默认80
+    """
+    try:
+        result = await ide_bridge.call("capture_debug_bundle", {
+            "expressions": expressions or [],
+            "expandChildren": expand_children,
+            "maxDepth": max_depth,
+            "outputTailLines": output_tail_lines
+        })
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "capture_debug_bundle")
 
 
 # ============== Debug Control Tools ==============

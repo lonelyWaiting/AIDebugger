@@ -112,18 +112,29 @@ namespace VSDebuggerMCP
                     // Create pipe security that allows access from non-admin processes
                     // This is critical when VS runs as admin but Cursor runs as normal user
                     var pipeSecurity = new PipeSecurity();
+                    bool strictPipeSecurity = IsStrictPipeSecurityEnabled();
                     
-                    // Allow Everyone to read/write (for cross-privilege-level communication)
-                    pipeSecurity.AddAccessRule(new PipeAccessRule(
-                        new SecurityIdentifier(WellKnownSidType.WorldSid, null),
-                        PipeAccessRights.ReadWrite | PipeAccessRights.CreateNewInstance,
-                        AccessControlType.Allow));
-                    
-                    // Also allow the current user full control
-                    pipeSecurity.AddAccessRule(new PipeAccessRule(
-                        WindowsIdentity.GetCurrent().User,
-                        PipeAccessRights.FullControl,
-                        AccessControlType.Allow));
+                    if (strictPipeSecurity)
+                    {
+                        // Strict mode: only current user can connect.
+                        pipeSecurity.AddAccessRule(new PipeAccessRule(
+                            WindowsIdentity.GetCurrent().User,
+                            PipeAccessRights.FullControl,
+                            AccessControlType.Allow));
+                    }
+                    else
+                    {
+                        // Default compatibility mode: allow cross-privilege local clients.
+                        pipeSecurity.AddAccessRule(new PipeAccessRule(
+                            new SecurityIdentifier(WellKnownSidType.WorldSid, null),
+                            PipeAccessRights.ReadWrite | PipeAccessRights.CreateNewInstance,
+                            AccessControlType.Allow));
+
+                        pipeSecurity.AddAccessRule(new PipeAccessRule(
+                            WindowsIdentity.GetCurrent().User,
+                            PipeAccessRights.FullControl,
+                            AccessControlType.Allow));
+                    }
 
                     pipeServer = new NamedPipeServerStream(
                         _pipeName,
@@ -138,10 +149,7 @@ namespace VSDebuggerMCP
                     _log("Waiting for client connection...");
 
                     // Wait for connection with cancellation support
-                    await Task.Factory.FromAsync(
-                        pipeServer.BeginWaitForConnection,
-                        pipeServer.EndWaitForConnection,
-                        null);
+                    await WaitForConnectionAsync(pipeServer, cancellationToken);
 
                     if (cancellationToken.IsCancellationRequested)
                     {
@@ -170,6 +178,48 @@ namespace VSDebuggerMCP
                 finally
                 {
                     pipeServer?.Dispose();
+                }
+            }
+        }
+
+        private static async Task WaitForConnectionAsync(NamedPipeServerStream pipeServer, CancellationToken cancellationToken)
+        {
+            if (pipeServer == null)
+            {
+                throw new ArgumentNullException(nameof(pipeServer));
+            }
+
+            if (pipeServer.IsConnected)
+            {
+                return;
+            }
+
+            using (cancellationToken.Register(() =>
+            {
+                try
+                {
+                    pipeServer.Dispose();
+                }
+                catch
+                {
+                    // Ignore cleanup races during cancellation.
+                }
+            }))
+            {
+                try
+                {
+                    await Task.Factory.FromAsync(
+                        pipeServer.BeginWaitForConnection,
+                        pipeServer.EndWaitForConnection,
+                        null);
+                }
+                catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException(cancellationToken);
+                }
+                catch (IOException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException(cancellationToken);
                 }
             }
         }
@@ -284,6 +334,23 @@ namespace VSDebuggerMCP
                         bool expandChildren = GetParam<bool>(request.Params, "expandChildren", false);
                         int maxDepth = GetParam<int>(request.Params, "maxDepth", 2);
                         return _debuggerService.EvaluateExpression(expression, expandChildren, maxDepth);
+                    }
+
+                case "evaluate_expressions_batch":
+                    {
+                        var expressions = GetStringListParam(request.Params, "expressions");
+                        bool expandChildren = GetParam<bool>(request.Params, "expandChildren", false);
+                        int maxDepth = GetParam<int>(request.Params, "maxDepth", 2);
+                        return _debuggerService.EvaluateExpressionsBatch(expressions, expandChildren, maxDepth);
+                    }
+
+                case "capture_debug_bundle":
+                    {
+                        var expressions = GetStringListParam(request.Params, "expressions");
+                        bool expandChildren = GetParam<bool>(request.Params, "expandChildren", false);
+                        int maxDepth = GetParam<int>(request.Params, "maxDepth", 2);
+                        int outputTailLines = GetParam<int>(request.Params, "outputTailLines", 80);
+                        return _debuggerService.CaptureDebugBundle(expressions, expandChildren, maxDepth, outputTailLines);
                     }
 
                 case "read_memory":
@@ -489,6 +556,43 @@ namespace VSDebuggerMCP
             }
         }
 
+        private List<string> GetStringListParam(Dictionary<string, object> parameters, string key)
+        {
+            var result = new List<string>();
+            if (parameters == null || !parameters.TryGetValue(key, out object value) || value == null)
+            {
+                return result;
+            }
+
+            if (value is string single)
+            {
+                if (!string.IsNullOrWhiteSpace(single))
+                {
+                    result.Add(single);
+                }
+                return result;
+            }
+
+            if (value is System.Collections.IEnumerable enumerable)
+            {
+                foreach (var item in enumerable)
+                {
+                    if (item == null)
+                    {
+                        continue;
+                    }
+
+                    string expression = item.ToString();
+                    if (!string.IsNullOrWhiteSpace(expression))
+                    {
+                        result.Add(expression);
+                    }
+                }
+            }
+
+            return result;
+        }
+
         private string SerializeResponse(DebugResponse response)
         {
             try
@@ -517,6 +621,19 @@ namespace VSDebuggerMCP
 
             Stop();
             _cts.Dispose();
+        }
+
+        private static bool IsStrictPipeSecurityEnabled()
+        {
+            var value = Environment.GetEnvironmentVariable("AIDB_PIPE_SECURITY");
+            if (string.IsNullOrEmpty(value))
+            {
+                return false;
+            }
+
+            return value.Equals("strict", StringComparison.OrdinalIgnoreCase) ||
+                   value.Equals("same_user", StringComparison.OrdinalIgnoreCase) ||
+                   value.Equals("owner_only", StringComparison.OrdinalIgnoreCase);
         }
     }
 }

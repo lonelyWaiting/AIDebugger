@@ -20,6 +20,12 @@ namespace VSDebuggerMCP.Protocol
         [DataMember(Name = "currentProcess")]
         public string CurrentProcess { get; set; }
 
+        [DataMember(Name = "stopReason")]
+        public string StopReason { get; set; } = "not_paused";
+
+        [DataMember(Name = "stopReasonRaw")]
+        public string StopReasonRaw { get; set; }
+
         [DataMember(Name = "currentLocation")]
         public LocationInfo CurrentLocation { get; set; }
     }
@@ -52,6 +58,18 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "threadName")]
         public string ThreadName { get; set; }
+
+        [DataMember(Name = "capability")]
+        public string Capability { get; set; }
+
+        [DataMember(Name = "snapshotStable")]
+        public bool SnapshotStable { get; set; }
+
+        [DataMember(Name = "snapshotAttempts")]
+        public int SnapshotAttempts { get; set; }
+
+        [DataMember(Name = "snapshotStatus")]
+        public string SnapshotStatus { get; set; } = "unavailable";
 
         [DataMember(Name = "frames")]
         public List<StackFrameInfo> Frames { get; set; } = new List<StackFrameInfo>();
@@ -138,6 +156,18 @@ namespace VSDebuggerMCP.Protocol
         [DataMember(Name = "currentThreadId")]
         public int CurrentThreadId { get; set; }
 
+        [DataMember(Name = "capability")]
+        public string Capability { get; set; }
+
+        [DataMember(Name = "snapshotStable")]
+        public bool SnapshotStable { get; set; }
+
+        [DataMember(Name = "snapshotAttempts")]
+        public int SnapshotAttempts { get; set; }
+
+        [DataMember(Name = "snapshotStatus")]
+        public string SnapshotStatus { get; set; } = "unavailable";
+
         [DataMember(Name = "threads")]
         public List<ThreadInfo> Threads { get; set; } = new List<ThreadInfo>();
     }
@@ -179,6 +209,9 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "totalCount")]
         public int TotalCount { get; set; }
+
+        [DataMember(Name = "capability")]
+        public string Capability { get; set; }
 
         [DataMember(Name = "error")]
         public string Error { get; set; }
@@ -231,6 +264,9 @@ namespace VSDebuggerMCP.Protocol
         [DataMember(Name = "hasException")]
         public bool HasException { get; set; }
 
+        [DataMember(Name = "capability")]
+        public string Capability { get; set; }
+
         [DataMember(Name = "type")]
         public string Type { get; set; }
 
@@ -282,6 +318,43 @@ namespace VSDebuggerMCP.Protocol
         public List<VariableInfo> Children { get; set; }
     }
 
+    [DataContract]
+    public class BatchEvaluateResult
+    {
+        [DataMember(Name = "snapshotId")]
+        public string SnapshotId { get; set; }
+
+        [DataMember(Name = "capturedAt")]
+        public string CapturedAt { get; set; }
+
+        [DataMember(Name = "snapshotStable")]
+        public bool SnapshotStable { get; set; }
+
+        [DataMember(Name = "snapshotAttempts")]
+        public int SnapshotAttempts { get; set; }
+
+        [DataMember(Name = "snapshotStatus")]
+        public string SnapshotStatus { get; set; } = "unavailable";
+
+        [DataMember(Name = "requestedCount")]
+        public int RequestedCount { get; set; }
+
+        [DataMember(Name = "successCount")]
+        public int SuccessCount { get; set; }
+
+        [DataMember(Name = "failedCount")]
+        public int FailedCount { get; set; }
+
+        [DataMember(Name = "partial")]
+        public bool Partial { get; set; }
+
+        [DataMember(Name = "results")]
+        public List<EvaluateResult> Results { get; set; } = new List<EvaluateResult>();
+
+        [DataMember(Name = "error")]
+        public string Error { get; set; }
+    }
+
     #endregion
 
     #region Memory
@@ -292,8 +365,23 @@ namespace VSDebuggerMCP.Protocol
         [DataMember(Name = "address")]
         public string Address { get; set; }
 
+        [DataMember(Name = "status")]
+        public string Status { get; set; } = "unavailable";
+
         [DataMember(Name = "size")]
         public int Size { get; set; }
+
+        [DataMember(Name = "requestedSize")]
+        public int RequestedSize { get; set; }
+
+        [DataMember(Name = "bytesRead")]
+        public int BytesRead { get; set; }
+
+        [DataMember(Name = "failedReads")]
+        public int FailedReads { get; set; }
+
+        [DataMember(Name = "partial")]
+        public bool Partial { get; set; }
 
         [DataMember(Name = "hexDump")]
         public string HexDump { get; set; }
@@ -306,6 +394,9 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "formattedView")]
         public string FormattedView { get; set; }
+
+        [DataMember(Name = "error")]
+        public string Error { get; set; }
     }
 
     #endregion
@@ -469,6 +560,61 @@ namespace VSDebuggerMCP.Protocol
         public ModulesResult Modules { get; set; }
     }
 
+    [DataContract]
+    public class DebugBundleResult
+    {
+        [DataMember(Name = "snapshotId")]
+        public string SnapshotId { get; set; }
+
+        [DataMember(Name = "capturedAt")]
+        public string CapturedAt { get; set; }
+
+        [DataMember(Name = "snapshotStable")]
+        public bool SnapshotStable { get; set; }
+
+        [DataMember(Name = "snapshotAttempts")]
+        public int SnapshotAttempts { get; set; }
+
+        [DataMember(Name = "snapshotStatus")]
+        public string SnapshotStatus { get; set; } = "unavailable";
+
+        [DataMember(Name = "partial")]
+        public bool Partial { get; set; }
+
+        [DataMember(Name = "stopReason")]
+        public string StopReason { get; set; } = "not_paused";
+
+        [DataMember(Name = "status")]
+        public DebugStatusResult Status { get; set; }
+
+        [DataMember(Name = "callstack")]
+        public CallStackResult Callstack { get; set; }
+
+        [DataMember(Name = "locals")]
+        public LocalsResult Locals { get; set; }
+
+        [DataMember(Name = "exception")]
+        public ExceptionResult Exception { get; set; }
+
+        [DataMember(Name = "threads")]
+        public ThreadsResult Threads { get; set; }
+
+        [DataMember(Name = "modules")]
+        public ModulesResult Modules { get; set; }
+
+        [DataMember(Name = "registers")]
+        public RegistersResult Registers { get; set; }
+
+        [DataMember(Name = "output")]
+        public OutputWindowResult Output { get; set; }
+
+        [DataMember(Name = "expressions")]
+        public BatchEvaluateResult Expressions { get; set; }
+
+        [DataMember(Name = "error")]
+        public string Error { get; set; }
+    }
+
     #endregion
 
     #region Ping
@@ -630,6 +776,12 @@ namespace VSDebuggerMCP.Protocol
         [DataMember(Name = "is64Bit")]
         public bool Is64Bit { get; set; }
 
+        [DataMember(Name = "capability")]
+        public string Capability { get; set; }
+
+        [DataMember(Name = "availableCategories")]
+        public List<string> AvailableCategories { get; set; } = new List<string>();
+
         [DataMember(Name = "error")]
         public string Error { get; set; }
     }
@@ -660,6 +812,9 @@ namespace VSDebuggerMCP.Protocol
         [DataMember(Name = "expression")]
         public string Expression { get; set; }
 
+        [DataMember(Name = "behavior")]
+        public string Behavior { get; set; }
+
         [DataMember(Name = "value")]
         public string Value { get; set; }
 
@@ -683,6 +838,9 @@ namespace VSDebuggerMCP.Protocol
         [DataMember(Name = "pattern")]
         public string Pattern { get; set; }
 
+        [DataMember(Name = "status")]
+        public string Status { get; set; } = "unavailable";
+
         [DataMember(Name = "patternBytes")]
         public string[] PatternBytes { get; set; }
 
@@ -694,6 +852,15 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "bytesSearched")]
         public int BytesSearched { get; set; }
+
+        [DataMember(Name = "requestedBytes")]
+        public int RequestedBytes { get; set; }
+
+        [DataMember(Name = "failedReads")]
+        public int FailedReads { get; set; }
+
+        [DataMember(Name = "partial")]
+        public bool Partial { get; set; }
 
         [DataMember(Name = "error")]
         public string Error { get; set; }
@@ -708,6 +875,9 @@ namespace VSDebuggerMCP.Protocol
     {
         [DataMember(Name = "pane")]
         public string Pane { get; set; }
+
+        [DataMember(Name = "capability")]
+        public string Capability { get; set; }
 
         [DataMember(Name = "content")]
         public string Content { get; set; }
@@ -733,6 +903,9 @@ namespace VSDebuggerMCP.Protocol
     {
         [DataMember(Name = "pane")]
         public string Pane { get; set; }
+
+        [DataMember(Name = "capability")]
+        public string Capability { get; set; }
 
         [DataMember(Name = "pattern")]
         public string Pattern { get; set; }

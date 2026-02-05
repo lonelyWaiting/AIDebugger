@@ -6,6 +6,8 @@ import com.intellij.openapi.diagnostic.Logger
 import java.io.File
 import java.io.InputStream
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
 
 object CursorMcpRegistration {
     private const val McpServerName = "AIDebuggerRider"
@@ -25,10 +27,18 @@ object CursorMcpRegistration {
     private const val ServerUseInstructions =
         "AIDebuggerRider - Rider debugging MCP\n\n" +
             "Before using any debugging tools, call detect_debug_sessions(prefer_ide=\"rider\") to locate a live session.\n" +
-            "If auto-selection fails, use list_ide_instances + select_ide_instance.\n"
+            "If auto-selection fails, use list_ide_instances + select_ide_instance.\n" +
+            "For crash/bug diagnosis, prefer capture_debug_bundle first (optionally with expressions).\n" +
+            "Use get_debug_status.stopReason to branch analysis flow (breakpoint/exception/step/user_break).\n" +
+            "When checking multiple values, prefer evaluate_expressions_batch to avoid drift.\n"
 
     fun registerWithCursor() {
         try {
+            if (!isPythonAvailable()) {
+                log.warn("Python 3.10+ is required for MCP server registration. Skipping Cursor registration.")
+                return
+            }
+
             val serverPath = ensureServerFiles() ?: return
             val configPath = getCursorMcpConfigPath()
             val config = readConfig(configPath)
@@ -66,6 +76,18 @@ object CursorMcpRegistration {
 
         val manifestFiles = loadManifestFiles()
         val filesToCopy = (baseFiles + "vendor/wheels/manifest.json" + manifestFiles).distinct()
+        val signatureFile = File(targetDir, ".bundle-signature")
+        val bundleSignature = computeBundleSignature(manifestFiles)
+        if (!bundleSignature.isNullOrBlank() &&
+            signatureFile.exists() &&
+            signatureFile.readText(StandardCharsets.UTF_8).trim() == bundleSignature &&
+            allServerFilesExist(targetDir, filesToCopy)
+        ) {
+            val existingServer = File(targetDir, "server.py")
+            if (existingServer.exists()) {
+                return existingServer.absolutePath
+            }
+        }
 
         for (fileName in filesToCopy) {
             val target = File(targetDir, fileName)
@@ -85,8 +107,41 @@ object CursorMcpRegistration {
             }
         }
 
+        if (!bundleSignature.isNullOrBlank()) {
+            signatureFile.writeText(bundleSignature, StandardCharsets.UTF_8)
+        }
+
         val serverFile = File(targetDir, "server.py")
         return if (serverFile.exists()) serverFile.absolutePath else null
+    }
+
+    private fun allServerFilesExist(targetDir: File, files: List<String>): Boolean {
+        return files.all { relativePath -> File(targetDir, relativePath).exists() }
+    }
+
+    private fun computeBundleSignature(manifestFiles: List<String>): String? {
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            val seedFiles = (baseFiles + "vendor/wheels/manifest.json").distinct()
+            for (fileName in seedFiles) {
+                val bytes = readResourceBytes(fileName) ?: return null
+                digest.update(bytes)
+            }
+            // Wheel list changes when bundled wheel set changes.
+            manifestFiles.sorted().forEach { file ->
+                digest.update(file.toByteArray(StandardCharsets.UTF_8))
+                digest.update('\n'.code.toByte())
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        } catch (ex: Exception) {
+            log.warn("Failed to compute MCP bundle signature: ${ex.message}", ex)
+            null
+        }
+    }
+
+    private fun readResourceBytes(name: String): ByteArray? {
+        val resource = getResourceStream(name) ?: return null
+        return resource.use { it.readBytes() }
     }
 
     private fun getResourceStream(name: String): InputStream? {
@@ -165,5 +220,34 @@ object CursorMcpRegistration {
         val env = existing["env"] as? Map<*, *> ?: return false
         val preferred = env["AIDB_PREFERRED_IDE"]?.toString() ?: return false
         return preferred.equals(PreferredIde, ignoreCase = true)
+    }
+
+    private fun isPythonAvailable(): Boolean {
+        return checkPythonCommand("python") || checkPythonCommand("python3")
+    }
+
+    private fun checkPythonCommand(command: String): Boolean {
+        return try {
+            val process = ProcessBuilder(command, "--version")
+                .redirectErrorStream(true)
+                .start()
+            if (!process.waitFor(5, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                return false
+            }
+            if (process.exitValue() != 0) {
+                return false
+            }
+            val output = process.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }.trim()
+            val match = Regex("Python\\s+(\\d+)\\.(\\d+)\\.(\\d+)", RegexOption.IGNORE_CASE).find(output)
+            if (match != null) {
+                val major = match.groupValues[1].toIntOrNull() ?: return false
+                val minor = match.groupValues[2].toIntOrNull() ?: return false
+                return major > 3 || (major == 3 && minor >= 10)
+            }
+            false
+        } catch (_: Exception) {
+            false
+        }
     }
 }

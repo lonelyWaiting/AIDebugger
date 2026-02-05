@@ -48,6 +48,7 @@ env/
 .intellijPlatform/
 .cursor/
 .gradle-user/
+.gradle-user*/
 .tmp/
 *.iml
 *.swp
@@ -64,3 +65,20 @@ env/
 # Rider/Gradle build outputs
 RiderDebuggerMCP/build/
 RiderDebuggerMCP/build-*/
+RiderDebuggerMCP/.kotlin/
+
+# Build logs
+*.log
+build*.log
+
+# VS upgrade logs
+UpgradeLog*.htm
+
+# Backup files
+*.backup
+
+# VSIX build output manifest (source.extension.vsixmanifest is the source file)
+VSDebuggerMCP/extension.vsixmanifest
+
+# Claude Code
+.claude/

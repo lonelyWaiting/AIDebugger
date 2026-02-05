@@ -20,11 +20,41 @@
     <RiderBuildDir>$(GradleProjectDir)\build-$(GradleBuildId)</RiderBuildDir>
     <RiderPluginOutputDir>$(RiderBuildDir)\distributions</RiderPluginOutputDir>
     <RiderBuildRetention>3</RiderBuildRetention>
+    <!--
+      JBR (JetBrains Runtime) detection priority:
+      1. RIDER_JBR environment variable (explicit override)
+      2. JAVA_HOME if already JDK 17+ (GitHub Actions / CI)
+      3. RIDER_HOME environment variable + /jbr
+      4. Auto-detect from installed Rider (dynamic, no hardcoded versions)
+    -->
     <RiderJbrHome Condition="'$(RIDER_JBR)' != ''">$(RIDER_JBR)</RiderJbrHome>
-    <RiderJbrHome Condition="'$(RiderJbrHome)' == '' and Exists('C:\\Program Files\\JetBrains\\JetBrains Rider 2025.1.2\\jbr')">C:\Program Files\JetBrains\JetBrains Rider 2025.1.2\jbr</RiderJbrHome>
-    <GradleEnvironment>GRADLE_USER_HOME=$(GradleUserHome);AIDB_GRADLE_BUILD_ID=$(GradleBuildId)</GradleEnvironment>
-    <GradleEnvironment Condition="'$(RiderJbrHome)' != ''">JAVA_HOME=$(RiderJbrHome);GRADLE_USER_HOME=$(GradleUserHome);AIDB_GRADLE_BUILD_ID=$(GradleBuildId)</GradleEnvironment>
+    <RiderJbrHome Condition="'$(RiderJbrHome)' == '' and '$(RIDER_HOME)' != '' and Exists('$(RIDER_HOME)\jbr')">$(RIDER_HOME)\jbr</RiderJbrHome>
+    <!-- JetBrains install directories to search -->
+    <JetBrainsDir Condition="Exists('C:\Program Files\JetBrains')">C:\Program Files\JetBrains</JetBrainsDir>
+    <JetBrainsDir Condition="'$(JetBrainsDir)' == '' and Exists('$(LOCALAPPDATA)\JetBrains\Toolbox\apps')">$(LOCALAPPDATA)\JetBrains\Toolbox\apps</JetBrainsDir>
   </PropertyGroup>
+
+  <!-- Target to dynamically detect Rider JBR before building -->
+  <Target Name="DetectRiderJbr" BeforeTargets="BuildRiderPlugin" Condition="'$(RiderJbrHome)' == '' and '$(JetBrainsDir)' != ''">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -Command &quot;$dirs = Get-ChildItem -Path '$(JetBrainsDir)' -Directory -Filter 'JetBrains Rider*' -ErrorAction SilentlyContinue | Sort-Object Name -Descending; foreach ($d in $dirs) { $jbr = Join-Path $d.FullName 'jbr'; if (Test-Path $jbr) { Write-Output $jbr; exit 0 } }; $tbDirs = Get-ChildItem -Path '$(LOCALAPPDATA)\JetBrains\Toolbox\apps' -Directory -Filter 'Rider*' -ErrorAction SilentlyContinue; foreach ($td in $tbDirs) { $channels = Get-ChildItem -Path $td.FullName -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending; foreach ($ch in $channels) { $jbr = Join-Path $ch.FullName 'jbr'; if (Test-Path $jbr) { Write-Output $jbr; exit 0 } } }&quot;"
+            ConsoleToMSBuild="true"
+            StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_DetectedJbrPath" />
+    </Exec>
+    <PropertyGroup>
+      <RiderJbrHome Condition="'$(_DetectedJbrPath)' != ''">$(_DetectedJbrPath.Trim())</RiderJbrHome>
+    </PropertyGroup>
+    <Message Importance="high" Text="Auto-detected Rider JBR: $(RiderJbrHome)" Condition="'$(RiderJbrHome)' != ''" />
+    <Message Importance="high" Text="No Rider JBR found. Using system JAVA_HOME or default Java." Condition="'$(RiderJbrHome)' == ''" />
+  </Target>
+
+  <!-- Set GradleEnvironment after JBR detection -->
+  <Target Name="SetGradleEnvironment" BeforeTargets="BuildRiderPlugin" DependsOnTargets="DetectRiderJbr">
+    <PropertyGroup>
+      <GradleEnvironment>GRADLE_USER_HOME=$(GradleUserHome);AIDB_GRADLE_BUILD_ID=$(GradleBuildId)</GradleEnvironment>
+      <GradleEnvironment Condition="'$(RiderJbrHome)' != ''">JAVA_HOME=$(RiderJbrHome);GRADLE_USER_HOME=$(GradleUserHome);AIDB_GRADLE_BUILD_ID=$(GradleBuildId)</GradleEnvironment>
+    </PropertyGroup>
+  </Target>
 
   <Target Name="BuildRiderPlugin" AfterTargets="Build">
     <Message Importance="high" Text="Building Rider plugin via Gradle..." />

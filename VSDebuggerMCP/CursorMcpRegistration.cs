@@ -28,11 +28,11 @@ namespace VSDebuggerMCP
 
 ### 崩溃/异常分析（最常见场景）
 - 关键词：崩溃、crash、异常、exception、错误、error、闪退、挂起、hang、死循环
-- 推荐操作：首先调用 get_full_context 或 get_exception + get_callstack 获取完整的崩溃现场
+- 推荐操作：优先调用 capture_debug_bundle（必要时附带 expressions）获取稳定快照；退化场景再用 get_full_context 或 get_exception + get_callstack
 
 ### 调试分析
 - 关键词：调试、debug、断点、breakpoint、单步、step、堆栈、stack、变量、variable
-- 推荐操作：根据需求使用 get_debug_status、get_callstack、get_locals 等
+- 推荐操作：先 get_debug_status 判断 stopReason，再按需 get_callstack/get_locals；多表达式分析优先 evaluate_expressions_batch
 
 ### 主动检测调试现场（推荐）
 - 在调用任何调试工具前，先调用 detect_debug_sessions(prefer_ide=""{1}"") 检测是否有 VS/Rider 调试现场
@@ -49,10 +49,10 @@ namespace VSDebuggerMCP
 ## 推荐工作流程
 
 ### 崩溃分析标准流程：
-1. 调用 get_full_context 一次性获取所有上下文（状态、堆栈、变量、异常、线程）
+1. 调用 capture_debug_bundle 一次性获取稳定上下文（含 snapshotId/partial/snapshotStatus）
 2. 根据返回的文件路径，使用 Read 工具读取相关源代码
 3. 分析异常信息和堆栈，定位问题根因
-4. 如需更多信息，使用 evaluate_expression 检查特定变量或表达式
+4. 如需更多信息，优先 evaluate_expressions_batch；仅单条场景再用 evaluate_expression
 
 ### 断点调试流程：
 1. get_debug_status 确认调试状态
@@ -65,7 +65,7 @@ namespace VSDebuggerMCP
 - 支持多个IDE实例，会自动选择处于断点暂停状态的实例
 - 如果有多个实例且无法自动选择，使用 list_ide_instances 查看，然后 select_ide_instance 选择
 - 调试控制工具（如 debug_step_over）会改变程序状态，需谨慎使用
-- get_full_context 是最高效的起点，一次调用获取全部信息";
+- 首选 capture_debug_bundle 作为分析起点；当 IDE 不支持完整快照时再退化到 get_full_context";
 
         private static string BuildServerUseInstructions(string ideLabel, string preferredIde)
         {

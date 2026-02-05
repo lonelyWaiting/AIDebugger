@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Runtime.InteropServices;
 using EnvDTE;
 using EnvDTE80;
 using EnvDTE100;
@@ -19,6 +20,26 @@ namespace VSDebuggerMCP
         private readonly DTE2 _dte;
         private readonly Action<string> _log;
         private readonly DisassemblyService _disasmService;
+        private readonly Dictionary<string, string> _sourceFileByClassCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, DateTime> _sourceFileByClassMissCache = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private string _sourceLookupSolutionKey = string.Empty;
+        private const int SnapshotMaxAttempts = 2;
+        private const int SnapshotRetryDelayMs = 40;
+        private const int SourceLookupCacheMaxEntries = 1024;
+        private static readonly TimeSpan SourceLookupMissCacheTtl = TimeSpan.FromSeconds(30);
+
+        private const uint PROCESS_VM_READ = 0x0010;
+        private const uint PROCESS_QUERY_INFORMATION = 0x0400;
+        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+        private const uint MEM_COMMIT = 0x1000;
+        private const uint PAGE_NOACCESS = 0x01;
+        private const uint PAGE_READONLY = 0x02;
+        private const uint PAGE_READWRITE = 0x04;
+        private const uint PAGE_WRITECOPY = 0x08;
+        private const uint PAGE_EXECUTE_READ = 0x20;
+        private const uint PAGE_EXECUTE_READWRITE = 0x40;
+        private const uint PAGE_EXECUTE_WRITECOPY = 0x80;
+        private const uint PAGE_GUARD = 0x100;
 
         public DebuggerService(DTE2 dte, Action<string> log)
         {
@@ -43,33 +64,168 @@ namespace VSDebuggerMCP
             return ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
-                var debugger = Debugger;
-                var result = new DebugStatusResult
-                {
-                    IsDebugging = debugger.CurrentMode != dbgDebugMode.dbgDesignMode,
-                    IsPaused = debugger.CurrentMode == dbgDebugMode.dbgBreakMode,
-                    DebugMode = GetDebugModeString(debugger.CurrentMode)
-                };
-
-                if (result.IsDebugging && debugger.CurrentProcess != null)
-                {
-                    result.CurrentProcess = debugger.CurrentProcess.Name;
-                }
-
-                if (result.IsPaused && debugger.CurrentStackFrame != null)
-                {
-                    var frame = debugger.CurrentStackFrame;
-                    result.CurrentLocation = new LocationInfo
-                    {
-                        FilePath = GetFrameFileName(frame),
-                        FunctionName = frame.FunctionName,
-                        LineNumber = GetFrameLineNumber(frame),
-                        ColumnNumber = 1
-                    };
-                }
-
-                return result;
+                return BuildDebugStatus(Debugger);
             });
+        }
+
+        private DebugStatusResult BuildDebugStatus(Debugger5 debugger)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (debugger == null)
+            {
+                return new DebugStatusResult
+                {
+                    IsDebugging = false,
+                    IsPaused = false,
+                    DebugMode = "Unknown",
+                    StopReason = "not_paused"
+                };
+            }
+
+            var result = new DebugStatusResult
+            {
+                IsDebugging = debugger.CurrentMode != dbgDebugMode.dbgDesignMode,
+                IsPaused = debugger.CurrentMode == dbgDebugMode.dbgBreakMode,
+                DebugMode = GetDebugModeString(debugger.CurrentMode)
+            };
+
+            if (result.IsDebugging && debugger.CurrentProcess != null)
+            {
+                result.CurrentProcess = debugger.CurrentProcess.Name;
+            }
+
+            if (result.IsPaused && debugger.CurrentStackFrame != null)
+            {
+                var frame = debugger.CurrentStackFrame;
+                result.CurrentLocation = new LocationInfo
+                {
+                    FilePath = GetFrameFileName(frame),
+                    FunctionName = frame.FunctionName,
+                    LineNumber = GetFrameLineNumber(frame),
+                    ColumnNumber = 1
+                };
+            }
+
+            var stopReason = DetermineStopReason(debugger);
+            result.StopReason = stopReason.Reason;
+            result.StopReasonRaw = stopReason.RawReason;
+
+            return result;
+        }
+
+        private (string Reason, string RawReason) DetermineStopReason(Debugger5 debugger)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (debugger == null || debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+            {
+                return ("not_paused", null);
+            }
+
+            string rawReason = TryReadDebuggerBreakReason(debugger);
+            string mappedReason = MapStopReason(rawReason);
+            if (!string.Equals(mappedReason, "pause_unknown", StringComparison.OrdinalIgnoreCase))
+            {
+                return (mappedReason, rawReason);
+            }
+
+            if (TryHasBreakpointHit(debugger))
+            {
+                return ("breakpoint", rawReason);
+            }
+
+            if (TryHasCurrentException(debugger))
+            {
+                return ("exception", rawReason);
+            }
+
+            return ("pause_unknown", rawReason);
+        }
+
+        private string TryReadDebuggerBreakReason(Debugger5 debugger)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            try
+            {
+                var debuggerType = debugger.GetType();
+                var property = debuggerType.GetProperty("BreakReason") ??
+                               debuggerType.GetProperty("CurrentBreakReason") ??
+                               debuggerType.GetProperty("CurrentReason");
+                if (property == null)
+                {
+                    return null;
+                }
+
+                var value = property.GetValue(debugger, null);
+                return value?.ToString();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private string MapStopReason(string rawReason)
+        {
+            if (string.IsNullOrWhiteSpace(rawReason))
+            {
+                return "pause_unknown";
+            }
+
+            string normalized = rawReason.Trim().ToLowerInvariant();
+            if (normalized.Contains("exception"))
+            {
+                return "exception";
+            }
+
+            if (normalized.Contains("step"))
+            {
+                return "step";
+            }
+
+            if (normalized.Contains("breakpoint") || normalized.Contains("tracepoint"))
+            {
+                return "breakpoint";
+            }
+
+            if (normalized.Contains("user") || normalized.Contains("pause") || normalized.Contains("break"))
+            {
+                return "user_break";
+            }
+
+            return "pause_unknown";
+        }
+
+        private bool TryHasBreakpointHit(Debugger5 debugger)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            try
+            {
+                var property = debugger.GetType().GetProperty("BreakpointLastHit");
+                if (property == null)
+                {
+                    return false;
+                }
+
+                return property.GetValue(debugger, null) != null;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool TryHasCurrentException(Debugger5 debugger)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            try
+            {
+                var exceptionExpr = debugger.GetExpression("$exception");
+                return exceptionExpr != null && exceptionExpr.IsValidValue;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private string GetDebugModeString(dbgDebugMode mode)
@@ -93,21 +249,83 @@ namespace VSDebuggerMCP
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
                 var debugger = Debugger;
-                var result = new CallStackResult();
-
-                if (debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+                var bestEffort = new CallStackResult
                 {
-                    return result;
+                    SnapshotStatus = "unavailable",
+                    Capability = "full_frame_metadata"
+                };
+
+                for (int attempt = 1; attempt <= SnapshotMaxAttempts; attempt++)
+                {
+                    if (debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+                    {
+                        bestEffort.SnapshotAttempts = attempt;
+                        bestEffort.SnapshotStatus = "unavailable";
+                        return bestEffort;
+                    }
+
+                    try
+                    {
+                        string tokenBefore = CreateDebuggerSnapshotToken(debugger);
+                        var snapshot = BuildCallStackResult(debugger);
+                        string tokenAfter = CreateDebuggerSnapshotToken(debugger);
+                        bool stable = !string.IsNullOrEmpty(tokenBefore) && tokenBefore == tokenAfter;
+
+                        snapshot.SnapshotStable = stable;
+                        snapshot.SnapshotAttempts = attempt;
+                        snapshot.SnapshotStatus = stable
+                            ? "ok"
+                            : (snapshot.Frames.Count > 0 ? "unstable" : "unavailable");
+
+                        bestEffort = snapshot;
+                        if (stable)
+                        {
+                            return snapshot;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _log($"GetCallStack snapshot attempt {attempt} failed: {ex.Message}");
+                        bestEffort.SnapshotAttempts = attempt;
+                        if (bestEffort.Frames.Count > 0)
+                        {
+                            bestEffort.SnapshotStatus = "unstable";
+                        }
+                    }
+
+                    if (attempt < SnapshotMaxAttempts)
+                    {
+                        System.Threading.Thread.Sleep(SnapshotRetryDelayMs);
+                    }
                 }
 
-                var currentThread = debugger.CurrentThread;
-                if (currentThread != null)
-                {
-                    result.ThreadId = currentThread.ID;
-                    result.ThreadName = currentThread.Name ?? $"Thread {currentThread.ID}";
+                return bestEffort;
+            });
+        }
 
-                    int index = 0;
-                    foreach (EnvDTE.StackFrame frame in currentThread.StackFrames)
+        private CallStackResult BuildCallStackResult(Debugger5 debugger)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var result = new CallStackResult
+            {
+                Capability = "full_frame_metadata"
+            };
+
+            var currentThread = debugger.CurrentThread;
+            if (currentThread == null)
+            {
+                return result;
+            }
+
+            result.ThreadId = currentThread.ID;
+            result.ThreadName = currentThread.Name ?? $"Thread {currentThread.ID}";
+
+            int index = 0;
+            try
+            {
+                foreach (EnvDTE.StackFrame frame in currentThread.StackFrames)
+                {
+                    try
                     {
                         var lineInfo = GetFrameLineNumberEx(frame);
                         result.Frames.Add(new StackFrameInfo
@@ -123,10 +341,18 @@ namespace VSDebuggerMCP
                             ReturnType = frame.ReturnType
                         });
                     }
+                    catch
+                    {
+                        // Skip frames that fail to materialize.
+                    }
                 }
+            }
+            catch
+            {
+                // Stack frame enumeration can fail for some engines/threads.
+            }
 
-                return result;
-            });
+            return result;
         }
 
         #endregion
@@ -138,43 +364,46 @@ namespace VSDebuggerMCP
             return ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
-                var debugger = Debugger;
-                var result = new LocalsResult();
-
-                if (debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
-                {
-                    return result;
-                }
-
-                var currentFrame = debugger.CurrentStackFrame;
-                if (currentFrame == null)
-                {
-                    return result;
-                }
-
-                // Get locals
-                foreach (EnvDTE.Expression local in currentFrame.Locals)
-                {
-                    result.Variables.Add(CreateVariableInfo(local, 0, 2));
-                }
-
-                // Get arguments
-                try
-                {
-                    foreach (EnvDTE.Expression arg in currentFrame.Arguments)
-                    {
-                        var varInfo = CreateVariableInfo(arg, 0, 2);
-                        varInfo.Name = $"[arg] {varInfo.Name}";
-                        result.Variables.Add(varInfo);
-                    }
-                }
-                catch
-                {
-                    // Arguments may not be available
-                }
-
-                return result;
+                return BuildLocalsResult(Debugger, 2);
             });
+        }
+
+        private LocalsResult BuildLocalsResult(Debugger5 debugger, int maxDepth)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var result = new LocalsResult();
+
+            if (debugger == null || debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+            {
+                return result;
+            }
+
+            var currentFrame = debugger.CurrentStackFrame;
+            if (currentFrame == null)
+            {
+                return result;
+            }
+
+            foreach (EnvDTE.Expression local in currentFrame.Locals)
+            {
+                result.Variables.Add(CreateVariableInfo(local, 0, maxDepth));
+            }
+
+            try
+            {
+                foreach (EnvDTE.Expression arg in currentFrame.Arguments)
+                {
+                    var varInfo = CreateVariableInfo(arg, 0, maxDepth);
+                    varInfo.Name = $"[arg] {varInfo.Name}";
+                    result.Variables.Add(varInfo);
+                }
+            }
+            catch
+            {
+                // Arguments may not be available
+            }
+
+            return result;
         }
 
         private VariableInfo CreateVariableInfo(EnvDTE.Expression expr, int currentDepth, int maxDepth)
@@ -218,17 +447,88 @@ namespace VSDebuggerMCP
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
                 var debugger = Debugger;
-                var result = new ThreadsResult();
-
-                if (debugger.CurrentMode == dbgDebugMode.dbgDesignMode)
+                var bestEffort = new ThreadsResult
                 {
-                    return result;
+                    SnapshotStatus = "unavailable",
+                    Capability = "full_thread_metadata"
+                };
+
+                for (int attempt = 1; attempt <= SnapshotMaxAttempts; attempt++)
+                {
+                    if (debugger.CurrentMode == dbgDebugMode.dbgDesignMode)
+                    {
+                        bestEffort.SnapshotAttempts = attempt;
+                        bestEffort.SnapshotStatus = "unavailable";
+                        return bestEffort;
+                    }
+
+                    try
+                    {
+                        string tokenBefore = CreateDebuggerSnapshotToken(debugger);
+                        var snapshot = BuildThreadsResult(debugger);
+                        string tokenAfter = CreateDebuggerSnapshotToken(debugger);
+                        bool stable = !string.IsNullOrEmpty(tokenBefore) && tokenBefore == tokenAfter;
+
+                        snapshot.SnapshotStable = stable;
+                        snapshot.SnapshotAttempts = attempt;
+                        snapshot.SnapshotStatus = stable
+                            ? "ok"
+                            : (snapshot.Threads.Count > 0 ? "unstable" : "unavailable");
+
+                        bestEffort = snapshot;
+                        if (stable)
+                        {
+                            return snapshot;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _log($"GetThreads snapshot attempt {attempt} failed: {ex.Message}");
+                        bestEffort.SnapshotAttempts = attempt;
+                        if (bestEffort.Threads.Count > 0)
+                        {
+                            bestEffort.SnapshotStatus = "unstable";
+                        }
+                    }
+
+                    if (attempt < SnapshotMaxAttempts)
+                    {
+                        System.Threading.Thread.Sleep(SnapshotRetryDelayMs);
+                    }
                 }
 
-                var currentThread = debugger.CurrentThread;
-                result.CurrentThreadId = currentThread?.ID ?? 0;
+                return bestEffort;
+            });
+        }
 
-                foreach (EnvDTE.Thread thread in debugger.CurrentProgram.Threads)
+        private ThreadsResult BuildThreadsResult(Debugger5 debugger)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var result = new ThreadsResult
+            {
+                Capability = "full_thread_metadata"
+            };
+            var currentThread = debugger.CurrentThread;
+            result.CurrentThreadId = currentThread?.ID ?? 0;
+
+            EnvDTE.Program currentProgram = null;
+            try
+            {
+                currentProgram = debugger.CurrentProgram;
+            }
+            catch
+            {
+                return result;
+            }
+
+            if (currentProgram == null)
+            {
+                return result;
+            }
+
+            try
+            {
+                foreach (EnvDTE.Thread thread in currentProgram.Threads)
                 {
                     var threadInfo = new ThreadInfo
                     {
@@ -240,7 +540,6 @@ namespace VSDebuggerMCP
                         SuspendCount = thread.SuspendCount
                     };
 
-                    // Try to get location
                     try
                     {
                         if (thread.StackFrames.Count > 0)
@@ -260,9 +559,13 @@ namespace VSDebuggerMCP
 
                     result.Threads.Add(threadInfo);
                 }
+            }
+            catch
+            {
+                // Thread enumeration can fail transiently while engine updates.
+            }
 
-                return result;
-            });
+            return result;
         }
 
         #endregion
@@ -274,113 +577,118 @@ namespace VSDebuggerMCP
             return ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
-                var debugger = Debugger;
-                var result = new ModulesResult();
+                return BuildModulesResult(Debugger);
+            });
+        }
 
-                if (debugger.CurrentMode == dbgDebugMode.dbgDesignMode)
-                {
-                    result.Error = "Not in debug mode";
-                    return result;
-                }
+        private ModulesResult BuildModulesResult(Debugger5 debugger)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var result = new ModulesResult
+            {
+                Capability = "multi_source"
+            };
 
+            if (debugger == null || debugger.CurrentMode == dbgDebugMode.dbgDesignMode)
+            {
+                result.Error = "Not in debug mode";
+                return result;
+            }
+
+            try
+            {
+                // Method 1: Try to get modules from stack frames (most reliable)
+                var moduleSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var moduleInfoDict = new Dictionary<string, ModuleInfo>(StringComparer.OrdinalIgnoreCase);
+
+                // Collect modules from all threads' stack frames
                 try
                 {
-                    // Method 1: Try to get modules from stack frames (most reliable)
-                    var moduleSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    var moduleInfoDict = new Dictionary<string, ModuleInfo>(StringComparer.OrdinalIgnoreCase);
-
-                    // Collect modules from all threads' stack frames
-                    try
+                    foreach (EnvDTE.Thread thread in debugger.CurrentProgram.Threads)
                     {
-                        foreach (EnvDTE.Thread thread in debugger.CurrentProgram.Threads)
+                        try
                         {
-                            try
+                            foreach (EnvDTE.StackFrame frame in thread.StackFrames)
                             {
-                                foreach (EnvDTE.StackFrame frame in thread.StackFrames)
+                                string modulePath = frame.Module;
+                                if (!string.IsNullOrEmpty(modulePath) && !moduleSet.Contains(modulePath))
                                 {
-                                    string modulePath = frame.Module;
-                                    if (!string.IsNullOrEmpty(modulePath) && !moduleSet.Contains(modulePath))
-                                    {
-                                        moduleSet.Add(modulePath);
-                                        var moduleInfo = CreateModuleInfoFromPath(modulePath, debugger);
-                                        moduleInfoDict[modulePath] = moduleInfo;
-                                    }
-                                }
-                            }
-                            catch
-                            {
-                                // Some threads may not have accessible stack frames
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _log($"Error collecting modules from stack frames: {ex.Message}");
-                    }
-
-                    // Method 2: Try to enumerate modules via PEB (Process Environment Block) for native processes
-                    try
-                    {
-                        // Get PEB address and enumerate loaded modules using expression evaluation
-                        var additionalModules = GetModulesFromPEB(debugger);
-                        foreach (var mod in additionalModules)
-                        {
-                            if (!moduleSet.Contains(mod.Path))
-                            {
-                                moduleSet.Add(mod.Path);
-                                moduleInfoDict[mod.Path] = mod;
-                            }
-                            else
-                            {
-                                // Merge additional info if we already have this module
-                                var existing = moduleInfoDict[mod.Path];
-                                if (string.IsNullOrEmpty(existing.Address) && !string.IsNullOrEmpty(mod.Address))
-                                {
-                                    existing.Address = mod.Address;
-                                }
-                                if (string.IsNullOrEmpty(existing.Size) && !string.IsNullOrEmpty(mod.Size))
-                                {
-                                    existing.Size = mod.Size;
+                                    moduleSet.Add(modulePath);
+                                    var moduleInfo = CreateModuleInfoFromPath(modulePath, debugger);
+                                    moduleInfoDict[modulePath] = moduleInfo;
                                 }
                             }
                         }
-                    }
-                    catch (Exception ex)
-                    {
-                        _log($"Error getting modules from PEB: {ex.Message}");
-                    }
-
-                    // Method 3: Try common system DLLs that are usually loaded
-                    TryAddCommonSystemModules(debugger, moduleSet, moduleInfoDict);
-
-                    // Sort and add to result
-                    int order = 0;
-                    var sortedModules = moduleInfoDict.Values
-                        .OrderBy(m => m.IsSystemModule)
-                        .ThenBy(m => m.Name)
-                        .ToList();
-
-                    foreach (var mod in sortedModules)
-                    {
-                        mod.Order = order++;
-                        result.Modules.Add(mod);
-                    }
-
-                    result.TotalCount = result.Modules.Count;
-
-                    if (result.Modules.Count == 0)
-                    {
-                        result.Error = "No modules found. The process may not have loaded any modules yet or module enumeration is not supported for this debug target.";
+                        catch
+                        {
+                            // Some threads may not have accessible stack frames
+                        }
                     }
                 }
                 catch (Exception ex)
                 {
-                    _log($"Error getting modules: {ex.Message}");
-                    result.Error = $"Error enumerating modules: {ex.Message}";
+                    _log($"Error collecting modules from stack frames: {ex.Message}");
                 }
 
-                return result;
-            });
+                // Method 2: Try to enumerate modules via PEB (Process Environment Block) for native processes
+                try
+                {
+                    var additionalModules = GetModulesFromPEB(debugger);
+                    foreach (var mod in additionalModules)
+                    {
+                        if (!moduleSet.Contains(mod.Path))
+                        {
+                            moduleSet.Add(mod.Path);
+                            moduleInfoDict[mod.Path] = mod;
+                        }
+                        else
+                        {
+                            var existing = moduleInfoDict[mod.Path];
+                            if (string.IsNullOrEmpty(existing.Address) && !string.IsNullOrEmpty(mod.Address))
+                            {
+                                existing.Address = mod.Address;
+                            }
+                            if (string.IsNullOrEmpty(existing.Size) && !string.IsNullOrEmpty(mod.Size))
+                            {
+                                existing.Size = mod.Size;
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log($"Error getting modules from PEB: {ex.Message}");
+                }
+
+                // Method 3: Try common system DLLs that are usually loaded
+                TryAddCommonSystemModules(debugger, moduleSet, moduleInfoDict);
+
+                int order = 0;
+                var sortedModules = moduleInfoDict.Values
+                    .OrderBy(m => m.IsSystemModule)
+                    .ThenBy(m => m.Name)
+                    .ToList();
+
+                foreach (var mod in sortedModules)
+                {
+                    mod.Order = order++;
+                    result.Modules.Add(mod);
+                }
+
+                result.TotalCount = result.Modules.Count;
+
+                if (result.Modules.Count == 0)
+                {
+                    result.Error = "No modules found. The process may not have loaded any modules yet or module enumeration is not supported for this debug target.";
+                }
+            }
+            catch (Exception ex)
+            {
+                _log($"Error getting modules: {ex.Message}");
+                result.Error = $"Error enumerating modules: {ex.Message}";
+            }
+
+            return result;
         }
 
         private ModuleInfo CreateModuleInfoFromPath(string modulePath, Debugger5 debugger)
@@ -637,7 +945,10 @@ namespace VSDebuggerMCP
                 if (lfanewExpr == null || !lfanewExpr.IsValidValue)
                     return null;
                 
-                uint lfanew = ParseUInt(lfanewExpr.Value);
+                uint? lfanewValue = ParseUInt(lfanewExpr.Value);
+                if (!lfanewValue.HasValue)
+                    return null;
+                uint lfanew = lfanewValue.Value;
                 if (lfanew == 0 || lfanew > 0x1000)
                     return null;
                 
@@ -647,7 +958,10 @@ namespace VSDebuggerMCP
                 if (exportRvaExpr == null || !exportRvaExpr.IsValidValue)
                     return null;
                 
-                uint exportRva = ParseUInt(exportRvaExpr.Value);
+                uint? exportRvaValue = ParseUInt(exportRvaExpr.Value);
+                if (!exportRvaValue.HasValue)
+                    return null;
+                uint exportRva = exportRvaValue.Value;
                 if (exportRva == 0)
                     return null;
                 
@@ -656,7 +970,10 @@ namespace VSDebuggerMCP
                 if (nameRvaExpr == null || !nameRvaExpr.IsValidValue)
                     return null;
                 
-                uint nameRva = ParseUInt(nameRvaExpr.Value);
+                uint? nameRvaValue = ParseUInt(nameRvaExpr.Value);
+                if (!nameRvaValue.HasValue)
+                    return null;
+                uint nameRva = nameRvaValue.Value;
                 if (nameRva == 0)
                     return null;
                 
@@ -857,47 +1174,55 @@ namespace VSDebuggerMCP
             return ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
-                var debugger = Debugger;
-                var result = new ExceptionResult { HasException = false };
+                return BuildExceptionResult(Debugger);
+            });
+        }
 
-                if (debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
-                {
-                    return result;
-                }
+        private ExceptionResult BuildExceptionResult(Debugger5 debugger)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var result = new ExceptionResult
+            {
+                HasException = false,
+                Capability = "full_exception_details"
+            };
 
-                try
+            if (debugger == null || debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+            {
+                return result;
+            }
+
+            try
+            {
+                var exceptionExpr = debugger.GetExpression("$exception");
+                if (exceptionExpr != null && exceptionExpr.IsValidValue)
                 {
-                    // Try to evaluate $exception
-                    var exceptionExpr = debugger.GetExpression("$exception");
-                    if (exceptionExpr != null && exceptionExpr.IsValidValue)
+                    result.HasException = true;
+                    result.Type = exceptionExpr.Type;
+                    result.Message = GetExpressionMemberValue(exceptionExpr, "Message");
+                    result.StackTrace = GetExpressionMemberValue(exceptionExpr, "StackTrace");
+                    result.Source = GetExpressionMemberValue(exceptionExpr, "Source");
+                    result.HResult = GetExpressionMemberValue(exceptionExpr, "HResult");
+
+                    var innerExpr = GetExpressionMember(exceptionExpr, "InnerException");
+                    if (innerExpr != null && innerExpr.IsValidValue && innerExpr.Value != "null")
                     {
-                        result.HasException = true;
-                        result.Type = exceptionExpr.Type;
-                        result.Message = GetExpressionMemberValue(exceptionExpr, "Message");
-                        result.StackTrace = GetExpressionMemberValue(exceptionExpr, "StackTrace");
-                        result.Source = GetExpressionMemberValue(exceptionExpr, "Source");
-                        result.HResult = GetExpressionMemberValue(exceptionExpr, "HResult");
-
-                        // Try to get inner exception
-                        var innerExpr = GetExpressionMember(exceptionExpr, "InnerException");
-                        if (innerExpr != null && innerExpr.IsValidValue && innerExpr.Value != "null")
+                        result.InnerException = new ExceptionResult
                         {
-                            result.InnerException = new ExceptionResult
-                            {
-                                HasException = true,
-                                Type = innerExpr.Type,
-                                Message = GetExpressionMemberValue(innerExpr, "Message")
-                            };
-                        }
+                            HasException = true,
+                            Type = innerExpr.Type,
+                            Message = GetExpressionMemberValue(innerExpr, "Message"),
+                            Capability = "full_exception_details"
+                        };
                     }
                 }
-                catch (Exception ex)
-                {
-                    _log($"Error getting exception: {ex.Message}");
-                }
+            }
+            catch (Exception ex)
+            {
+                _log($"Error getting exception: {ex.Message}");
+            }
 
-                return result;
-            });
+            return result;
         }
 
         private string GetExpressionMemberValue(EnvDTE.Expression expr, string memberName)
@@ -949,70 +1274,215 @@ namespace VSDebuggerMCP
             return ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
-                var debugger = Debugger;
-                var result = new EvaluateResult { Expression = expression };
-
-                if (debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
-                {
-                    result.IsValid = false;
-                    result.ErrorMessage = "Not in break mode";
-                    return result;
-                }
-
-                try
-                {
-                    var expr = debugger.GetExpression(expression);
-                    result.IsValid = expr.IsValidValue;
-                    result.Value = expr.Value;
-                    result.Type = expr.Type;
-                    result.HasChildren = expr.DataMembers?.Count > 0;
-
-                    if (!result.IsValid)
-                    {
-                        result.ErrorMessage = expr.Value;
-                    }
-
-                    // Try to get hex value for numeric types
-                    if (result.IsValid && IsNumericType(expr.Type))
-                    {
-                        try
-                        {
-                            var hexExpr = debugger.GetExpression($"(void*){expression}");
-                            if (hexExpr.IsValidValue)
-                            {
-                                result.HexValue = hexExpr.Value;
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _log($"[EvaluateExpression] Error getting hex value for '{expression}': {ex.Message}");
-                        }
-                    }
-
-                    // Expand children if requested
-                    if (expandChildren && result.HasChildren)
-                    {
-                        result.Children = new List<VariableInfo>();
-                        foreach (EnvDTE.Expression child in expr.DataMembers)
-                        {
-                            result.Children.Add(CreateVariableInfo(child, 0, maxDepth));
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    result.IsValid = false;
-                    result.ErrorMessage = ex.Message;
-                }
-
-                return result;
+                return EvaluateExpressionCore(Debugger, expression, expandChildren, maxDepth);
             });
+        }
+
+        public BatchEvaluateResult EvaluateExpressionsBatch(List<string> expressions, bool expandChildren = false, int maxDepth = 2)
+        {
+            return ExecuteOnMainThread(() =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                var debugger = Debugger;
+                var normalizedExpressions = NormalizeExpressions(expressions);
+                var snapshotId = Guid.NewGuid().ToString("N");
+                var capturedAt = DateTime.UtcNow.ToString("o");
+                var bestEffort = new BatchEvaluateResult
+                {
+                    SnapshotId = snapshotId,
+                    CapturedAt = capturedAt,
+                    RequestedCount = normalizedExpressions.Count,
+                    SnapshotStatus = "unavailable",
+                    Partial = true
+                };
+
+                if (normalizedExpressions.Count == 0)
+                {
+                    bestEffort.Error = "No expressions provided";
+                    return bestEffort;
+                }
+
+                if (debugger == null || debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+                {
+                    bestEffort.Error = "Not in break mode";
+                    return bestEffort;
+                }
+
+                for (int attempt = 1; attempt <= SnapshotMaxAttempts; attempt++)
+                {
+                    if (debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+                    {
+                        bestEffort.SnapshotAttempts = attempt;
+                        bestEffort.SnapshotStatus = "unavailable";
+                        bestEffort.Error = "Not in break mode";
+                        return bestEffort;
+                    }
+
+                    try
+                    {
+                        string tokenBefore = CreateDebuggerSnapshotToken(debugger);
+                        var snapshot = BuildBatchEvaluateResult(
+                            debugger,
+                            normalizedExpressions,
+                            expandChildren,
+                            maxDepth,
+                            snapshotId,
+                            capturedAt);
+                        string tokenAfter = CreateDebuggerSnapshotToken(debugger);
+                        bool stable = !string.IsNullOrEmpty(tokenBefore) && tokenBefore == tokenAfter;
+
+                        snapshot.SnapshotStable = stable;
+                        snapshot.SnapshotAttempts = attempt;
+                        snapshot.SnapshotStatus = stable
+                            ? (snapshot.Partial ? "partial" : "ok")
+                            : "unstable";
+                        bestEffort = snapshot;
+                        if (stable)
+                        {
+                            return snapshot;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _log($"EvaluateExpressionsBatch snapshot attempt {attempt} failed: {ex.Message}");
+                        bestEffort.SnapshotAttempts = attempt;
+                        if (bestEffort.Results.Count > 0)
+                        {
+                            bestEffort.SnapshotStatus = "unstable";
+                        }
+                    }
+
+                    if (attempt < SnapshotMaxAttempts)
+                    {
+                        System.Threading.Thread.Sleep(SnapshotRetryDelayMs);
+                    }
+                }
+
+                return bestEffort;
+            });
+        }
+
+        private BatchEvaluateResult BuildBatchEvaluateResult(
+            Debugger5 debugger,
+            IReadOnlyList<string> expressions,
+            bool expandChildren,
+            int maxDepth,
+            string snapshotId,
+            string capturedAt)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var result = new BatchEvaluateResult
+            {
+                SnapshotId = snapshotId,
+                CapturedAt = capturedAt,
+                RequestedCount = expressions.Count
+            };
+
+            foreach (var expression in expressions)
+            {
+                var evalResult = EvaluateExpressionCore(debugger, expression, expandChildren, maxDepth);
+                result.Results.Add(evalResult);
+            }
+
+            result.SuccessCount = result.Results.Count(r => r.IsValid);
+            result.FailedCount = result.Results.Count - result.SuccessCount;
+            result.Partial = result.FailedCount > 0;
+            return result;
+        }
+
+        private EvaluateResult EvaluateExpressionCore(Debugger5 debugger, string expression, bool expandChildren, int maxDepth)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var result = new EvaluateResult { Expression = expression };
+
+            if (debugger == null || debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+            {
+                result.IsValid = false;
+                result.ErrorMessage = "Not in break mode";
+                return result;
+            }
+
+            try
+            {
+                var expr = debugger.GetExpression(expression);
+                result.IsValid = expr.IsValidValue;
+                result.Value = expr.Value;
+                result.Type = expr.Type;
+                result.HasChildren = expr.DataMembers?.Count > 0;
+
+                if (!result.IsValid)
+                {
+                    result.ErrorMessage = expr.Value;
+                }
+
+                if (result.IsValid && IsNumericType(expr.Type))
+                {
+                    try
+                    {
+                        var hexExpr = debugger.GetExpression($"(void*){expression}");
+                        if (hexExpr.IsValidValue)
+                        {
+                            result.HexValue = hexExpr.Value;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _log($"[EvaluateExpression] Error getting hex value for '{expression}': {ex.Message}");
+                    }
+                }
+
+                if (expandChildren && result.HasChildren)
+                {
+                    result.Children = new List<VariableInfo>();
+                    foreach (EnvDTE.Expression child in expr.DataMembers)
+                    {
+                        result.Children.Add(CreateVariableInfo(child, 0, maxDepth));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                result.IsValid = false;
+                result.ErrorMessage = ex.Message;
+            }
+
+            return result;
         }
 
         private bool IsNumericType(string type)
         {
+            if (string.IsNullOrEmpty(type))
+            {
+                return false;
+            }
+
             var numericTypes = new[] { "int", "uint", "long", "ulong", "short", "ushort", "byte", "sbyte", "IntPtr", "UIntPtr", "nint", "nuint" };
             return numericTypes.Any(t => type.Contains(t));
+        }
+
+        private List<string> NormalizeExpressions(IEnumerable<string> expressions)
+        {
+            var result = new List<string>();
+            if (expressions == null)
+            {
+                return result;
+            }
+
+            foreach (var expression in expressions)
+            {
+                if (string.IsNullOrWhiteSpace(expression))
+                {
+                    continue;
+                }
+
+                result.Add(expression.Trim());
+                if (result.Count >= 100)
+                {
+                    break;
+                }
+            }
+
+            return result;
         }
 
         #endregion
@@ -1025,104 +1495,158 @@ namespace VSDebuggerMCP
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
                 var debugger = Debugger;
-                var result = new MemoryResult { Address = address, Size = size };
+                int requestedSize = Math.Max(1, Math.Min(size, 4096));
+                var bestEffort = CreateUnavailableMemoryResult(address, requestedSize);
 
                 if (debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+                {
+                    return bestEffort;
+                }
+
+                for (int attempt = 1; attempt <= SnapshotMaxAttempts; attempt++)
+                {
+                    if (debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+                    {
+                        bestEffort.Status = "unavailable";
+                        return bestEffort;
+                    }
+
+                    try
+                    {
+                        string tokenBefore = CreateDebuggerSnapshotToken(debugger);
+                        var snapshot = ReadMemoryInternal(debugger, address, requestedSize);
+                        string tokenAfter = CreateDebuggerSnapshotToken(debugger);
+                        bool stable = !string.IsNullOrEmpty(tokenBefore) && tokenBefore == tokenAfter;
+
+                        if (stable)
+                        {
+                            return snapshot;
+                        }
+
+                        bestEffort = snapshot;
+                        if (bestEffort.BytesRead > 0)
+                        {
+                            bestEffort.Status = "unstable";
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _log($"ReadMemory snapshot attempt {attempt} failed: {ex.Message}");
+                    }
+
+                    if (attempt < SnapshotMaxAttempts)
+                    {
+                        System.Threading.Thread.Sleep(SnapshotRetryDelayMs);
+                    }
+                }
+
+                return bestEffort;
+            });
+        }
+
+        private MemoryResult CreateUnavailableMemoryResult(string address, int requestedSize)
+        {
+            return new MemoryResult
+            {
+                Address = address,
+                Status = "unavailable",
+                RequestedSize = requestedSize,
+                Size = 0,
+                BytesRead = 0,
+                FailedReads = requestedSize
+            };
+        }
+
+        private MemoryResult ReadMemoryInternal(Debugger5 debugger, string address, int requestedSize)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var result = CreateUnavailableMemoryResult(address, requestedSize);
+
+            try
+            {
+                var addrExpr = debugger.GetExpression(address);
+                if (addrExpr == null || !addrExpr.IsValidValue)
                 {
                     return result;
                 }
 
-                try
+                ulong baseAddress = ParseAddress(addrExpr.Value);
+                bool is64Bit = Is64BitProcess(debugger);
+                result.Address = is64Bit ? $"0x{baseAddress:X16}" : $"0x{baseAddress:X8}";
+
+                byte[] memory = ReadProcessMemoryContiguous(debugger, baseAddress, requestedSize);
+                
+                // Validate that ReadProcessMemoryContiguous returned correct data
+                // This is important for minidump debugging where the process ID might
+                // correspond to a different or non-existent process
+                if (memory != null && memory.Length >= 4)
                 {
-                    // First, evaluate the address to get numeric value
-                    var addrExpr = debugger.GetExpression(address);
-                    if (!addrExpr.IsValidValue)
+                    if (!ValidateMemoryWithExpression(debugger, baseAddress, memory))
                     {
-                        return result;
+                        _log($"ReadMemoryInternal: Process memory validation failed, falling back to expression-based reading");
+                        memory = null; // Force fallback to ReadMemoryBlockOptimized
                     }
-
-                    // Read memory bytes
-                    var bytes = new List<byte>();
-                    var hexBuilder = new StringBuilder();
-                    var asciiBuilder = new StringBuilder();
-
-                    // Read in chunks of 16 bytes
-                    int bytesPerLine = 16;
-                    int lines = (size + bytesPerLine - 1) / bytesPerLine;
-                    var formattedBuilder = new StringBuilder();
-
-                    for (int line = 0; line < lines; line++)
-                    {
-                        int offset = line * bytesPerLine;
-                        int count = Math.Min(bytesPerLine, size - offset);
-
-                        // Read each byte
-                        var lineHex = new StringBuilder();
-                        var lineAscii = new StringBuilder();
-
-                        for (int i = 0; i < count; i++)
-                        {
-                            try
-                            {
-                                string byteExpr = $"*(unsigned char*)({address} + {offset + i})";
-                                var byteResult = debugger.GetExpression(byteExpr);
-                                if (byteResult.IsValidValue)
-                                {
-                                    // Parse the byte value
-                                    string valStr = byteResult.Value.Trim();
-                                    byte b = 0;
-                                    if (valStr.StartsWith("0x"))
-                                    {
-                                        b = Convert.ToByte(valStr, 16);
-                                    }
-                                    else if (byte.TryParse(valStr, out byte parsed))
-                                    {
-                                        b = parsed;
-                                    }
-
-                                    bytes.Add(b);
-                                    lineHex.AppendFormat("{0:X2} ", b);
-                                    lineAscii.Append(b >= 32 && b < 127 ? (char)b : '.');
-                                }
-                                else
-                                {
-                                    lineHex.Append("?? ");
-                                    lineAscii.Append('?');
-                                }
-                            }
-                            catch
-                            {
-                                lineHex.Append("?? ");
-                                lineAscii.Append('?');
-                            }
-                        }
-
-                        // Pad hex to full width
-                        while (lineHex.Length < bytesPerLine * 3)
-                        {
-                            lineHex.Append("   ");
-                        }
-
-                        hexBuilder.Append(lineHex);
-                        asciiBuilder.Append(lineAscii);
-
-                        // Add formatted line
-                        formattedBuilder.AppendFormat("{0}+{1:X4}: {2} | {3}\n",
-                            result.Address, offset, lineHex.ToString().TrimEnd(), lineAscii.ToString());
-                    }
-
-                    result.Bytes = bytes;
-                    result.HexDump = hexBuilder.ToString().Trim();
-                    result.AsciiView = asciiBuilder.ToString();
-                    result.FormattedView = formattedBuilder.ToString();
                 }
-                catch (Exception ex)
+                
+                if ((memory == null || memory.Length == 0) && requestedSize > 0)
                 {
-                    _log($"Error reading memory: {ex.Message}");
+                    memory = ReadMemoryBlockOptimized(debugger, baseAddress, requestedSize);
+                }
+                if (memory == null || memory.Length == 0)
+                {
+                    return result;
                 }
 
-                return result;
-            });
+                result.Bytes = memory.ToList();
+                result.Size = memory.Length;
+                result.BytesRead = memory.Length;
+                result.FailedReads = Math.Max(0, requestedSize - memory.Length);
+                result.Partial = result.FailedReads > 0;
+                result.Status = result.Partial ? "partial" : "ok";
+
+                var hexBuilder = new StringBuilder();
+                var asciiBuilder = new StringBuilder();
+                var formattedBuilder = new StringBuilder();
+                const int bytesPerLine = 16;
+
+                for (int offset = 0; offset < memory.Length; offset += bytesPerLine)
+                {
+                    int count = Math.Min(bytesPerLine, memory.Length - offset);
+                    var lineHex = new StringBuilder();
+                    var lineAscii = new StringBuilder();
+
+                    for (int i = 0; i < count; i++)
+                    {
+                        byte b = memory[offset + i];
+                        lineHex.AppendFormat("{0:X2} ", b);
+                        lineAscii.Append(b >= 32 && b < 127 ? (char)b : '.');
+                    }
+
+                    string lineHexText = lineHex.ToString().TrimEnd();
+                    hexBuilder.Append(lineHexText);
+                    if (offset + count < memory.Length)
+                    {
+                        hexBuilder.Append(' ');
+                    }
+                    asciiBuilder.Append(lineAscii.ToString());
+                    formattedBuilder.AppendFormat(
+                        "{0}+{1:X4}: {2} | {3}\n",
+                        result.Address,
+                        offset,
+                        lineHexText,
+                        lineAscii.ToString());
+                }
+
+                result.HexDump = hexBuilder.ToString();
+                result.AsciiView = asciiBuilder.ToString();
+                result.FormattedView = formattedBuilder.ToString().TrimEnd();
+            }
+            catch (Exception ex)
+            {
+                _log($"Error reading memory: {ex.Message}");
+            }
+
+            return result;
         }
 
         #endregion
@@ -1495,6 +2019,53 @@ namespace VSDebuggerMCP
         }
 
         /// <summary>
+        /// Validates that memory read via ReadProcessMemory matches what the debugger's
+        /// expression evaluator returns. This is important for minidump debugging where
+        /// the ProcessID might not correspond to an actual running process.
+        /// </summary>
+        private bool ValidateMemoryWithExpression(Debugger5 debugger, ulong baseAddress, byte[] memory)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (memory == null || memory.Length < 4)
+            {
+                return true; // Cannot validate, assume valid
+            }
+
+            try
+            {
+                // Read first DWORD via expression evaluation
+                var expr = debugger.GetExpression($"*(unsigned int*)(0x{baseAddress:X})");
+                if (expr == null || !expr.IsValidValue)
+                {
+                    return true; // Cannot validate, assume valid
+                }
+
+                uint? expectedValue = ParseUInt(expr.Value);
+                if (expectedValue == null)
+                {
+                    return true; // Cannot validate, assume valid
+                }
+
+                // Extract first 4 bytes from memory as little-endian uint32
+                uint actualValue = BitConverter.ToUInt32(memory, 0);
+
+                // Compare the values
+                if (actualValue != expectedValue.Value)
+                {
+                    _log($"ValidateMemoryWithExpression: Mismatch at 0x{baseAddress:X} - expected 0x{expectedValue.Value:X8}, got 0x{actualValue:X8}");
+                    return false;
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _log($"ValidateMemoryWithExpression: Error validating memory at 0x{baseAddress:X}: {ex.Message}");
+                return true; // On error, assume valid to avoid breaking existing functionality
+            }
+        }
+
+        /// <summary>
         /// Optimized memory reading - reads in larger chunks to reduce IPC calls.
         /// Uses 4-byte reads instead of single-byte reads for better performance.
         /// </summary>
@@ -1512,8 +2083,11 @@ namespace VSDebuggerMCP
                     if (!expr.IsValidValue)
                         break;
 
-                    uint value = ParseUInt(expr.Value);
-                    var bytes = BitConverter.GetBytes(value);
+                    uint? value = ParseUInt(expr.Value);
+                    if (!value.HasValue)
+                        break;
+
+                    var bytes = BitConverter.GetBytes(value.Value);
 
                     // Only add the bytes we need (handle end of range)
                     int bytesNeeded = Math.Min(4, size - offset);
@@ -1533,20 +2107,26 @@ namespace VSDebuggerMCP
         /// <summary>
         /// Parse unsigned int from debugger expression value.
         /// </summary>
-        private uint ParseUInt(string value)
+        private uint? ParseUInt(string value)
         {
             if (string.IsNullOrEmpty(value))
-                return 0;
+                return null;
 
             value = value.Trim();
 
             if (value.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
-                return Convert.ToUInt32(value.Substring(2), 16);
+            {
+                if (uint.TryParse(value.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out uint hex))
+                {
+                    return hex;
+                }
+                return null;
+            }
 
             if (uint.TryParse(value, out uint result))
                 return result;
 
-            return 0;
+            return null;
         }
 
         /// <summary>
@@ -1589,6 +2169,217 @@ namespace VSDebuggerMCP
 
             return 0;
         }
+
+        private string CreateDebuggerSnapshotToken(Debugger5 debugger)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (debugger == null || debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+            {
+                return string.Empty;
+            }
+
+            int processId = 0;
+            int threadId = 0;
+            string functionName = "";
+            string moduleName = "";
+
+            try
+            {
+                processId = debugger.CurrentProcess?.ProcessID ?? 0;
+            }
+            catch { }
+
+            try
+            {
+                threadId = debugger.CurrentThread?.ID ?? 0;
+            }
+            catch { }
+
+            try
+            {
+                var frame = debugger.CurrentStackFrame;
+                if (frame != null)
+                {
+                    functionName = frame.FunctionName ?? "";
+                    moduleName = frame.Module ?? "";
+                }
+            }
+            catch { }
+
+            return $"{processId}:{threadId}:{functionName}:{moduleName}";
+        }
+
+        private byte[] ReadProcessMemoryContiguous(Debugger5 debugger, ulong startAddress, int requestedSize)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (debugger == null || requestedSize <= 0)
+            {
+                return Array.Empty<byte>();
+            }
+
+            int processId;
+            try
+            {
+                processId = debugger.CurrentProcess?.ProcessID ?? 0;
+            }
+            catch
+            {
+                return Array.Empty<byte>();
+            }
+
+            if (processId <= 0)
+            {
+                return Array.Empty<byte>();
+            }
+
+            uint access = PROCESS_VM_READ | PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION;
+            IntPtr processHandle = OpenProcess(access, false, processId);
+            if (processHandle == IntPtr.Zero)
+            {
+                return Array.Empty<byte>();
+            }
+
+            try
+            {
+                var bytes = new List<byte>(requestedSize);
+                int offset = 0;
+                UIntPtr mbiSize = (UIntPtr)Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION));
+
+                while (offset < requestedSize)
+                {
+                    ulong currentAddress = startAddress + (ulong)offset;
+                    if (currentAddress > long.MaxValue)
+                    {
+                        break;
+                    }
+
+                    MEMORY_BASIC_INFORMATION mbi;
+                    IntPtr queryResult = VirtualQueryEx(processHandle, new IntPtr((long)currentAddress), out mbi, mbiSize);
+                    if (queryResult == IntPtr.Zero)
+                    {
+                        break;
+                    }
+
+                    long regionSize = mbi.RegionSize.ToInt64();
+                    if (regionSize <= 0)
+                    {
+                        break;
+                    }
+
+                    ulong regionBase = unchecked((ulong)mbi.BaseAddress.ToInt64());
+                    ulong regionEnd = regionBase + (ulong)regionSize;
+                    if (currentAddress < regionBase || currentAddress >= regionEnd)
+                    {
+                        break;
+                    }
+
+                    int chunkSize = (int)Math.Min((ulong)(requestedSize - offset), regionEnd - currentAddress);
+                    if (chunkSize <= 0)
+                    {
+                        break;
+                    }
+
+                    if (!IsReadableMemoryProtection(mbi.State, mbi.Protect))
+                    {
+                        break;
+                    }
+
+                    var chunk = new byte[chunkSize];
+                    IntPtr bytesReadPtr;
+                    bool success = ReadProcessMemory(
+                        processHandle,
+                        new IntPtr((long)currentAddress),
+                        chunk,
+                        (UIntPtr)chunkSize,
+                        out bytesReadPtr);
+
+                    if (!success)
+                    {
+                        break;
+                    }
+
+                    int bytesRead = (int)Math.Min(chunkSize, Math.Max(0, bytesReadPtr.ToInt64()));
+                    if (bytesRead <= 0)
+                    {
+                        break;
+                    }
+
+                    for (int i = 0; i < bytesRead; i++)
+                    {
+                        bytes.Add(chunk[i]);
+                    }
+
+                    offset += bytesRead;
+                    if (bytesRead < chunkSize)
+                    {
+                        break;
+                    }
+                }
+
+                return bytes.ToArray();
+            }
+            finally
+            {
+                CloseHandle(processHandle);
+            }
+        }
+
+        private bool IsReadableMemoryProtection(uint state, uint protect)
+        {
+            if (state != MEM_COMMIT)
+            {
+                return false;
+            }
+
+            if ((protect & PAGE_GUARD) != 0 || (protect & PAGE_NOACCESS) != 0)
+            {
+                return false;
+            }
+
+            uint readableMask =
+                PAGE_READONLY |
+                PAGE_READWRITE |
+                PAGE_WRITECOPY |
+                PAGE_EXECUTE_READ |
+                PAGE_EXECUTE_READWRITE |
+                PAGE_EXECUTE_WRITECOPY;
+            return (protect & readableMask) != 0;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MEMORY_BASIC_INFORMATION
+        {
+            public IntPtr BaseAddress;
+            public IntPtr AllocationBase;
+            public uint AllocationProtect;
+            public IntPtr RegionSize;
+            public uint State;
+            public uint Protect;
+            public uint Type;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ReadProcessMemory(
+            IntPtr hProcess,
+            IntPtr lpBaseAddress,
+            [Out] byte[] lpBuffer,
+            UIntPtr nSize,
+            out IntPtr lpNumberOfBytesRead);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr VirtualQueryEx(
+            IntPtr hProcess,
+            IntPtr lpAddress,
+            out MEMORY_BASIC_INFORMATION lpBuffer,
+            UIntPtr dwLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr hObject);
 
         #endregion
 
@@ -1752,6 +2543,322 @@ namespace VSDebuggerMCP
                 Threads = GetThreads(),
                 Modules = GetModules()
             };
+        }
+
+        public DebugBundleResult CaptureDebugBundle(List<string> expressions = null, bool expandChildren = false, int maxDepth = 2, int outputTailLines = 80)
+        {
+            return ExecuteOnMainThread(() =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                var debugger = Debugger;
+                var normalizedExpressions = NormalizeExpressions(expressions);
+                int normalizedDepth = Math.Max(0, Math.Min(maxDepth, 4));
+                int normalizedTailLines = Math.Max(0, Math.Min(outputTailLines, 500));
+                string snapshotId = Guid.NewGuid().ToString("N");
+                string capturedAt = DateTime.UtcNow.ToString("o");
+                var bestEffort = new DebugBundleResult
+                {
+                    SnapshotId = snapshotId,
+                    CapturedAt = capturedAt,
+                    SnapshotStatus = "unavailable",
+                    Partial = true
+                };
+
+                if (debugger == null)
+                {
+                    bestEffort.Error = "Debugger unavailable";
+                    bestEffort.Status = BuildDebugStatus(debugger);
+                    bestEffort.StopReason = bestEffort.Status?.StopReason ?? "not_paused";
+                    bestEffort.Expressions = BuildUnavailableBatchEvaluateResult(snapshotId, capturedAt, normalizedExpressions.Count, "Debugger unavailable");
+                    return bestEffort;
+                }
+
+                for (int attempt = 1; attempt <= SnapshotMaxAttempts; attempt++)
+                {
+                    if (debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+                    {
+                        var status = BuildDebugStatus(debugger);
+                        bestEffort.Status = status;
+                        bestEffort.StopReason = status.StopReason;
+                        bestEffort.SnapshotAttempts = attempt;
+                        bestEffort.SnapshotStatus = "unavailable";
+                        bestEffort.Error = "Not in break mode";
+                        bestEffort.Expressions = BuildUnavailableBatchEvaluateResult(snapshotId, capturedAt, normalizedExpressions.Count, "Not in break mode");
+                        return bestEffort;
+                    }
+
+                    try
+                    {
+                        string tokenBefore = CreateDebuggerSnapshotToken(debugger);
+                        var snapshot = BuildDebugBundleResult(
+                            debugger,
+                            snapshotId,
+                            capturedAt,
+                            normalizedExpressions,
+                            expandChildren,
+                            normalizedDepth,
+                            normalizedTailLines);
+                        string tokenAfter = CreateDebuggerSnapshotToken(debugger);
+                        bool stable = !string.IsNullOrEmpty(tokenBefore) && tokenBefore == tokenAfter;
+
+                        snapshot.SnapshotStable = stable;
+                        snapshot.SnapshotAttempts = attempt;
+                        snapshot.SnapshotStatus = stable
+                            ? (snapshot.Partial ? "partial" : "ok")
+                            : "unstable";
+                        if (snapshot.Expressions != null)
+                        {
+                            snapshot.Expressions.SnapshotStable = stable;
+                            snapshot.Expressions.SnapshotAttempts = attempt;
+                            snapshot.Expressions.SnapshotStatus = stable
+                                ? (snapshot.Expressions.Partial ? "partial" : "ok")
+                                : "unstable";
+                        }
+                        bestEffort = snapshot;
+                        if (stable)
+                        {
+                            return snapshot;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _log($"CaptureDebugBundle snapshot attempt {attempt} failed: {ex.Message}");
+                        bestEffort.SnapshotAttempts = attempt;
+                        if (bestEffort.Status != null)
+                        {
+                            bestEffort.SnapshotStatus = "unstable";
+                        }
+                    }
+
+                    if (attempt < SnapshotMaxAttempts)
+                    {
+                        System.Threading.Thread.Sleep(SnapshotRetryDelayMs);
+                    }
+                }
+
+                return bestEffort;
+            });
+        }
+
+        private DebugBundleResult BuildDebugBundleResult(
+            Debugger5 debugger,
+            string snapshotId,
+            string capturedAt,
+            IReadOnlyList<string> expressions,
+            bool expandChildren,
+            int maxDepth,
+            int outputTailLines)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var bundle = new DebugBundleResult
+            {
+                SnapshotId = snapshotId,
+                CapturedAt = capturedAt
+            };
+            var componentErrors = new List<string>();
+
+            bundle.Status = BuildDebugStatus(debugger);
+            bundle.StopReason = bundle.Status?.StopReason ?? "not_paused";
+
+            try
+            {
+                bundle.Callstack = BuildCallStackResult(debugger);
+                bundle.Callstack.SnapshotAttempts = 1;
+                bundle.Callstack.SnapshotStable = true;
+                bundle.Callstack.SnapshotStatus = bundle.Callstack.Frames.Count > 0 ? "ok" : "unavailable";
+            }
+            catch (Exception ex)
+            {
+                componentErrors.Add($"callstack: {ex.Message}");
+                bundle.Callstack = new CallStackResult
+                {
+                    Capability = "full_frame_metadata",
+                    SnapshotStatus = "unavailable"
+                };
+            }
+
+            try
+            {
+                bundle.Locals = BuildLocalsResult(debugger, maxDepth);
+            }
+            catch (Exception ex)
+            {
+                componentErrors.Add($"locals: {ex.Message}");
+                bundle.Locals = new LocalsResult();
+            }
+
+            try
+            {
+                bundle.Exception = BuildExceptionResult(debugger);
+            }
+            catch (Exception ex)
+            {
+                componentErrors.Add($"exception: {ex.Message}");
+                bundle.Exception = new ExceptionResult
+                {
+                    Capability = "full_exception_details",
+                    HasException = false
+                };
+            }
+
+            try
+            {
+                bundle.Threads = BuildThreadsResult(debugger);
+                bundle.Threads.SnapshotAttempts = 1;
+                bundle.Threads.SnapshotStable = true;
+                bundle.Threads.SnapshotStatus = bundle.Threads.Threads.Count > 0 ? "ok" : "unavailable";
+            }
+            catch (Exception ex)
+            {
+                componentErrors.Add($"threads: {ex.Message}");
+                bundle.Threads = new ThreadsResult
+                {
+                    Capability = "full_thread_metadata",
+                    SnapshotStatus = "unavailable"
+                };
+            }
+
+            try
+            {
+                bundle.Modules = BuildModulesResult(debugger);
+                if (!string.IsNullOrEmpty(bundle.Modules.Error))
+                {
+                    componentErrors.Add($"modules: {bundle.Modules.Error}");
+                }
+            }
+            catch (Exception ex)
+            {
+                componentErrors.Add($"modules: {ex.Message}");
+                bundle.Modules = new ModulesResult
+                {
+                    Capability = "multi_source",
+                    Error = ex.Message
+                };
+            }
+
+            try
+            {
+                bundle.Registers = BuildRegistersResult(debugger);
+                if (!string.IsNullOrEmpty(bundle.Registers.Error))
+                {
+                    componentErrors.Add($"registers: {bundle.Registers.Error}");
+                }
+            }
+            catch (Exception ex)
+            {
+                componentErrors.Add($"registers: {ex.Message}");
+                bundle.Registers = new RegistersResult
+                {
+                    Capability = "general_segment_sse",
+                    Error = ex.Message
+                };
+            }
+
+            try
+            {
+                bundle.Output = BuildOutputWindowResult("Debug", outputTailLines);
+                if (!string.IsNullOrEmpty(bundle.Output.Error))
+                {
+                    componentErrors.Add($"output: {bundle.Output.Error}");
+                }
+            }
+            catch (Exception ex)
+            {
+                componentErrors.Add($"output: {ex.Message}");
+                bundle.Output = new OutputWindowResult
+                {
+                    Pane = "Debug",
+                    Capability = "multi_pane_output",
+                    Error = ex.Message
+                };
+            }
+
+            try
+            {
+                bundle.Expressions = expressions.Count > 0
+                    ? BuildBatchEvaluateResult(debugger, expressions, expandChildren, maxDepth, snapshotId, capturedAt)
+                    : new BatchEvaluateResult
+                    {
+                        SnapshotId = snapshotId,
+                        CapturedAt = capturedAt,
+                        SnapshotStable = true,
+                        SnapshotAttempts = 1,
+                        SnapshotStatus = "ok",
+                        RequestedCount = 0,
+                        SuccessCount = 0,
+                        FailedCount = 0,
+                        Partial = false
+                    };
+                if (!string.IsNullOrEmpty(bundle.Expressions.Error))
+                {
+                    componentErrors.Add($"expressions: {bundle.Expressions.Error}");
+                }
+            }
+            catch (Exception ex)
+            {
+                componentErrors.Add($"expressions: {ex.Message}");
+                bundle.Expressions = BuildUnavailableBatchEvaluateResult(snapshotId, capturedAt, expressions.Count, ex.Message);
+            }
+
+            bundle.Partial = IsDebugBundlePartial(bundle);
+            if (componentErrors.Count > 0)
+            {
+                bundle.Error = string.Join("; ", componentErrors);
+            }
+
+            return bundle;
+        }
+
+        private BatchEvaluateResult BuildUnavailableBatchEvaluateResult(string snapshotId, string capturedAt, int requestedCount, string error)
+        {
+            return new BatchEvaluateResult
+            {
+                SnapshotId = snapshotId,
+                CapturedAt = capturedAt,
+                RequestedCount = requestedCount,
+                SuccessCount = 0,
+                FailedCount = requestedCount,
+                Partial = requestedCount > 0,
+                SnapshotStatus = "unavailable",
+                Error = error
+            };
+        }
+
+        private bool IsDebugBundlePartial(DebugBundleResult bundle)
+        {
+            if (bundle == null)
+            {
+                return true;
+            }
+
+            if (!string.IsNullOrEmpty(bundle.Error))
+            {
+                return true;
+            }
+
+            if (bundle.Callstack == null || bundle.Callstack.SnapshotStatus != "ok")
+            {
+                return true;
+            }
+
+            if (bundle.Threads == null || bundle.Threads.SnapshotStatus != "ok")
+            {
+                return true;
+            }
+
+            if (bundle.Modules?.Error != null ||
+                bundle.Registers?.Error != null ||
+                bundle.Output?.Error != null)
+            {
+                return true;
+            }
+
+            if (bundle.Expressions != null && (bundle.Expressions.Partial || bundle.Expressions.FailedCount > 0))
+            {
+                return true;
+            }
+
+            return false;
         }
 
         #endregion
@@ -2535,65 +3642,36 @@ namespace VSDebuggerMCP
             return ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
-                var debugger = Debugger;
-                var result = new RegistersResult();
+                return BuildRegistersResult(Debugger);
+            });
+        }
 
-                if (debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+        private RegistersResult BuildRegistersResult(Debugger5 debugger)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var result = new RegistersResult
+            {
+                Capability = "general_segment_sse",
+                AvailableCategories = new List<string> { "General Purpose", "Instruction Pointer", "Stack", "Flags", "Segment", "SSE" }
+            };
+
+            if (debugger == null || debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+            {
+                result.Error = "Not in break mode";
+                return result;
+            }
+
+            try
+            {
+                bool is64Bit = Is64BitProcess(debugger);
+                result.Is64Bit = is64Bit;
+
+                if (is64Bit)
                 {
-                    result.Error = "Not in break mode";
-                    return result;
-                }
-
-                try
-                {
-                    bool is64Bit = Is64BitProcess(debugger);
-                    result.Is64Bit = is64Bit;
-
-                    // General purpose registers
-                    if (is64Bit)
-                    {
-                        // 64-bit registers
-                        string[] regs64 = { "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", 
-                                           "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
-                                           "rip", "rflags" };
-                        foreach (var reg in regs64)
-                        {
-                            var expr = debugger.GetExpression($"@{reg}");
-                            if (expr != null && expr.IsValidValue)
-                            {
-                                result.Registers.Add(new RegisterInfo
-                                {
-                                    Name = reg.ToUpper(),
-                                    Value = expr.Value,
-                                    HexValue = FormatAsHex(expr.Value),
-                                    Category = GetRegisterCategory(reg)
-                                });
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // 32-bit registers
-                        string[] regs32 = { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags" };
-                        foreach (var reg in regs32)
-                        {
-                            var expr = debugger.GetExpression($"@{reg}");
-                            if (expr != null && expr.IsValidValue)
-                            {
-                                result.Registers.Add(new RegisterInfo
-                                {
-                                    Name = reg.ToUpper(),
-                                    Value = expr.Value,
-                                    HexValue = FormatAsHex(expr.Value),
-                                    Category = GetRegisterCategory(reg)
-                                });
-                            }
-                        }
-                    }
-
-                    // Segment registers
-                    string[] segRegs = { "cs", "ds", "es", "fs", "gs", "ss" };
-                    foreach (var reg in segRegs)
+                    string[] regs64 = { "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", 
+                                       "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+                                       "rip", "rflags" };
+                    foreach (var reg in regs64)
                     {
                         var expr = debugger.GetExpression($"@{reg}");
                         if (expr != null && expr.IsValidValue)
@@ -2603,33 +3681,66 @@ namespace VSDebuggerMCP
                                 Name = reg.ToUpper(),
                                 Value = expr.Value,
                                 HexValue = FormatAsHex(expr.Value),
-                                Category = "Segment"
+                                Category = GetRegisterCategory(reg)
                             });
                         }
                     }
-
-                    // XMM registers (SSE)
-                    for (int i = 0; i < 16; i++)
+                }
+                else
+                {
+                    string[] regs32 = { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags" };
+                    foreach (var reg in regs32)
                     {
-                        var expr = debugger.GetExpression($"@xmm{i}");
+                        var expr = debugger.GetExpression($"@{reg}");
                         if (expr != null && expr.IsValidValue)
                         {
                             result.Registers.Add(new RegisterInfo
                             {
-                                Name = $"XMM{i}",
+                                Name = reg.ToUpper(),
                                 Value = expr.Value,
-                                Category = "SSE"
+                                HexValue = FormatAsHex(expr.Value),
+                                Category = GetRegisterCategory(reg)
                             });
                         }
                     }
                 }
-                catch (Exception ex)
+
+                string[] segRegs = { "cs", "ds", "es", "fs", "gs", "ss" };
+                foreach (var reg in segRegs)
                 {
-                    result.Error = ex.Message;
+                    var expr = debugger.GetExpression($"@{reg}");
+                    if (expr != null && expr.IsValidValue)
+                    {
+                        result.Registers.Add(new RegisterInfo
+                        {
+                            Name = reg.ToUpper(),
+                            Value = expr.Value,
+                            HexValue = FormatAsHex(expr.Value),
+                            Category = "Segment"
+                        });
+                    }
                 }
 
-                return result;
-            });
+                for (int i = 0; i < 16; i++)
+                {
+                    var expr = debugger.GetExpression($"@xmm{i}");
+                    if (expr != null && expr.IsValidValue)
+                    {
+                        result.Registers.Add(new RegisterInfo
+                        {
+                            Name = $"XMM{i}",
+                            Value = expr.Value,
+                            Category = "SSE"
+                        });
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                result.Error = ex.Message;
+            }
+
+            return result;
         }
 
         private string GetRegisterCategory(string reg)
@@ -2672,7 +3783,11 @@ namespace VSDebuggerMCP
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
                 var debugger = Debugger;
-                var result = new WatchResult { Expression = expression };
+                var result = new WatchResult
+                {
+                    Expression = expression,
+                    Behavior = "persisted_watch"
+                };
 
                 if (debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
                 {
@@ -2720,78 +3835,131 @@ namespace VSDebuggerMCP
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
                 var debugger = Debugger;
-                var result = new MemorySearchResult { Pattern = pattern };
+                var bestEffort = CreateUnavailableMemorySearchResult(pattern, searchSize);
 
                 if (debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
                 {
-                    result.Error = "Not in break mode";
-                    return result;
+                    return bestEffort;
                 }
 
-                // Save current thread in case we need to restore
-                int originalThreadId = debugger.CurrentThread?.ID ?? 0;
-                bool switchedThread = false;
-
-                try
+                for (int attempt = 1; attempt <= SnapshotMaxAttempts; attempt++)
                 {
-                    // Try to execute first
-                    result = ExecuteSearchMemory(debugger, startAddress, pattern, maxResults, searchSize, result);
-                    
-                    // If first attempt failed (has error or no bytes searched), try switching to user code thread
-                    if (!string.IsNullOrEmpty(result.Error) || result.BytesSearched == 0)
+                    if (debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
                     {
-                        string firstError = result.Error ?? "No memory read";
-                        _log($"SearchMemory first attempt failed: {firstError}");
+                        bestEffort.Status = "unavailable";
+                        return bestEffort;
+                    }
 
-                        var userThread = FindUserCodeThread(debugger);
-                        if (userThread != null && userThread.ID != originalThreadId)
+                    try
+                    {
+                        string tokenBefore = CreateDebuggerSnapshotToken(debugger);
+                        var snapshot = ExecuteSearchMemoryWithThreadFallback(
+                            debugger,
+                            startAddress,
+                            pattern,
+                            maxResults,
+                            searchSize);
+                        string tokenAfter = CreateDebuggerSnapshotToken(debugger);
+                        bool stable = !string.IsNullOrEmpty(tokenBefore) && tokenBefore == tokenAfter;
+
+                        if (stable)
                         {
-                            _log($"SearchMemory: Switching from thread {originalThreadId} to user code thread {userThread.ID}");
-                            debugger.CurrentThread = userThread;
-                            switchedThread = true;
+                            return snapshot;
+                        }
 
-                            // Reset result and retry
-                            result = new MemorySearchResult { Pattern = pattern };
-                            result = ExecuteSearchMemory(debugger, startAddress, pattern, maxResults, searchSize, result);
-                            
-                            // If retry also failed, log it
-                            if (!string.IsNullOrEmpty(result.Error) || result.BytesSearched == 0)
-                            {
-                                _log($"SearchMemory retry also failed: {result.Error}");
-                            }
+                        bestEffort = snapshot;
+                        if (bestEffort.BytesSearched > 0)
+                        {
+                            bestEffort.Status = "unstable";
                         }
                     }
-                }
-                catch (Exception ex)
-                {
-                    _log($"SearchMemory exception: {ex.Message}");
-                    result.Error = ex.Message;
-                }
-                finally
-                {
-                    // Restore original thread if we switched
-                    if (switchedThread && originalThreadId > 0)
+                    catch (Exception ex)
                     {
-                        try
-                        {
-                            foreach (EnvDTE.Thread thread in debugger.CurrentProgram.Threads)
-                            {
-                                if (thread.ID == originalThreadId)
-                                {
-                                    debugger.CurrentThread = thread;
-                                    break;
-                                }
-                            }
-                        }
-                        catch (Exception restoreEx)
-                        {
-                            _log($"Failed to restore original thread: {restoreEx.Message}");
-                        }
+                        _log($"SearchMemory snapshot attempt {attempt} failed: {ex.Message}");
+                    }
+
+                    if (attempt < SnapshotMaxAttempts)
+                    {
+                        System.Threading.Thread.Sleep(SnapshotRetryDelayMs);
                     }
                 }
 
-                return result;
+                return bestEffort;
             });
+        }
+
+        private MemorySearchResult CreateUnavailableMemorySearchResult(string pattern, int searchSize)
+        {
+            return new MemorySearchResult
+            {
+                Pattern = pattern,
+                Status = "unavailable",
+                RequestedBytes = Math.Max(1, Math.Min(searchSize, 0x100000)),
+                FailedReads = Math.Max(1, Math.Min(searchSize, 0x100000))
+            };
+        }
+
+        private MemorySearchResult ExecuteSearchMemoryWithThreadFallback(
+            Debugger5 debugger,
+            string startAddress,
+            string pattern,
+            int maxResults,
+            int searchSize)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var result = CreateUnavailableMemorySearchResult(pattern, searchSize);
+
+            // Save current thread in case we need to restore.
+            int originalThreadId = debugger.CurrentThread?.ID ?? 0;
+            bool switchedThread = false;
+
+            try
+            {
+                result = ExecuteSearchMemory(debugger, startAddress, pattern, maxResults, searchSize, result);
+
+                // If first attempt could not obtain bytes, try switching to a user-code thread once.
+                if (result.BytesSearched == 0)
+                {
+                    var userThread = FindUserCodeThread(debugger);
+                    if (userThread != null && userThread.ID != originalThreadId)
+                    {
+                        _log($"SearchMemory: Switching from thread {originalThreadId} to user code thread {userThread.ID}");
+                        debugger.CurrentThread = userThread;
+                        switchedThread = true;
+
+                        result = ExecuteSearchMemory(
+                            debugger,
+                            startAddress,
+                            pattern,
+                            maxResults,
+                            searchSize,
+                            CreateUnavailableMemorySearchResult(pattern, searchSize));
+                    }
+                }
+            }
+            finally
+            {
+                if (switchedThread && originalThreadId > 0)
+                {
+                    try
+                    {
+                        foreach (EnvDTE.Thread thread in debugger.CurrentProgram.Threads)
+                        {
+                            if (thread.ID == originalThreadId)
+                            {
+                                debugger.CurrentThread = thread;
+                                break;
+                            }
+                        }
+                    }
+                    catch (Exception restoreEx)
+                    {
+                        _log($"Failed to restore original thread: {restoreEx.Message}");
+                    }
+                }
+            }
+
+            return result;
         }
 
         /// <summary>
@@ -2800,6 +3968,15 @@ namespace VSDebuggerMCP
         private MemorySearchResult ExecuteSearchMemory(Debugger5 debugger, string startAddress, string pattern, int maxResults, int searchSize, MemorySearchResult result)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
+            int requestedBytes = Math.Max(1, Math.Min(searchSize, 0x100000));
+            result.Pattern = pattern;
+            result.RequestedBytes = requestedBytes;
+            result.Matches.Clear();
+            result.TotalFound = 0;
+            result.BytesSearched = 0;
+            result.FailedReads = requestedBytes;
+            result.Partial = false;
+            result.Status = "unavailable";
 
             // Parse pattern (hex bytes like "4D 5A" or string)
             byte[] patternBytes;
@@ -2809,7 +3986,6 @@ namespace VSDebuggerMCP
                 var hexBytes = pattern.Replace(" ", "").Trim();
                 if (hexBytes.Length % 2 != 0)
                 {
-                    result.Error = "Invalid hex pattern: odd number of characters";
                     return result;
                 }
                 patternBytes = Enumerable.Range(0, hexBytes.Length / 2)
@@ -2824,7 +4000,6 @@ namespace VSDebuggerMCP
 
             if (patternBytes.Length == 0)
             {
-                result.Error = "Empty search pattern";
                 return result;
             }
 
@@ -2832,23 +4007,29 @@ namespace VSDebuggerMCP
 
             // Get start address
             var addrExpr = debugger.GetExpression(startAddress);
-            if (!addrExpr.IsValidValue)
+            if (addrExpr == null || !addrExpr.IsValidValue)
             {
-                result.Error = $"Invalid start address: {startAddress}";
                 return result;
             }
 
             ulong addr = ParseAddress(addrExpr.Value);
 
-            // Read memory block using optimized batch reading
-            // This reduces IPC calls from O(searchSize) to O(searchSize/4)
-            byte[] memoryBlock = ReadMemoryBlockOptimized(debugger, addr, searchSize);
+            byte[] memoryBlock = ReadProcessMemoryContiguous(debugger, addr, requestedBytes);
+            if ((memoryBlock == null || memoryBlock.Length == 0) && requestedBytes > 0)
+            {
+                memoryBlock = ReadMemoryBlockOptimized(debugger, addr, requestedBytes);
+            }
 
             if (memoryBlock == null || memoryBlock.Length == 0)
             {
-                result.Error = "Could not read memory at specified address";
+                result.FailedReads = requestedBytes;
                 return result;
             }
+
+            result.BytesSearched = memoryBlock.Length;
+            result.FailedReads = Math.Max(0, requestedBytes - memoryBlock.Length);
+            result.Partial = result.FailedReads > 0;
+            result.Status = result.Partial ? "partial" : "ok";
 
             // Search for pattern in the local memory block
             int found = 0;
@@ -2884,7 +4065,6 @@ namespace VSDebuggerMCP
             }
 
             result.TotalFound = found;
-            result.BytesSearched = memoryBlock.Length;
 
             return result;
         }
@@ -2903,111 +4083,108 @@ namespace VSDebuggerMCP
             return ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
-                var result = new OutputWindowResult
-                {
-                    Pane = pane,
-                    RequestedLines = tailLines
-                };
+                return BuildOutputWindowResult(pane, tailLines);
+            });
+        }
 
+        private OutputWindowResult BuildOutputWindowResult(string pane, int tailLines)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var result = new OutputWindowResult
+            {
+                Pane = pane,
+                Capability = "multi_pane_output",
+                RequestedLines = tailLines
+            };
+
+            try
+            {
+                var outputWindow = _dte.ToolWindows.OutputWindow;
+                if (outputWindow == null)
+                {
+                    result.Error = "Output window not available";
+                    return result;
+                }
+
+                foreach (OutputWindowPane p in outputWindow.OutputWindowPanes)
+                {
+                    try
+                    {
+                        result.AvailablePanes.Add(p.Name);
+                    }
+                    catch { }
+                }
+
+                OutputWindowPane targetPane = null;
                 try
                 {
-                    // Get the Output window
-                    var outputWindow = _dte.ToolWindows.OutputWindow;
-                    if (outputWindow == null)
-                    {
-                        result.Error = "Output window not available";
-                        return result;
-                    }
-
-                    // List available panes
+                    targetPane = outputWindow.OutputWindowPanes.Item(pane);
+                }
+                catch
+                {
                     foreach (OutputWindowPane p in outputWindow.OutputWindowPanes)
                     {
                         try
                         {
-                            result.AvailablePanes.Add(p.Name);
+                            if (p.Name.Equals(pane, StringComparison.OrdinalIgnoreCase))
+                            {
+                                targetPane = p;
+                                break;
+                            }
                         }
                         catch { }
                     }
-
-                    // Find the requested pane
-                    OutputWindowPane targetPane = null;
-                    
-                    // Try exact match first
-                    try
-                    {
-                        targetPane = outputWindow.OutputWindowPanes.Item(pane);
-                    }
-                    catch
-                    {
-                        // Try case-insensitive match
-                        foreach (OutputWindowPane p in outputWindow.OutputWindowPanes)
-                        {
-                            try
-                            {
-                                if (p.Name.Equals(pane, StringComparison.OrdinalIgnoreCase))
-                                {
-                                    targetPane = p;
-                                    break;
-                                }
-                            }
-                            catch { }
-                        }
-                    }
-
-                    if (targetPane == null)
-                    {
-                        result.Error = $"Output pane '{pane}' not found. Available panes: {string.Join(", ", result.AvailablePanes)}";
-                        return result;
-                    }
-
-                    result.Pane = targetPane.Name;
-
-                    // Get the text from the pane
-                    var textDocument = targetPane.TextDocument;
-                    if (textDocument == null)
-                    {
-                        result.Error = "Could not access output pane text";
-                        return result;
-                    }
-
-                    var startPoint = textDocument.StartPoint.CreateEditPoint();
-                    var endPoint = textDocument.EndPoint.CreateEditPoint();
-                    string fullContent = startPoint.GetText(endPoint);
-
-                    if (string.IsNullOrEmpty(fullContent))
-                    {
-                        result.Content = "";
-                        result.LineCount = 0;
-                        result.Truncated = false;
-                        return result;
-                    }
-
-                    // Split into lines
-                    var lines = fullContent.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
-                    result.LineCount = lines.Length;
-
-                    // Apply tail limit if specified
-                    if (tailLines > 0 && lines.Length > tailLines)
-                    {
-                        var tailArray = new string[tailLines];
-                        Array.Copy(lines, lines.Length - tailLines, tailArray, 0, tailLines);
-                        result.Content = string.Join("\n", tailArray);
-                        result.Truncated = true;
-                    }
-                    else
-                    {
-                        result.Content = fullContent;
-                        result.Truncated = false;
-                    }
                 }
-                catch (Exception ex)
+
+                if (targetPane == null)
                 {
-                    _log($"GetOutputWindow error: {ex.Message}");
-                    result.Error = ex.Message;
+                    result.Error = $"Output pane '{pane}' not found. Available panes: {string.Join(", ", result.AvailablePanes)}";
+                    return result;
                 }
 
-                return result;
-            });
+                result.Pane = targetPane.Name;
+                var textDocument = targetPane.TextDocument;
+                if (textDocument == null)
+                {
+                    result.Error = "Could not access output pane text";
+                    return result;
+                }
+
+                var startPoint = textDocument.StartPoint.CreateEditPoint();
+                var endPoint = textDocument.EndPoint.CreateEditPoint();
+                string fullContent = startPoint.GetText(endPoint);
+
+                if (string.IsNullOrEmpty(fullContent))
+                {
+                    result.Content = "";
+                    result.LineCount = 0;
+                    result.Truncated = false;
+                    return result;
+                }
+
+                var lines = fullContent.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+                result.LineCount = lines.Length;
+
+                if (tailLines > 0 && lines.Length > tailLines)
+                {
+                    var tailArray = new string[tailLines];
+                    Array.Copy(lines, lines.Length - tailLines, tailArray, 0, tailLines);
+                    result.Content = string.Join("\n", tailArray);
+                    result.Truncated = true;
+                }
+                else
+                {
+                    result.Content = fullContent;
+                    result.Truncated = false;
+                }
+            }
+            catch (Exception ex)
+            {
+                _log($"GetOutputWindow error: {ex.Message}");
+                result.Error = ex.Message;
+            }
+
+            return result;
         }
 
         /// <summary>
@@ -3026,6 +4203,7 @@ namespace VSDebuggerMCP
                 var result = new SearchOutputResult
                 {
                     Pane = pane,
+                    Capability = "multi_pane_output",
                     Pattern = pattern,
                     IsRegex = isRegex
                 };
@@ -3333,9 +4511,9 @@ namespace VSDebuggerMCP
                         
                         // Try to find source file by class name
                         var parts = ParseFunctionName(frame.FunctionName);
-                        if (!string.IsNullOrEmpty(parts.ClassName))
+                        if (!string.IsNullOrEmpty(parts.TypeName) || !string.IsNullOrEmpty(parts.ClassName))
                         {
-                            var filePath = FindSourceFileByClassName(parts.ClassName);
+                            var filePath = FindSourceFileByClassName(parts.TypeName, parts.ClassName);
                             if (!string.IsNullOrEmpty(filePath))
                             {
                                 return filePath;
@@ -3523,10 +4701,10 @@ namespace VSDebuggerMCP
         /// Parse function name to extract class and method.
         /// Handles C# style (Namespace.Class.Method) and C++ style (Namespace::Class::Method)
         /// </summary>
-        private (string ClassName, string MethodName) ParseFunctionName(string functionName)
+        private (string TypeName, string ClassName, string MethodName) ParseFunctionName(string functionName)
         {
             if (string.IsNullOrEmpty(functionName))
-                return (null, null);
+                return (null, null, null);
 
             // Remove generic type parameters using stack-based approach to handle nested generics
             // e.g., "Dictionary<string, List<int>>" -> "Dictionary"
@@ -3542,10 +4720,23 @@ namespace VSDebuggerMCP
 
             if (parts.Length >= 2)
             {
-                return (parts[parts.Length - 2], parts[parts.Length - 1]);
+                var className = parts[parts.Length - 2].Trim();
+                var methodName = parts[parts.Length - 1].Trim();
+                var typeName = string.Join(".", parts.Take(parts.Length - 1)).Trim();
+                return (
+                    string.IsNullOrEmpty(typeName) ? null : typeName,
+                    string.IsNullOrEmpty(className) ? null : className,
+                    string.IsNullOrEmpty(methodName) ? null : methodName
+                );
             }
 
-            return (null, parts.Length > 0 ? parts[0] : null);
+            var singleName = parts.Length > 0 ? parts[0].Trim() : null;
+            if (string.IsNullOrEmpty(singleName))
+            {
+                return (null, null, null);
+            }
+
+            return (singleName, singleName, null);
         }
 
         /// <summary>
@@ -3599,21 +4790,53 @@ namespace VSDebuggerMCP
         /// <summary>
         /// Find source file by searching solution for class definition.
         /// </summary>
-        private string FindSourceFileByClassName(string className)
+        private string FindSourceFileByClassName(string typeName, string className)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
+            var normalizedTypeName = NormalizeTypeLookupName(typeName);
+            var normalizedClassName = NormalizeTypeLookupName(className);
+            if (string.IsNullOrEmpty(normalizedClassName) && !string.IsNullOrEmpty(normalizedTypeName))
+            {
+                var lastSegment = normalizedTypeName.Split('.').LastOrDefault();
+                normalizedClassName = NormalizeTypeLookupName(lastSegment);
+            }
+
+            var cacheKeys = BuildSourceLookupKeys(normalizedTypeName, normalizedClassName);
+            if (cacheKeys.Count == 0)
+            {
+                return null;
+            }
+
             try
             {
-                if (_dte.Solution == null || string.IsNullOrEmpty(className))
+                if (_dte.Solution == null)
+                {
                     return null;
+                }
+
+                EnsureSourceLookupCacheFresh();
+
+                foreach (var key in cacheKeys)
+                {
+                    if (TryGetSourceLookupHit(key, out string cachedPath))
+                    {
+                        return cachedPath;
+                    }
+                }
+
+                if (cacheKeys.All(IsSourceLookupMissCached))
+                {
+                    return null;
+                }
 
                 foreach (Project project in _dte.Solution.Projects)
                 {
                     try
                     {
-                        var filePath = SearchProjectForClass(project.ProjectItems, className);
+                        var filePath = SearchProjectForClass(project.ProjectItems, normalizedTypeName, normalizedClassName);
                         if (!string.IsNullOrEmpty(filePath))
                         {
+                            RecordSourceLookupHit(cacheKeys, filePath);
                             return filePath;
                         }
                     }
@@ -3627,13 +4850,170 @@ namespace VSDebuggerMCP
             {
                 _log($"Error finding source file by class name: {ex.Message}");
             }
+
+            RecordSourceLookupMiss(cacheKeys);
             return null;
+        }
+
+        private List<string> BuildSourceLookupKeys(string typeName, string className)
+        {
+            var keys = new List<string>();
+            if (!string.IsNullOrEmpty(typeName))
+            {
+                keys.Add(typeName);
+            }
+
+            if (!string.IsNullOrEmpty(className) &&
+                !keys.Any(k => string.Equals(k, className, StringComparison.OrdinalIgnoreCase)))
+            {
+                keys.Add(className);
+            }
+
+            return keys;
+        }
+
+        private void EnsureSourceLookupCacheFresh()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            string solutionKey = _dte.Solution?.FullName ?? string.Empty;
+            if (!string.Equals(solutionKey, _sourceLookupSolutionKey, StringComparison.OrdinalIgnoreCase))
+            {
+                _sourceLookupSolutionKey = solutionKey;
+                _sourceFileByClassCache.Clear();
+                _sourceFileByClassMissCache.Clear();
+                return;
+            }
+
+            PruneSourceLookupMissCache();
+        }
+
+        private void PruneSourceLookupMissCache()
+        {
+            var now = DateTime.UtcNow;
+            var expiredKeys = _sourceFileByClassMissCache
+                .Where(entry => entry.Value <= now)
+                .Select(entry => entry.Key)
+                .ToList();
+
+            foreach (var expiredKey in expiredKeys)
+            {
+                _sourceFileByClassMissCache.Remove(expiredKey);
+            }
+        }
+
+        private bool TryGetSourceLookupHit(string cacheKey, out string cachedPath)
+        {
+            cachedPath = null;
+            if (string.IsNullOrEmpty(cacheKey))
+            {
+                return false;
+            }
+
+            if (_sourceFileByClassCache.TryGetValue(cacheKey, out string path))
+            {
+                if (!string.IsNullOrEmpty(path) && System.IO.File.Exists(path))
+                {
+                    cachedPath = path;
+                    return true;
+                }
+
+                _sourceFileByClassCache.Remove(cacheKey);
+            }
+
+            return false;
+        }
+
+        private bool IsSourceLookupMissCached(string cacheKey)
+        {
+            if (string.IsNullOrEmpty(cacheKey))
+            {
+                return false;
+            }
+
+            if (_sourceFileByClassMissCache.TryGetValue(cacheKey, out DateTime expiresAt))
+            {
+                if (expiresAt > DateTime.UtcNow)
+                {
+                    return true;
+                }
+
+                _sourceFileByClassMissCache.Remove(cacheKey);
+            }
+
+            return false;
+        }
+
+        private void RecordSourceLookupHit(IEnumerable<string> cacheKeys, string filePath)
+        {
+            if (string.IsNullOrEmpty(filePath))
+            {
+                return;
+            }
+
+            foreach (var key in cacheKeys)
+            {
+                if (string.IsNullOrEmpty(key))
+                {
+                    continue;
+                }
+
+                if (_sourceFileByClassCache.Count >= SourceLookupCacheMaxEntries &&
+                    !_sourceFileByClassCache.ContainsKey(key))
+                {
+                    _sourceFileByClassCache.Clear();
+                }
+
+                _sourceFileByClassCache[key] = filePath;
+                _sourceFileByClassMissCache.Remove(key);
+            }
+        }
+
+        private void RecordSourceLookupMiss(IEnumerable<string> cacheKeys)
+        {
+            var expiresAt = DateTime.UtcNow.Add(SourceLookupMissCacheTtl);
+            foreach (var key in cacheKeys)
+            {
+                if (string.IsNullOrEmpty(key))
+                {
+                    continue;
+                }
+
+                if (_sourceFileByClassMissCache.Count >= SourceLookupCacheMaxEntries &&
+                    !_sourceFileByClassMissCache.ContainsKey(key))
+                {
+                    PruneSourceLookupMissCache();
+                    if (_sourceFileByClassMissCache.Count >= SourceLookupCacheMaxEntries)
+                    {
+                        _sourceFileByClassMissCache.Clear();
+                    }
+                }
+
+                _sourceFileByClassMissCache[key] = expiresAt;
+            }
+        }
+
+        private string NormalizeTypeLookupName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return null;
+            }
+
+            var normalized = name.Trim();
+            if (normalized.StartsWith("global::", StringComparison.OrdinalIgnoreCase))
+            {
+                normalized = normalized.Substring("global::".Length);
+            }
+
+            normalized = normalized.Replace("::", ".").Replace("+", ".");
+            normalized = normalized.Trim('.');
+            return string.IsNullOrWhiteSpace(normalized) ? null : normalized;
         }
 
         /// <summary>
         /// Search project items recursively for a class definition.
         /// </summary>
-        private string SearchProjectForClass(ProjectItems items, string className)
+        private string SearchProjectForClass(ProjectItems items, string typeName, string className)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             if (items == null) return null;
@@ -3645,7 +5025,7 @@ namespace VSDebuggerMCP
                     // Check if this is a code file
                     if (item.FileCodeModel != null)
                     {
-                        if (ContainsClass(item.FileCodeModel.CodeElements, className))
+                        if (ContainsClass(item.FileCodeModel.CodeElements, typeName, className))
                         {
                             try
                             {
@@ -3661,7 +5041,7 @@ namespace VSDebuggerMCP
                     // Recurse into nested items (folders, etc.)
                     if (item.ProjectItems != null && item.ProjectItems.Count > 0)
                     {
-                        var result = SearchProjectForClass(item.ProjectItems, className);
+                        var result = SearchProjectForClass(item.ProjectItems, typeName, className);
                         if (!string.IsNullOrEmpty(result))
                         {
                             return result;
@@ -3679,7 +5059,7 @@ namespace VSDebuggerMCP
         /// <summary>
         /// Check if code elements contain a class with the specified name.
         /// </summary>
-        private bool ContainsClass(CodeElements elements, string className)
+        private bool ContainsClass(CodeElements elements, string typeName, string className)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             if (elements == null) return false;
@@ -3690,19 +5070,26 @@ namespace VSDebuggerMCP
                 {
                     try
                     {
-                        // Check if this element is the target class/struct
-                        if ((element.Kind == vsCMElement.vsCMElementClass ||
-                             element.Kind == vsCMElement.vsCMElementStruct) &&
-                            element.Name == className)
+                        bool isType = element.Kind == vsCMElement.vsCMElementClass ||
+                                      element.Kind == vsCMElement.vsCMElementStruct;
+                        if (isType && MatchesCodeElementType(element, typeName, className))
                         {
                             return true;
                         }
 
-                        // Search within namespaces
+                        if (isType)
+                        {
+                            var nestedMembers = SafeReadCodeElements(() => element.Children);
+                            if (nestedMembers != null && ContainsClass(nestedMembers, typeName, className))
+                            {
+                                return true;
+                            }
+                        }
+
                         if (element.Kind == vsCMElement.vsCMElementNamespace)
                         {
                             var ns = element as CodeNamespace;
-                            if (ns != null && ContainsClass(ns.Members, className))
+                            if (ns != null && ContainsClass(ns.Members, typeName, className))
                             {
                                 return true;
                             }
@@ -3719,6 +5106,64 @@ namespace VSDebuggerMCP
                 _log($"[ContainsClass] Error iterating elements: {ex.Message}");
             }
             return false;
+        }
+
+        private bool MatchesCodeElementType(CodeElement element, string targetTypeName, string targetClassName)
+        {
+            string elementName = NormalizeTypeLookupName(SafeReadCodeElementName(() => element.Name));
+            if (!string.IsNullOrEmpty(targetClassName) &&
+                string.Equals(elementName, targetClassName, StringComparison.OrdinalIgnoreCase))
+            {
+                // If caller only knows the short class name, this is enough.
+                if (string.IsNullOrEmpty(targetTypeName))
+                {
+                    return true;
+                }
+            }
+
+            string elementFullName = NormalizeTypeLookupName(SafeReadCodeElementName(() => element.FullName));
+            if (!string.IsNullOrEmpty(targetTypeName) &&
+                !string.IsNullOrEmpty(elementFullName) &&
+                string.Equals(elementFullName, targetTypeName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            // Some code models omit namespace in FullName; allow short-type fallback only
+            // when the requested type itself has no namespace.
+            if (!string.IsNullOrEmpty(targetTypeName) &&
+                targetTypeName.IndexOf('.') < 0 &&
+                !string.IsNullOrEmpty(elementName) &&
+                string.Equals(elementName, targetTypeName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private string SafeReadCodeElementName(Func<string> reader)
+        {
+            try
+            {
+                return reader();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private CodeElements SafeReadCodeElements(Func<CodeElements> reader)
+        {
+            try
+            {
+                return reader();
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private T ExecuteOnMainThread<T>(Func<T> action)
