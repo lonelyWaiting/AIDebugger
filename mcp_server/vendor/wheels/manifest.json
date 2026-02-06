@@ -4,7 +4,8 @@
         "cp310",
         "cp311",
         "cp312",
-        "cp313"
+        "cp313",
+        "cp314"
     ],
     "generatedAt": "2026-02-06",
     "wheels": [
@@ -71,6 +72,10 @@
         {
             "file": "vendor/wheels/pydantic_core-2.41.5-cp313-cp313-win_amd64.whl",
             "sha256": "79ec52ec461e99e13791ec6508c722742ad745571f234ea6255bed38c6480f11"
+        },
+        {
+            "file": "vendor/wheels/pydantic_core-2.41.5-cp314-cp314-win_amd64.whl",
+            "sha256": "8e7c86f27c585ef37c35e56a96363ab8de4e549a95512445b85c96d3e2f7c1bf"
         },
         {
             "file": "vendor/wheels/pydantic_settings-2.12.0-py3-none-any.whl",

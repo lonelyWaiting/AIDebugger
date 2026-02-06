@@ -59,17 +59,9 @@ object McpClientRegistration {
                 return
             }
 
-            val configPath = getClaudeDesktopConfigPath()
-            val configFile = File(configPath)
-            
-            // Check if Claude Desktop is installed
-            if (!configFile.parentFile.exists()) {
-                log.debug("Claude Desktop not installed, skipping registration.")
-                return
-            }
-
             val serverPath = ensureServerFiles() ?: return
-            registerToConfig(configPath, serverPath, ClientNameClaudeDesktop, createDirIfMissing = false)
+            val configPath = getClaudeDesktopConfigPath()
+            registerToConfig(configPath, serverPath, ClientNameClaudeDesktop, createDirIfMissing = true)
         } catch (ex: Exception) {
             log.warn("Failed to register MCP server with Claude Desktop: ${ex.message}", ex)
         }
@@ -82,16 +74,17 @@ object McpClientRegistration {
                 return
             }
 
+            val serverPath = ensureServerFiles() ?: return
             val configPath = getOpenCodeConfigPath()
             val configFile = File(configPath)
 
-            // Check if OpenCode is installed (config directory exists)
-            if (!configFile.parentFile.exists()) {
-                log.debug("[$ClientNameOpenCode] OpenCode not installed, skipping registration.")
-                return
+            // Ensure the config directory exists, create if missing
+            val configDir = configFile.parentFile
+            if (configDir != null && !configDir.exists()) {
+                configDir.mkdirs()
+                log.info("[$ClientNameOpenCode] Created directory: ${configDir.absolutePath}")
             }
 
-            val serverPath = ensureServerFiles() ?: return
             registerToOpenCodeConfig(configPath, serverPath)
         } catch (ex: Exception) {
             log.warn("Failed to register MCP server with OpenCode: ${ex.message}", ex)
@@ -118,7 +111,7 @@ object McpClientRegistration {
             "type" to "local",
             "command" to listOf("python", normalizedPath),
             "enabled" to true,
-            "environment" to mapOf("AIDB_PREFERRED_IDE" to PreferredIde)
+            "environment" to mapOf("AIDB_PREFERRED_IDE" to PreferredIde, "PYTHONIOENCODING" to "utf-8")
         )
 
         val existing = mcpServers[McpServerName] as? Map<*, *>
@@ -181,7 +174,7 @@ object McpClientRegistration {
         val serverConfig = linkedMapOf<String, Any>(
             "command" to "python",
             "args" to listOf(normalizedPath),
-            "env" to mapOf("AIDB_PREFERRED_IDE" to PreferredIde),
+            "env" to mapOf("AIDB_PREFERRED_IDE" to PreferredIde, "PYTHONIOENCODING" to "utf-8"),
             "serverUseInstructions" to ServerUseInstructions
         )
 
@@ -383,7 +376,7 @@ object McpClientRegistration {
             if (match != null) {
                 val major = match.groupValues[1].toIntOrNull() ?: return false
                 val minor = match.groupValues[2].toIntOrNull() ?: return false
-                return major > 3 || (major == 3 && minor >= 10)
+                return major == 3 && minor >= 10
             }
             false
         } catch (_: Exception) {

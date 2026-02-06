@@ -86,7 +86,7 @@ namespace VSDebuggerMCP
 
         private static bool IsSupportedPythonVersion(int major, int minor)
         {
-            return major == 3 && minor >= 10 && minor <= 13;
+            return major == 3 && minor >= 10;
         }
 
         private static bool TryResolvePythonRuntime(Action<string> log, out PythonRuntimeInfo runtime)
@@ -94,12 +94,14 @@ namespace VSDebuggerMCP
             runtime = null;
             log = log ?? ((s) => { });
 
+            // Use "py -3" to automatically select the latest Python 3.x on Windows.
+            // This avoids hardcoding version-specific candidates (py -3.14, py -3.13, etc.)
+            // and automatically adapts when new Python versions are installed.
+            // Fallback to "python" / "python3" for non-Windows or environments without the py launcher.
             var candidates = new[]
             {
-                new { Command = "py", Args = new[] { "-3.13" } },
-                new { Command = "py", Args = new[] { "-3.12" } },
-                new { Command = "py", Args = new[] { "-3.11" } },
-                new { Command = "py", Args = new[] { "-3.10" } },
+                new { Command = "py", Args = new[] { "-3" } },
+                new { Command = "python3", Args = new string[0] },
                 new { Command = "python", Args = new string[0] }
             };
 
@@ -111,7 +113,7 @@ namespace VSDebuggerMCP
                 }
             }
 
-            log("No compatible Python runtime found. Please install Python 3.10-3.13 x64.");
+            log("No compatible Python runtime found. Please install Python 3.10+ x64.");
             return false;
         }
 
@@ -169,7 +171,7 @@ namespace VSDebuggerMCP
                     var minor = int.Parse(match.Groups[2].Value);
                     if (!IsSupportedPythonVersion(major, minor))
                     {
-                        log($"Ignoring unsupported Python runtime: {trimmed} (requires 3.10-3.13)");
+                        log($"Ignoring unsupported Python runtime: {trimmed} (requires 3.10+)");
                         return false;
                     }
 
@@ -191,13 +193,14 @@ namespace VSDebuggerMCP
         
         /// <summary>
         /// Gets the path to the MCP server Python script.
-        /// Primary location is ~/.ai-debugger/mcp_server (stable path seeded by Install-VSIX.ps1).
+        /// Primary location is ~/.ai-debugger/mcp_server (stable path).
+        /// If the stable path doesn't exist, attempts to seed from the VSIX extension directory.
         /// </summary>
         public static string GetMcpServerPath()
         {
             var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             
-            // Primary location: ~/.ai-debugger/mcp_server (stable path, seeded by Install-VSIX.ps1)
+            // Primary location: ~/.ai-debugger/mcp_server (stable path)
             var stablePath = Path.Combine(userProfile, ".ai-debugger", "mcp_server", "server.py");
             var normalizedStablePath = Path.GetFullPath(stablePath);
             
@@ -205,30 +208,81 @@ namespace VSDebuggerMCP
             {
                 return normalizedStablePath;
             }
-            
-            // Fallback locations for development scenarios
+
+            // Stable path doesn't exist – try to seed from the VSIX extension directory or dev layout
             var extensionDir = GetExtensionDirectory();
-            var fallbackPaths = new[]
+            var sourceDirectories = new[]
             {
-                // Extension directory (bundled with VSIX, if available)
-                Path.Combine(extensionDir, "mcp_server", "server.py"),
-                // Parent directory (development: running from VSDebuggerMCP/bin/Debug)
-                Path.Combine(extensionDir, "..", "..", "..", "mcp_server", "server.py"),
-                // Legacy user profile location
-                Path.Combine(userProfile, ".vs-debugger-mcp", "mcp_server", "server.py"),
+                // Extension directory (bundled with VSIX)
+                Path.Combine(extensionDir, "mcp_server"),
+                // Development layout: running from VSDebuggerMCP/bin/Debug
+                Path.GetFullPath(Path.Combine(extensionDir, "..", "..", "..", "mcp_server")),
             };
 
-            foreach (var path in fallbackPaths)
+            foreach (var sourceDir in sourceDirectories)
             {
-                var normalizedPath = Path.GetFullPath(path);
-                if (File.Exists(normalizedPath))
+                var sourceServer = Path.Combine(sourceDir, "server.py");
+                if (File.Exists(sourceServer))
                 {
-                    return normalizedPath;
+                    if (TrySeedServerFiles(sourceDir, Path.GetDirectoryName(normalizedStablePath)))
+                    {
+                        return normalizedStablePath;
+                    }
+                    // Seeding failed, fall back to using source directly
+                    return Path.GetFullPath(sourceServer);
                 }
+            }
+
+            // Legacy user profile location
+            var legacyPath = Path.Combine(userProfile, ".vs-debugger-mcp", "mcp_server", "server.py");
+            var normalizedLegacy = Path.GetFullPath(legacyPath);
+            if (File.Exists(normalizedLegacy))
+            {
+                return normalizedLegacy;
             }
 
             // Return the stable path even if it doesn't exist (will show meaningful error)
             return normalizedStablePath;
+        }
+
+        /// <summary>
+        /// Copies all MCP server files from a source directory to the stable target directory.
+        /// </summary>
+        private static bool TrySeedServerFiles(string sourceDir, string targetDir)
+        {
+            try
+            {
+                if (Directory.Exists(targetDir))
+                {
+                    Directory.Delete(targetDir, true);
+                }
+                CopyDirectoryRecursive(sourceDir, targetDir);
+                return File.Exists(Path.Combine(targetDir, "server.py"));
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Recursively copies a directory and all its contents.
+        /// </summary>
+        private static void CopyDirectoryRecursive(string sourceDir, string targetDir)
+        {
+            Directory.CreateDirectory(targetDir);
+
+            foreach (var file in Directory.GetFiles(sourceDir))
+            {
+                var destFile = Path.Combine(targetDir, Path.GetFileName(file));
+                File.Copy(file, destFile, true);
+            }
+
+            foreach (var subDir in Directory.GetDirectories(sourceDir))
+            {
+                var destSubDir = Path.Combine(targetDir, Path.GetFileName(subDir));
+                CopyDirectoryRecursive(subDir, destSubDir);
+            }
         }
 
         /// <summary>
@@ -279,36 +333,22 @@ namespace VSDebuggerMCP
 
         /// <summary>
         /// Registers the AIDebugger server in Claude Desktop's configuration.
+        /// Creates the config directory and file if they don't exist.
         /// </summary>
-        /// <returns>Registration result. If Claude Desktop is not installed, returns success with a skip message.</returns>
+        /// <returns>Registration result.</returns>
         public static RegistrationResult RegisterWithClaudeDesktop(Action<string> log = null)
         {
-            log = log ?? ((s) => { });
             var configPath = GetClaudeDesktopConfigPath();
-            
-            // Check if Claude Desktop is installed
-            var claudeDir = Path.GetDirectoryName(configPath);
-            if (!Directory.Exists(claudeDir))
-            {
-                log("Claude Desktop not installed, skipping registration.");
-                return new RegistrationResult
-                {
-                    Success = true,
-                    AlreadyRegistered = false,
-                    Message = "Claude Desktop not installed",
-                    Skipped = true
-                };
-            }
-            
-            return RegisterToConfig(configPath, ClientNameClaudeDesktop, log, createDirIfMissing: false);
+            return RegisterToConfig(configPath, ClientNameClaudeDesktop, log, createDirIfMissing: true);
         }
 
         /// <summary>
         /// Registers the AIDebugger server in OpenCode's configuration.
         /// OpenCode uses a different JSON format: "mcp" key instead of "mcpServers",
         /// "command" as array, "environment" instead of "env", and requires "type" and "enabled" fields.
+        /// Creates the config directory and file if they don't exist.
         /// </summary>
-        /// <returns>Registration result. If OpenCode is not installed, returns success with a skip message.</returns>
+        /// <returns>Registration result.</returns>
         public static RegistrationResult RegisterWithOpenCode(Action<string> log = null)
         {
             log = log ?? ((s) => { });
@@ -317,18 +357,12 @@ namespace VSDebuggerMCP
 
             try
             {
-                // Check if OpenCode is installed (config directory exists)
+                // Ensure the config directory exists, create if missing
                 var openCodeDir = Path.GetDirectoryName(configPath);
                 if (!Directory.Exists(openCodeDir))
                 {
-                    log("OpenCode not installed, skipping registration.");
-                    return new RegistrationResult
-                    {
-                        Success = true,
-                        AlreadyRegistered = false,
-                        Message = "OpenCode not installed",
-                        Skipped = true
-                    };
+                    Directory.CreateDirectory(openCodeDir);
+                    log($"[{ClientNameOpenCode}] Created directory: {openCodeDir}");
                 }
 
                 var serverPath = GetMcpServerPath();
@@ -408,7 +442,7 @@ namespace VSDebuggerMCP
                     { "type", "local" },
                     { "command", commandArray.ToArray() },
                     { "enabled", true },
-                    { "environment", new Dictionary<string, object> { { "AIDB_PREFERRED_IDE", preferredIde } } }
+                    { "environment", new Dictionary<string, object> { { "AIDB_PREFERRED_IDE", preferredIde }, { "PYTHONIOENCODING", "utf-8" } } }
                 };
                 mcpServers[entryName] = serverConfig;
 
@@ -637,7 +671,7 @@ namespace VSDebuggerMCP
                     {
                         { "command", pythonRuntime.Command },
                         { "args", commandArgs.ToArray() },
-                        { "env", new Dictionary<string, object> { { "AIDB_PREFERRED_IDE", preferredIde } } },
+                        { "env", new Dictionary<string, object> { { "AIDB_PREFERRED_IDE", preferredIde }, { "PYTHONIOENCODING", "utf-8" } } },
                         { "serverUseInstructions", instructions }
                     };
                     mcpServers[entryName] = serverConfig;

@@ -118,6 +118,11 @@
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <Import Project="$(VSToolsPath)\VSSDK\Microsoft.VsSDK.targets" Condition="'$(VSToolsPath)' != ''" />
 
+  <!-- Auto-stamp version from git before every real build (skipped during IntelliSense) -->
+  <Target Name="StampVersion" BeforeTargets="BeforeBuild" Condition="'$(DesignTimeBuild)' != 'true'">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\..\tools\Stamp-Version.ps1&quot;" IgnoreExitCode="true" />
+  </Target>
+
   <Target Name="CreateSplitVsixPackages" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' and Exists('$(MSBuildProjectDirectory)\$(OutputPath)$(AssemblyName).vsix')">
     <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\Create-SplitVsix.ps1&quot; -BaseVsixPath &quot;$(MSBuildProjectDirectory)\$(OutputPath)$(AssemblyName).vsix&quot;" />
     <Delete Files="$(MSBuildProjectDirectory)\$(OutputPath)$(AssemblyName).vsix" />

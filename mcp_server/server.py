@@ -10,9 +10,20 @@ Supports multiple IDE instances with automatic discovery and smart selection:
 - Use select_ide_instance to choose a specific instance
 """
 
+import io
+import os
 import sys
 import json
 from typing import Any, Dict, List, Optional
+
+# Force UTF-8 for stdio before anything else.
+# On Windows the default encoding may be cp1252 which cannot encode CJK characters
+# used in tool descriptions, causing UnicodeEncodeError when MCP writes responses.
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "buffer"):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 import bootstrap
 

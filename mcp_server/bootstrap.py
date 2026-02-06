@@ -1,8 +1,9 @@
-﻿"""Bundled dependency bootstrapper for the MCP server."""
+"""Bundled dependency bootstrapper for the MCP server."""
 
 from __future__ import annotations
 
 import shutil
+import subprocess
 import sys
 import sysconfig
 import zipfile
@@ -70,15 +71,76 @@ def _select_wheels(wheels_dir: Path) -> List[Path]:
         selected.append(wheel)
 
     if pydantic_core is None:
-        if any(path.name.startswith("pydantic_core-") for path in wheels_dir.glob("*.whl")):
-            raise RuntimeError(
-                "Bundled dependencies do not include a pydantic_core wheel for "
-                f"Python {py_tag} on {platform_tag}. Please use Python 3.10-3.13 x64."
-            )
-    else:
+        # No bundled wheel for this Python version – try pip install as fallback.
+        # This makes the server automatically work with future Python versions
+        # without needing to pre-bundle a new pydantic_core wheel.
+        pydantic_core = _pip_install_pydantic_core(wheels_dir)
+        if pydantic_core is None:
+            if any(p.name.startswith("pydantic_core-") for p in wheels_dir.glob("*.whl")):
+                raise RuntimeError(
+                    f"No pydantic_core wheel for Python {py_tag} on {platform_tag}. "
+                    f"Bundled wheels cover other Python versions but not yours. "
+                    f"Auto-install via pip also failed. "
+                    f"Please install manually: pip install pydantic-core"
+                )
+    if pydantic_core is not None:
         selected.append(pydantic_core)
 
     return selected
+
+
+def _pip_install_pydantic_core(wheels_dir: Path) -> Optional[Path]:
+    """Attempt to pip-download the pydantic_core wheel for the current Python version.
+
+    Downloads into the vendor/wheels directory so it's cached for future runs.
+    Returns the Path to the downloaded wheel, or None on failure.
+    """
+    # Determine the required version from an existing bundled wheel
+    required_version: Optional[str] = None
+    for whl in wheels_dir.glob("pydantic_core-*.whl"):
+        # Wheel filename format: pydantic_core-{version}-{py}-{py}-{platform}.whl
+        parts = whl.name.split("-")
+        if len(parts) >= 2:
+            required_version = parts[1]
+            break
+
+    if required_version is None:
+        return None
+
+    py_tag = _python_tag()
+    platform_tag = _platform_tag()
+
+    try:
+        print(
+            f"[AIDebugger] No bundled pydantic_core for {py_tag}. "
+            f"Downloading pydantic-core=={required_version} via pip...",
+            file=sys.stderr,
+        )
+        subprocess.check_call(
+            [
+                sys.executable, "-m", "pip", "download",
+                f"pydantic-core=={required_version}",
+                "--only-binary=:all:",
+                "--no-deps",
+                f"--python-version={sys.version_info.major}.{sys.version_info.minor}",
+                f"--platform={platform_tag}",
+                "-d", str(wheels_dir),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+    except Exception as exc:
+        print(f"[AIDebugger] pip download failed: {exc}", file=sys.stderr)
+        return None
+
+    # Find the newly downloaded wheel
+    for whl in wheels_dir.glob("pydantic_core-*.whl"):
+        if f"-{py_tag}-" in whl.name and whl.name.endswith(f"-{platform_tag}.whl"):
+            print(f"[AIDebugger] Downloaded: {whl.name}", file=sys.stderr)
+            return whl
+
+    return None
 
 
 def _extract_wheel(wheel: Path, target_dir: Path) -> None:

@@ -88,14 +88,14 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 - `VSDebuggerMCPPackage.cs` - Package entry point, auto-loads on VS startup
 - `DebuggerService.cs` - All debugger operations (callstack, locals, memory, disassembly)
 - `NamedPipeServer.cs` - JSON-RPC over Named Pipe (`\\.\pipe\AIDebuggerVS_<PID>`)
-- `CursorMcpRegistration.cs` - Auto-registers MCP server with Cursor's `mcp.json`
+- `McpClientRegistration.cs` - Auto-registers MCP server with Cursor/Claude Desktop/OpenCode
 - `Protocol/DebugModels.cs` - Shared data models for responses
 
 **Rider Plugin:**
 - `RiderDebuggerPlugin.kt` - Plugin entry point
 - `DebuggerService.kt` - Debugger operations (mirrors VS implementation)
 - `NamedPipeServer.kt` - Named Pipe server (`\\.\pipe\AIDebuggerRider_<PID>`)
-- `CursorMcpRegistration.kt` - MCP registration with Python version check
+- `McpClientRegistration.kt` - MCP registration with Python version check
 
 **MCP Server:**
 - `server.py` - FastMCP tool definitions (40+ debugging tools)
@@ -123,6 +123,36 @@ Named Pipe uses JSON-RPC style messages:
 - `AIDB_PREFERRED_IDE` env var locks MCP server to `vs` or `rider`
 - Auto-selection priority: paused at breakpoint > debugging > single instance
 - Pipe security configurable via `AIDB_PIPE_SECURITY` (strict/same_user/owner_only)
+
+## Versioning
+
+Version is computed automatically from git history — no manual edits needed.
+
+| Scenario | Version format | Example |
+|----------|---------------|---------|
+| Tagged commit (`v1.2.3`) | Tag version | `1.2.3` |
+| Untagged commit | `1.1.<commit count>` | `1.1.18` |
+
+This scheme is identical for local IDE builds and CI, so the same commit always
+produces the same version number regardless of where it is built.
+
+### How it works
+
+| Build system | Mechanism |
+|-------------|-----------|
+| VS Extension (MSBuild) | Pre-build target calls `tools/Stamp-Version.ps1`, which updates `source.extension.vsixmanifest` and `AssemblyInfo.cs` |
+| Rider Plugin (Gradle) | `build.gradle.kts` runs `git describe` / `git rev-list --count` at configuration time |
+| GitHub Actions | Same as local — `fetch-depth: 0` ensures full git history is available |
+
+### Manual override
+
+```bash
+# Stamp a specific version into all project files
+powershell tools/Stamp-Version.ps1 -Version 2.0.0
+
+# Preview computed version without modifying files
+powershell tools/Stamp-Version.ps1 -DryRun
+```
 
 ## Development Notes
 
