@@ -57,8 +57,8 @@ namespace VSDebuggerMCP
 
                 LogMessage("AIDebugger initialized successfully. Named Pipe server is running.");
 
-                // Auto-register with Cursor MCP configuration
-                await Task.Run(() => AutoRegisterWithCursor());
+                // Auto-register with MCP clients (Cursor, Claude Desktop)
+                await Task.Run(() => AutoRegisterMcpClients());
             }
             catch (Exception ex)
             {
@@ -101,15 +101,15 @@ namespace VSDebuggerMCP
         }
 
         /// <summary>
-        /// Automatically registers this extension with Cursor's MCP configuration.
+        /// Automatically registers this extension with MCP clients (Cursor, Claude Desktop, OpenCode).
         /// </summary>
-        private void AutoRegisterWithCursor()
+        private void AutoRegisterMcpClients()
         {
             try
             {
                 // Step 1: Check if Python is available
                 LogMessage("Checking Python installation...");
-                if (!CursorMcpRegistration.IsPythonAvailable(LogMessage))
+                if (!McpClientRegistration.IsPythonAvailable(LogMessage))
                 {
                     LogError("Python is not installed or not in PATH. Please install Python 3.10+ and add it to PATH.");
                     return;
@@ -119,33 +119,50 @@ namespace VSDebuggerMCP
                 LogMessage("Using bundled Python dependencies (no pip install required).");
 
                 // Step 3: Register with Cursor
-                LogMessage("Checking Cursor MCP registration...");
-                var result = CursorMcpRegistration.RegisterWithCursor(LogMessage);
-                
-                if (result.Success)
-                {
-                    if (result.AlreadyRegistered)
-                    {
-                        LogMessage("AIDebugger is already registered in Cursor.");
-                    }
-                    else
-                    {
-                        LogMessage("==============================================");
-                        LogMessage("AIDebugger has been registered with Cursor!");
-                        LogMessage($"Config file: {result.ConfigPath}");
-                        LogMessage($"Server script: {result.ServerPath}");
-                        LogMessage("Please restart Cursor to use the debugging tools.");
-                        LogMessage("==============================================");
-                    }
-                }
-                else
-                {
-                    LogError($"Failed to register with Cursor: {result.Message}");
-                }
+                LogMessage("[Cursor] Checking MCP registration...");
+                var cursorResult = McpClientRegistration.RegisterWithCursor(msg => LogMessage($"[Cursor] {msg}"));
+                HandleRegistrationResult(cursorResult, "Cursor");
+
+                // Step 4: Register with Claude Desktop
+                LogMessage("[Claude Desktop] Checking MCP registration...");
+                var claudeResult = McpClientRegistration.RegisterWithClaudeDesktop(msg => LogMessage($"[Claude Desktop] {msg}"));
+                HandleRegistrationResult(claudeResult, "Claude Desktop");
+
+                // Step 5: Register with OpenCode
+                LogMessage("[OpenCode] Checking MCP registration...");
+                var openCodeResult = McpClientRegistration.RegisterWithOpenCode(msg => LogMessage(msg));
+                HandleRegistrationResult(openCodeResult, "OpenCode");
             }
             catch (Exception ex)
             {
-                LogError($"Error during Cursor MCP registration: {ex.Message}");
+                LogError($"Error during MCP registration: {ex.Message}");
+            }
+        }
+
+        private void HandleRegistrationResult(RegistrationResult result, string clientName)
+        {
+            if (result.Success)
+            {
+                if (result.Skipped)
+                {
+                    LogMessage($"[{clientName}] {result.Message}");
+                }
+                else if (result.AlreadyRegistered)
+                {
+                    LogMessage($"[{clientName}] AIDebugger is already registered.");
+                }
+                else
+                {
+                    LogMessage($"[{clientName}] ============================================");
+                    LogMessage($"[{clientName}] AIDebugger has been registered!");
+                    LogMessage($"[{clientName}] Config: {result.ConfigPath}");
+                    LogMessage($"[{clientName}] Please restart {clientName} to use the tools.");
+                    LogMessage($"[{clientName}] ============================================");
+                }
+            }
+            else
+            {
+                LogError($"[{clientName}] Failed to register: {result.Message}");
             }
         }
 

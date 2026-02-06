@@ -27,6 +27,8 @@ namespace VSDebuggerMCP.Protocol
     [KnownType(typeof(MemorySearchResult))]
     [KnownType(typeof(OutputWindowResult))]
     [KnownType(typeof(SearchOutputResult))]
+    [KnownType(typeof(BatchEvaluateResult))]
+    [KnownType(typeof(DebugBundleResult))]
     public class DebugResponse
     {
         [DataMember(Name = "id")]

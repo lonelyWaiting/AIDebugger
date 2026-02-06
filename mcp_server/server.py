@@ -27,6 +27,63 @@ import ide_bridge
 mcp = FastMCP("AIDebugger")
 
 
+# ============== MCP Prompt: Tool Usage Guide ==============
+@mcp.prompt()
+def debug_guide() -> str:
+    """
+    AIDebugger 工具使用指南 - 用于调试 Visual Studio / Rider 程序。
+    当需要分析调试现场时，请先阅读此指南。
+    """
+    return """# AIDebugger MCP 工具使用指南
+
+## 快速入门
+
+当用户提到调试、崩溃、异常等场景时，推荐的调用顺序：
+
+### 1. 获取完整调试快照（推荐首选）
+```
+capture_debug_bundle()
+```
+这一个调用会返回：状态、堆栈、局部变量、异常、线程、模块、寄存器、输出日志。
+
+### 2. 或分步获取信息
+```
+get_debug_status()     # 无参数 - 查看调试状态
+get_callstack()        # 无参数 - 查看调用堆栈
+get_locals()           # 无参数 - 查看局部变量
+get_exception()        # 无参数 - 查看异常信息
+```
+
+### 3. 求值特定表达式
+```
+evaluate_expression(expression="myVariable")
+evaluate_expression(expression="obj.Property", expand_children=True)
+```
+
+## 参数格式说明
+
+- 所有无参数的工具直接调用，不需要传任何参数
+- 表达式类工具的参数名是 `expression`（不是 `expr`）
+- 布尔参数使用 Python 风格：`True`/`False`（不是 `true`/`false`）
+
+## 常用场景
+
+| 场景 | 推荐工具 |
+|------|----------|
+| 分析崩溃/异常 | capture_debug_bundle() 或 get_exception() |
+| 查看变量值 | get_locals() 或 evaluate_expression(expression="xxx") |
+| 查看调用链 | get_callstack() |
+| 设置断点 | set_breakpoint(file_path="...", line_number=42) |
+| 单步调试 | debug_step_over() / debug_step_into() / debug_step_out() |
+
+## 多实例场景
+
+如果有多个 VS/Rider 实例运行：
+1. 调用 list_ide_instances() 查看所有实例
+2. 调用 select_ide_instance(ide="vs", process_id=12345) 选择特定实例
+"""
+
+
 def format_result(result: Any) -> str:
     """Format result as readable text for MCP response."""
     if isinstance(result, dict):
@@ -150,10 +207,17 @@ async def list_ide_instances() -> str:
 async def detect_debug_sessions(prefer_ide: Optional[str] = None, select: bool = True) -> str:
     """
     检测是否存在 VS / Rider 调试现场，并根据规则自动选择最合适的实例。
+    
+    调用示例:
+    ```
+    detect_debug_sessions()                          # 自动检测并选择
+    detect_debug_sessions(prefer_ide="vs")           # 优先选择 VS
+    detect_debug_sessions(prefer_ide="rider", select=False)  # 只检测不选择
+    ```
 
     Args:
         prefer_ide: 可选，优先使用的 IDE（"vs" 或 "rider"）
-        select: 是否自动选择匹配的实例（默认 true）
+        select: 是否自动选择匹配的实例（默认 True）
     """
     try:
         instances = await ide_bridge.discover_instances()
@@ -189,7 +253,17 @@ async def detect_debug_sessions(prefer_ide: Optional[str] = None, select: bool =
 @mcp.tool()
 async def select_ide_instance(ide: str, process_id: int) -> str:
     """
-    选择要操作的IDE实例（ide=vs|rider）。
+    选择要操作的IDE实例。选择后，所有调试工具调用都会使用这个实例。
+    
+    调用示例:
+    ```
+    select_ide_instance(ide="vs", process_id=12345)
+    select_ide_instance(ide="rider", process_id=67890)
+    ```
+    
+    Args:
+        ide: IDE类型，必须是 "vs" 或 "rider"
+        process_id: 进程ID，可通过 list_ide_instances() 获取
     """
     try:
         ide_key = (ide or "").lower()
@@ -307,6 +381,18 @@ async def get_debug_status() -> str:
     """
     获取当前调试状态，包括是否暂停、当前位置，以及标准化的 stopReason（breakpoint/exception/step/user_break/...）。
     
+    无需任何参数。
+    
+    返回示例:
+    ```json
+    {
+      "isDebugging": true,
+      "isPaused": true,
+      "stopReason": "breakpoint",
+      "currentLocation": {"file": "Program.cs", "line": 42, "function": "Main"}
+    }
+    ```
+    
     **触发场景**: 当用户提到"调试"、"debug"、"断点"、"breakpoint"、"VS"、"Visual Studio"时，优先调用此工具了解当前状态。
     """
     try:
@@ -324,6 +410,19 @@ async def get_callstack() -> str:
     获取当前线程的完整调用堆栈，包含每个栈帧的函数名、文件路径、行号等信息。
     Cursor可以根据返回的文件路径自动读取相关代码。
     
+    无需任何参数。
+    
+    返回示例:
+    ```json
+    {
+      "frames": [
+        {"index": 0, "function": "DoSomething", "file": "Helper.cs", "line": 25},
+        {"index": 1, "function": "Main", "file": "Program.cs", "line": 42}
+      ],
+      "totalFrames": 2
+    }
+    ```
+    
     **触发场景**: 当用户询问"怎么执行到这里的"、"调用链"、"堆栈"、"callstack"、"函数调用顺序"时调用此工具。
     """
     try:
@@ -339,6 +438,18 @@ async def get_callstack() -> str:
 async def get_locals() -> str:
     """
     获取当前栈帧的所有局部变量和参数，包含变量名、类型和当前值。
+    
+    无需任何参数。
+    
+    返回示例:
+    ```json
+    {
+      "variables": [
+        {"name": "count", "type": "int", "value": "42"},
+        {"name": "items", "type": "List<string>", "value": "{Count=3}"}
+      ]
+    }
+    ```
     
     **触发场景**: 当用户询问"变量值是什么"、"参数是多少"、"局部变量"、"当前状态"时调用此工具。
     """
@@ -359,12 +470,19 @@ async def evaluate_expression(
     在当前调试上下文中求值任意表达式。可以获取变量的地址、计算偏移量、访问结构成员等。
     对于指针和数值类型会同时返回十进制和十六进制值。
     
-    **触发场景**: 当用户想查看特定表达式的值、询问"xxx的值是多少"、"计算xxx"、"查看指针"、"展开对象"时调用此工具。
-    
     Args:
         expression: 要求值的表达式，如：&myVariable、myPointer->field、sizeof(MyStruct)、(int*)0x1234
         expand_children: 是否展开对象的子成员，默认false
         max_depth: 展开子成员的最大深度，默认2
+    
+    调用示例:
+    ```
+    evaluate_expression(expression="myObject.Property")
+    evaluate_expression(expression="&myVariable", expand_children=True)
+    evaluate_expression(expression="arr[0]", expand_children=True, max_depth=3)
+    ```
+    
+    **触发场景**: 当用户想查看特定表达式的值、询问"xxx的值是多少"、"计算xxx"、"查看指针"、"展开对象"时调用此工具。
     """
     try:
         result = await ide_bridge.call("evaluate_expression", {
@@ -438,6 +556,18 @@ async def get_modules() -> str:
 async def get_exception() -> str:
     """
     获取当前异常的详细信息，包括异常类型、消息、堆栈跟踪和内部异常。
+    
+    无需任何参数。仅当程序因异常暂停时有效。
+    
+    返回示例:
+    ```json
+    {
+      "hasException": true,
+      "exceptionType": "System.NullReferenceException",
+      "message": "Object reference not set to an instance of an object",
+      "stackTrace": "at Program.Main() in Program.cs:line 42"
+    }
+    ```
     
     **触发场景**: 当用户提到"崩溃"、"crash"、"异常"、"exception"、"报错"、"出错了"、"抛异常"时，优先调用此工具。
     """
@@ -644,14 +774,28 @@ async def capture_debug_bundle(
     output_tail_lines: int = 80
 ) -> str:
     """
-    一次性抓取“可分析快照包”（status/callstack/locals/exception/threads/modules/registers/output + 可选批量表达式）。
+    一次性抓取"可分析快照包"（status/callstack/locals/exception/threads/modules/registers/output + 可选批量表达式）。
     返回 snapshotId/capturedAt/snapshotStatus/partial，可直接用于AI诊断。
+    
+    这是分析调试现场的推荐入口，一次调用获取全部信息。
 
     Args:
         expressions: 可选表达式列表，会在同一快照中批量求值
         expand_children: 表达式是否展开子成员，默认False
         max_depth: 表达式子成员展开深度，默认2
         output_tail_lines: Debug Output 末尾行数，默认80
+    
+    调用示例:
+    ```
+    # 基础用法 - 无需参数
+    capture_debug_bundle()
+    
+    # 带表达式求值
+    capture_debug_bundle(expressions=["myVar", "obj.Property", "arr.Length"])
+    
+    # 展开对象
+    capture_debug_bundle(expressions=["complexObj"], expand_children=True, max_depth=3)
+    ```
     """
     try:
         result = await ide_bridge.call("capture_debug_bundle", {

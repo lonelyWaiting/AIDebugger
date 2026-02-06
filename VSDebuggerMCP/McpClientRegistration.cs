@@ -9,12 +9,17 @@ using System.Collections.Generic;
 namespace VSDebuggerMCP
 {
     /// <summary>
-    /// Handles automatic registration of the MCP server in Cursor's mcp.json configuration.
+    /// Handles automatic registration of the MCP server in MCP client configurations (Cursor, Claude Desktop).
     /// </summary>
-    public static class CursorMcpRegistration
+    public static class McpClientRegistration
     {
         private const string McpServerNameVs = "AIDebuggerVS";
         private const string LegacyMcpServerName = "AIDebugger";
+        
+        // Client display names for logging
+        private const string ClientNameCursor = "Cursor";
+        private const string ClientNameClaudeDesktop = "Claude Desktop";
+        private const string ClientNameOpenCode = "OpenCode";
 
         /// <summary>
         /// Server use instructions that help Cursor AI understand when and how to use this MCP.
@@ -231,7 +236,7 @@ namespace VSDebuggerMCP
         /// </summary>
         private static string GetExtensionDirectory()
         {
-            return Path.GetDirectoryName(typeof(CursorMcpRegistration).Assembly.Location);
+            return Path.GetDirectoryName(typeof(McpClientRegistration).Assembly.Location);
         }
 
         /// <summary>
@@ -244,17 +249,299 @@ namespace VSDebuggerMCP
         }
 
         /// <summary>
+        /// Gets the path to Claude Desktop's configuration file (Windows only).
+        /// </summary>
+        public static string GetClaudeDesktopConfigPath()
+        {
+            var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            return Path.Combine(appData, "Claude", "claude_desktop_config.json");
+        }
+
+        /// <summary>
+        /// Gets the path to OpenCode's configuration file.
+        /// Windows: %USERPROFILE%\.config\opencode\opencode.json
+        /// </summary>
+        public static string GetOpenCodeConfigPath()
+        {
+            var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            return Path.Combine(userProfile, ".config", "opencode", "opencode.json");
+        }
+
+        /// <summary>
         /// Registers the AIDebugger server in Cursor's configuration.
         /// </summary>
         /// <returns>True if registration was successful or already registered, false on error.</returns>
         public static RegistrationResult RegisterWithCursor(Action<string> log = null)
+        {
+            var configPath = GetCursorMcpConfigPath();
+            return RegisterToConfig(configPath, ClientNameCursor, log, createDirIfMissing: true);
+        }
+
+        /// <summary>
+        /// Registers the AIDebugger server in Claude Desktop's configuration.
+        /// </summary>
+        /// <returns>Registration result. If Claude Desktop is not installed, returns success with a skip message.</returns>
+        public static RegistrationResult RegisterWithClaudeDesktop(Action<string> log = null)
+        {
+            log = log ?? ((s) => { });
+            var configPath = GetClaudeDesktopConfigPath();
+            
+            // Check if Claude Desktop is installed
+            var claudeDir = Path.GetDirectoryName(configPath);
+            if (!Directory.Exists(claudeDir))
+            {
+                log("Claude Desktop not installed, skipping registration.");
+                return new RegistrationResult
+                {
+                    Success = true,
+                    AlreadyRegistered = false,
+                    Message = "Claude Desktop not installed",
+                    Skipped = true
+                };
+            }
+            
+            return RegisterToConfig(configPath, ClientNameClaudeDesktop, log, createDirIfMissing: false);
+        }
+
+        /// <summary>
+        /// Registers the AIDebugger server in OpenCode's configuration.
+        /// OpenCode uses a different JSON format: "mcp" key instead of "mcpServers",
+        /// "command" as array, "environment" instead of "env", and requires "type" and "enabled" fields.
+        /// </summary>
+        /// <returns>Registration result. If OpenCode is not installed, returns success with a skip message.</returns>
+        public static RegistrationResult RegisterWithOpenCode(Action<string> log = null)
+        {
+            log = log ?? ((s) => { });
+            var configPath = GetOpenCodeConfigPath();
+            var result = new RegistrationResult();
+
+            try
+            {
+                // Check if OpenCode is installed (config directory exists)
+                var openCodeDir = Path.GetDirectoryName(configPath);
+                if (!Directory.Exists(openCodeDir))
+                {
+                    log("OpenCode not installed, skipping registration.");
+                    return new RegistrationResult
+                    {
+                        Success = true,
+                        AlreadyRegistered = false,
+                        Message = "OpenCode not installed",
+                        Skipped = true
+                    };
+                }
+
+                var serverPath = GetMcpServerPath();
+
+                if (!TryResolvePythonRuntime(log, out var pythonRuntime))
+                {
+                    result.Success = false;
+                    result.Message = "No compatible Python runtime found. Please install Python 3.10-3.13 x64.";
+                    return result;
+                }
+
+                log($"[{ClientNameOpenCode}] Config path: {configPath}");
+                log($"[{ClientNameOpenCode}] MCP server path: {serverPath}");
+                log($"[{ClientNameOpenCode}] Python runtime: {pythonRuntime.VersionText} via '{pythonRuntime.Command}'");
+
+                // Read existing config or create new one
+                Dictionary<string, object> config;
+                if (File.Exists(configPath))
+                {
+                    var existingJson = File.ReadAllText(configPath, Encoding.UTF8);
+                    var serializer = new JavaScriptSerializer();
+                    config = serializer.Deserialize<Dictionary<string, object>>(existingJson)
+                             ?? new Dictionary<string, object>();
+                    log($"[{ClientNameOpenCode}] Read existing config");
+                }
+                else
+                {
+                    config = new Dictionary<string, object>();
+                    log($"[{ClientNameOpenCode}] Creating new config");
+                }
+
+                // Ensure "mcp" object exists (OpenCode uses "mcp" instead of "mcpServers")
+                Dictionary<string, object> mcpServers;
+                if (config.ContainsKey("mcp") && config["mcp"] is Dictionary<string, object>)
+                {
+                    mcpServers = (Dictionary<string, object>)config["mcp"];
+                }
+                else
+                {
+                    mcpServers = new Dictionary<string, object>();
+                    config["mcp"] = mcpServers;
+                }
+
+                // Use forward slashes for cross-platform compatibility in JSON
+                var normalizedPath = serverPath.Replace("\\", "/");
+
+                var entryName = McpServerNameVs;
+                var preferredIde = "vs";
+
+                // Check if already correctly registered
+                if (mcpServers.ContainsKey(entryName))
+                {
+                    var existingConfig = mcpServers[entryName] as Dictionary<string, object>;
+                    if (IsCorrectOpenCodeConfig(existingConfig, pythonRuntime, normalizedPath, preferredIde))
+                    {
+                        log($"[{ClientNameOpenCode}] MCP server already correctly registered");
+                        result.Success = true;
+                        result.AlreadyRegistered = true;
+                        result.Message = "Already registered";
+                        return result;
+                    }
+                    log($"[{ClientNameOpenCode}] MCP server '{entryName}' exists but needs update...");
+                }
+
+                // Build OpenCode-specific server config
+                // OpenCode uses "command" as array: ["python", "path/to/server.py"] or ["py", "-3.12", "path/to/server.py"]
+                var commandArray = new List<object>();
+                commandArray.Add(pythonRuntime.Command);
+                foreach (var prefixArg in pythonRuntime.PrefixArgs)
+                {
+                    commandArray.Add(prefixArg);
+                }
+                commandArray.Add(normalizedPath);
+
+                var serverConfig = new Dictionary<string, object>
+                {
+                    { "type", "local" },
+                    { "command", commandArray.ToArray() },
+                    { "enabled", true },
+                    { "environment", new Dictionary<string, object> { { "AIDB_PREFERRED_IDE", preferredIde } } }
+                };
+                mcpServers[entryName] = serverConfig;
+
+                // Remove legacy entry if present
+                if (mcpServers.ContainsKey(LegacyMcpServerName))
+                {
+                    log($"[{ClientNameOpenCode}] Removing legacy MCP server entry '{LegacyMcpServerName}'.");
+                    mcpServers.Remove(LegacyMcpServerName);
+                }
+
+                // Write updated config
+                var serializer2 = new JavaScriptSerializer();
+                var json = FormatJson(serializer2.Serialize(config));
+                File.WriteAllText(configPath, json, Encoding.UTF8);
+
+                log($"[{ClientNameOpenCode}] Successfully registered '{McpServerNameVs}'");
+
+                result.Success = true;
+                result.AlreadyRegistered = false;
+                result.Message = $"Successfully registered. Please restart {ClientNameOpenCode} to use the AIDebugger tools.";
+                result.ConfigPath = configPath;
+                result.ServerPath = serverPath;
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                log($"[{ClientNameOpenCode}] Error registering: {ex.Message}");
+                result.Success = false;
+                result.Message = $"Failed to register: {ex.Message}";
+                return result;
+            }
+        }
+
+        /// <summary>
+        /// Checks if the existing OpenCode config is correct.
+        /// OpenCode uses "command" as array and "environment" instead of "env".
+        /// </summary>
+        private static bool IsCorrectOpenCodeConfig(Dictionary<string, object> existingConfig, PythonRuntimeInfo runtime, string normalizedPath, string preferredIde)
+        {
+            if (existingConfig == null)
+            {
+                return false;
+            }
+
+            // Check type
+            if (!existingConfig.ContainsKey("type") || existingConfig["type"]?.ToString() != "local")
+            {
+                return false;
+            }
+
+            // Check enabled
+            if (!existingConfig.ContainsKey("enabled"))
+            {
+                return false;
+            }
+            var enabled = existingConfig["enabled"];
+            if (!(enabled is bool && (bool)enabled))
+            {
+                return false;
+            }
+
+            // Check command array: ["python", "path"] or ["py", "-3.12", "path"]
+            var existingCommand = existingConfig.ContainsKey("command") ? existingConfig["command"] : null;
+            var existingCommandValues = new List<string>();
+            if (existingCommand is object[] cmdArray)
+            {
+                foreach (var cmd in cmdArray)
+                {
+                    existingCommandValues.Add(cmd?.ToString() ?? string.Empty);
+                }
+            }
+            else if (existingCommand is System.Collections.ArrayList cmdList)
+            {
+                foreach (var cmd in cmdList)
+                {
+                    existingCommandValues.Add(cmd?.ToString() ?? string.Empty);
+                }
+            }
+            else
+            {
+                return false;
+            }
+
+            // Expected command array
+            var expectedCommandValues = new List<string>();
+            expectedCommandValues.Add(runtime.Command);
+            expectedCommandValues.AddRange(runtime.PrefixArgs ?? new string[0]);
+            expectedCommandValues.Add(normalizedPath);
+
+            if (existingCommandValues.Count != expectedCommandValues.Count)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < expectedCommandValues.Count; i++)
+            {
+                if (!string.Equals(existingCommandValues[i], expectedCommandValues[i], StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+            }
+
+            // Check environment (OpenCode uses "environment" instead of "env")
+            if (!existingConfig.ContainsKey("environment"))
+            {
+                return false;
+            }
+
+            var envObj = existingConfig["environment"];
+            if (envObj is Dictionary<string, object> envDict)
+            {
+                if (!envDict.ContainsKey("AIDB_PREFERRED_IDE"))
+                {
+                    return false;
+                }
+                var envValue = envDict["AIDB_PREFERRED_IDE"]?.ToString();
+                return string.Equals(envValue, preferredIde, StringComparison.OrdinalIgnoreCase);
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Core registration logic for any MCP client configuration file.
+        /// </summary>
+        private static RegistrationResult RegisterToConfig(string configPath, string clientName, Action<string> log, bool createDirIfMissing)
         {
             log = log ?? ((s) => { });
             var result = new RegistrationResult();
 
             try
             {
-                var configPath = GetCursorMcpConfigPath();
                 var serverPath = GetMcpServerPath();
 
                 if (!TryResolvePythonRuntime(log, out var pythonRuntime))
@@ -264,16 +551,26 @@ namespace VSDebuggerMCP
                     return result;
                 }
                 
-                log($"Cursor MCP config path: {configPath}");
+                log($"Config path: {configPath}");
                 log($"MCP server path: {serverPath}");
-                log($"Selected Python runtime: {pythonRuntime.VersionText} via '{pythonRuntime.Command}'");
+                log($"Python runtime: {pythonRuntime.VersionText} via '{pythonRuntime.Command}'");
 
-                // Ensure the .cursor directory exists
-                var cursorDir = Path.GetDirectoryName(configPath);
-                if (!Directory.Exists(cursorDir))
+                // Ensure the config directory exists
+                var configDir = Path.GetDirectoryName(configPath);
+                if (!Directory.Exists(configDir))
                 {
-                    Directory.CreateDirectory(cursorDir);
-                    log($"Created .cursor directory: {cursorDir}");
+                    if (createDirIfMissing)
+                    {
+                        Directory.CreateDirectory(configDir);
+                        log($"Created directory: {configDir}");
+                    }
+                    else
+                    {
+                        result.Success = true;
+                        result.Skipped = true;
+                        result.Message = $"{clientName} directory does not exist";
+                        return result;
+                    }
                 }
 
                 // Read existing config or create new one
@@ -284,12 +581,12 @@ namespace VSDebuggerMCP
                     var serializer = new JavaScriptSerializer();
                     config = serializer.Deserialize<Dictionary<string, object>>(existingJson) 
                              ?? new Dictionary<string, object>();
-                    log("Read existing mcp.json config");
+                    log("Read existing config");
                 }
                 else
                 {
                     config = new Dictionary<string, object>();
-                    log("Creating new mcp.json config");
+                    log("Creating new config");
                 }
 
                 // Ensure mcpServers object exists
@@ -349,14 +646,14 @@ namespace VSDebuggerMCP
 
                 if (mcpServers.ContainsKey(LegacyMcpServerName))
                 {
-                    log($"Removing legacy MCP server entry '{LegacyMcpServerName}' to keep only VS entry.");
+                    log($"Removing legacy MCP server entry '{LegacyMcpServerName}'.");
                     mcpServers.Remove(LegacyMcpServerName);
                     allCorrect = false;
                 }
 
                 if (allCorrect)
                 {
-                    log("MCP servers are already correctly registered in Cursor");
+                    log($"MCP server already correctly registered");
                     result.Success = true;
                     result.AlreadyRegistered = true;
                     result.Message = "Already registered";
@@ -368,21 +665,11 @@ namespace VSDebuggerMCP
                 var json = FormatJson(serializer2.Serialize(config));
                 File.WriteAllText(configPath, json, Encoding.UTF8);
 
-                log($"Successfully registered '{McpServerNameVs}' in Cursor MCP config");
-                var commandLine = new StringBuilder();
-                commandLine.Append(pythonRuntime.Command);
-                foreach (var prefixArg in pythonRuntime.PrefixArgs)
-                {
-                    commandLine.Append(" ");
-                    commandLine.Append(prefixArg);
-                }
-                commandLine.Append(" ");
-                commandLine.Append(normalizedPath);
-                log($"Server command: {commandLine}");
+                log($"Successfully registered '{McpServerNameVs}'");
                 
                 result.Success = true;
                 result.AlreadyRegistered = false;
-                result.Message = $"Successfully registered. Please restart Cursor to use the AIDebugger tools.";
+                result.Message = $"Successfully registered. Please restart {clientName} to use the AIDebugger tools.";
                 result.ConfigPath = configPath;
                 result.ServerPath = serverPath;
 
@@ -390,7 +677,7 @@ namespace VSDebuggerMCP
             }
             catch (Exception ex)
             {
-                log($"Error registering with Cursor: {ex.Message}");
+                log($"Error registering: {ex.Message}");
                 result.Success = false;
                 result.Message = $"Failed to register: {ex.Message}";
                 return result;
@@ -428,15 +715,103 @@ namespace VSDebuggerMCP
         /// </summary>
         public static bool UnregisterFromCursor(Action<string> log = null)
         {
+            var configPath = GetCursorMcpConfigPath();
+            return UnregisterFromConfig(configPath, ClientNameCursor, log);
+        }
+
+        /// <summary>
+        /// Unregisters the AIDebugger server from Claude Desktop's configuration.
+        /// </summary>
+        public static bool UnregisterFromClaudeDesktop(Action<string> log = null)
+        {
+            var configPath = GetClaudeDesktopConfigPath();
+            return UnregisterFromConfig(configPath, ClientNameClaudeDesktop, log);
+        }
+
+        /// <summary>
+        /// Unregisters the AIDebugger server from OpenCode's configuration.
+        /// </summary>
+        public static bool UnregisterFromOpenCode(Action<string> log = null)
+        {
+            var configPath = GetOpenCodeConfigPath();
+            return UnregisterFromOpenCodeConfig(configPath, log);
+        }
+
+        /// <summary>
+        /// Core unregistration logic for OpenCode configuration file.
+        /// OpenCode uses "mcp" key instead of "mcpServers".
+        /// </summary>
+        private static bool UnregisterFromOpenCodeConfig(string configPath, Action<string> log)
+        {
             log = log ?? ((s) => { });
 
             try
             {
-                var configPath = GetCursorMcpConfigPath();
-                
                 if (!File.Exists(configPath))
                 {
-                    log("Cursor MCP config does not exist, nothing to unregister");
+                    log($"{ClientNameOpenCode} config does not exist, nothing to unregister");
+                    return true;
+                }
+
+                var existingJson = File.ReadAllText(configPath, Encoding.UTF8);
+                var serializer = new JavaScriptSerializer();
+                var config = serializer.Deserialize<Dictionary<string, object>>(existingJson);
+
+                if (config == null || !config.ContainsKey("mcp"))
+                {
+                    log("No mcp in config, nothing to unregister");
+                    return true;
+                }
+
+                var mcpServers = config["mcp"] as Dictionary<string, object>;
+                if (mcpServers == null)
+                {
+                    log("mcp is not a valid object, nothing to unregister");
+                    return true;
+                }
+
+                bool removed = false;
+                foreach (var name in new[] { McpServerNameVs, LegacyMcpServerName })
+                {
+                    if (mcpServers.ContainsKey(name))
+                    {
+                        mcpServers.Remove(name);
+                        removed = true;
+                        log($"Removed MCP server '{name}' from config");
+                    }
+                }
+
+                if (!removed)
+                {
+                    log("No AIDebugger MCP servers found in config, nothing to unregister");
+                    return true;
+                }
+
+                var json = FormatJson(serializer.Serialize(config));
+                File.WriteAllText(configPath, json, Encoding.UTF8);
+
+                log($"Successfully unregistered AIDebugger from {ClientNameOpenCode}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                log($"Error unregistering from {ClientNameOpenCode}: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Core unregistration logic for any MCP client configuration file.
+        /// </summary>
+        private static bool UnregisterFromConfig(string configPath, string clientName, Action<string> log)
+        {
+            log = log ?? ((s) => { });
+
+            try
+            {
+                if (!File.Exists(configPath))
+                {
+                    log($"{clientName} config does not exist, nothing to unregister");
                     return true;
                 }
 
@@ -477,12 +852,12 @@ namespace VSDebuggerMCP
                 var json = FormatJson(serializer.Serialize(config));
                 File.WriteAllText(configPath, json, Encoding.UTF8);
 
-                log($"Successfully unregistered AIDebugger VS MCP server from Cursor MCP config");
+                log($"Successfully unregistered AIDebugger from {clientName}");
                 return true;
             }
             catch (Exception ex)
             {
-                log($"Error unregistering from Cursor: {ex.Message}");
+                log($"Error unregistering from {clientName}: {ex.Message}");
                 return false;
             }
         }
@@ -636,6 +1011,7 @@ namespace VSDebuggerMCP
     {
         public bool Success { get; set; }
         public bool AlreadyRegistered { get; set; }
+        public bool Skipped { get; set; }
         public string Message { get; set; }
         public string ConfigPath { get; set; }
         public string ServerPath { get; set; }

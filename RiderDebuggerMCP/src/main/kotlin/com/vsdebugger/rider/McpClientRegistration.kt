@@ -9,11 +9,16 @@ import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
-object CursorMcpRegistration {
+object McpClientRegistration {
     private const val McpServerName = "AIDebuggerRider"
     private const val PreferredIde = "rider"
-    private val log = Logger.getInstance(CursorMcpRegistration::class.java)
+    private val log = Logger.getInstance(McpClientRegistration::class.java)
     private val gson = GsonBuilder().setPrettyPrinting().create()
+    
+    // Client display names for logging
+    private const val ClientNameCursor = "Cursor"
+    private const val ClientNameClaudeDesktop = "Claude Desktop"
+    private const val ClientNameOpenCode = "OpenCode"
 
     private val baseFiles = listOf(
         "server.py",
@@ -41,30 +46,154 @@ object CursorMcpRegistration {
 
             val serverPath = ensureServerFiles() ?: return
             val configPath = getCursorMcpConfigPath()
-            val config = readConfig(configPath)
-
-            val mcpServers = getOrCreateMap(config, "mcpServers")
-            val normalizedPath = serverPath.replace("\\", "/")
-
-            val serverConfig = linkedMapOf<String, Any>(
-                "command" to "python",
-                "args" to listOf(normalizedPath),
-                "env" to mapOf("AIDB_PREFERRED_IDE" to PreferredIde),
-                "serverUseInstructions" to ServerUseInstructions
-            )
-
-            val existing = mcpServers[McpServerName] as? Map<*, *>
-            if (isCorrectConfig(existing, normalizedPath)) {
-                log.debug("MCP server '$McpServerName' already registered.")
-                return
-            }
-
-            mcpServers[McpServerName] = serverConfig
-            writeConfig(configPath, config)
-            log.info("Registered MCP server '$McpServerName' in Cursor config.")
+            registerToConfig(configPath, serverPath, ClientNameCursor, createDirIfMissing = true)
         } catch (ex: Exception) {
             log.warn("Failed to register MCP server with Cursor: ${ex.message}", ex)
         }
+    }
+
+    fun registerWithClaudeDesktop() {
+        try {
+            if (!isPythonAvailable()) {
+                log.warn("Python 3.10+ is required for MCP server registration. Skipping Claude Desktop registration.")
+                return
+            }
+
+            val configPath = getClaudeDesktopConfigPath()
+            val configFile = File(configPath)
+            
+            // Check if Claude Desktop is installed
+            if (!configFile.parentFile.exists()) {
+                log.debug("Claude Desktop not installed, skipping registration.")
+                return
+            }
+
+            val serverPath = ensureServerFiles() ?: return
+            registerToConfig(configPath, serverPath, ClientNameClaudeDesktop, createDirIfMissing = false)
+        } catch (ex: Exception) {
+            log.warn("Failed to register MCP server with Claude Desktop: ${ex.message}", ex)
+        }
+    }
+
+    fun registerWithOpenCode() {
+        try {
+            if (!isPythonAvailable()) {
+                log.warn("Python 3.10+ is required for MCP server registration. Skipping OpenCode registration.")
+                return
+            }
+
+            val configPath = getOpenCodeConfigPath()
+            val configFile = File(configPath)
+
+            // Check if OpenCode is installed (config directory exists)
+            if (!configFile.parentFile.exists()) {
+                log.debug("[$ClientNameOpenCode] OpenCode not installed, skipping registration.")
+                return
+            }
+
+            val serverPath = ensureServerFiles() ?: return
+            registerToOpenCodeConfig(configPath, serverPath)
+        } catch (ex: Exception) {
+            log.warn("Failed to register MCP server with OpenCode: ${ex.message}", ex)
+        }
+    }
+
+    private fun registerToOpenCodeConfig(configPath: String, serverPath: String) {
+        val configFile = File(configPath)
+        val normalizedPath = serverPath.replace("\\", "/")
+
+        // Read existing config or create new one
+        val config = if (configFile.exists()) {
+            readConfig(configPath)
+        } else {
+            mutableMapOf()
+        }
+
+        // OpenCode uses "mcp" key instead of "mcpServers"
+        val mcpServers = getOrCreateMap(config, "mcp")
+
+        // Build OpenCode-specific server config
+        // OpenCode uses "command" as array: ["python", "path/to/server.py"]
+        val serverConfig = linkedMapOf<String, Any>(
+            "type" to "local",
+            "command" to listOf("python", normalizedPath),
+            "enabled" to true,
+            "environment" to mapOf("AIDB_PREFERRED_IDE" to PreferredIde)
+        )
+
+        val existing = mcpServers[McpServerName] as? Map<*, *>
+        if (isCorrectOpenCodeConfig(existing, normalizedPath)) {
+            log.debug("[$ClientNameOpenCode] MCP server '$McpServerName' already registered.")
+            return
+        }
+
+        mcpServers[McpServerName] = serverConfig
+        writeConfig(configPath, config)
+        log.info("[$ClientNameOpenCode] Registered MCP server '$McpServerName'.")
+    }
+
+    private fun isCorrectOpenCodeConfig(existing: Map<*, *>?, normalizedPath: String): Boolean {
+        if (existing == null) return false
+        
+        // Check type
+        val type = existing["type"]?.toString() ?: return false
+        if (type != "local") return false
+
+        // Check enabled
+        val enabled = existing["enabled"]
+        if (enabled != true) return false
+
+        // Check command array
+        val command = existing["command"]
+        val commandList = when (command) {
+            is List<*> -> command
+            is Array<*> -> command.toList()
+            else -> return false
+        }
+        if (commandList.size < 2) return false
+        if (commandList[0]?.toString() != "python") return false
+        if (!normalizedPath.equals(commandList.last()?.toString(), ignoreCase = true)) return false
+
+        // Check environment
+        val env = existing["environment"] as? Map<*, *> ?: return false
+        val preferred = env["AIDB_PREFERRED_IDE"]?.toString() ?: return false
+        return preferred.equals(PreferredIde, ignoreCase = true)
+    }
+
+    private fun registerToConfig(configPath: String, serverPath: String, clientName: String, createDirIfMissing: Boolean) {
+        val configFile = File(configPath)
+        val configDir = configFile.parentFile
+        
+        if (configDir != null && !configDir.exists()) {
+            if (createDirIfMissing) {
+                configDir.mkdirs()
+                log.info("[$clientName] Created directory: ${configDir.absolutePath}")
+            } else {
+                log.debug("[$clientName] Directory does not exist, skipping.")
+                return
+            }
+        }
+
+        val config = readConfig(configPath)
+        val mcpServers = getOrCreateMap(config, "mcpServers")
+        val normalizedPath = serverPath.replace("\\", "/")
+
+        val serverConfig = linkedMapOf<String, Any>(
+            "command" to "python",
+            "args" to listOf(normalizedPath),
+            "env" to mapOf("AIDB_PREFERRED_IDE" to PreferredIde),
+            "serverUseInstructions" to ServerUseInstructions
+        )
+
+        val existing = mcpServers[McpServerName] as? Map<*, *>
+        if (isCorrectConfig(existing, normalizedPath)) {
+            log.debug("[$clientName] MCP server '$McpServerName' already registered.")
+            return
+        }
+
+        mcpServers[McpServerName] = serverConfig
+        writeConfig(configPath, config)
+        log.info("[$clientName] Registered MCP server '$McpServerName'.")
     }
 
     private fun ensureServerFiles(): String? {
@@ -146,7 +275,7 @@ object CursorMcpRegistration {
 
     private fun getResourceStream(name: String): InputStream? {
         val normalized = name.replace("\\", "/")
-        return CursorMcpRegistration::class.java.classLoader.getResourceAsStream(normalized)
+        return McpClientRegistration::class.java.classLoader.getResourceAsStream(normalized)
     }
 
     private data class WheelsManifest(val wheels: List<WheelEntry> = emptyList())
@@ -173,6 +302,17 @@ object CursorMcpRegistration {
     private fun getCursorMcpConfigPath(): String {
         val userHome = System.getProperty("user.home")
         return File(File(userHome, ".cursor"), "mcp.json").absolutePath
+    }
+
+    private fun getClaudeDesktopConfigPath(): String {
+        val appData = System.getenv("APPDATA")
+            ?: File(System.getProperty("user.home"), "AppData/Roaming").absolutePath
+        return File(File(appData, "Claude"), "claude_desktop_config.json").absolutePath
+    }
+
+    private fun getOpenCodeConfigPath(): String {
+        val userHome = System.getProperty("user.home")
+        return File(File(File(userHome, ".config"), "opencode"), "opencode.json").absolutePath
     }
 
     private fun readConfig(path: String): MutableMap<String, Any> {

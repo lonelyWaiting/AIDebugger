@@ -54,7 +54,7 @@
     <Compile Include="Protocol\DebugRequest.cs" />
     <Compile Include="Protocol\DebugResponse.cs" />
     <Compile Include="Protocol\DebugModels.cs" />
-    <Compile Include="CursorMcpRegistration.cs" />
+    <Compile Include="McpClientRegistration.cs" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="System" />
