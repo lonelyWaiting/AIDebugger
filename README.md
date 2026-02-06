@@ -148,7 +148,7 @@ A Python-based MCP server that connects to the VS extension and Rider plugin and
 - Windows 10/11 (debugger integrations are Windows-only)
 - Visual Studio 2026 (18.0+) recommended (Visual Studio 2022 17.0+ also works)
 - JDK 21+ (for Rider plugin build)
-- Python 3.10+ (x64)
+- Python 3.10-3.13 (x64)
 - Cursor IDE
 
 ### Step 1: Build and Install VS Extension
@@ -165,6 +165,7 @@ A Python-based MCP server that connects to the VS extension and Rider plugin and
      - `VSDebuggerMCP/Install-VSIX.cmd -Target vs2022`
      - `VSDebuggerMCP/Install-VSIX.cmd -Target vs2026`
      - `VSDebuggerMCP/Install-VSIX.cmd -Target all`
+     - This script also seeds MCP server files to `<user-home>/.ai-debugger/mcp_server`.
 4. The Rider plugin ZIP is created in `RiderDebuggerMCP/build-<id>/distributions/` when building via Visual Studio.
    - When building directly with Gradle, the ZIP is created in `RiderDebuggerMCP/build/distributions/`
    - Visual Studio builds keep only the most recent Rider build folders by default. Adjust `RiderBuildRetention` in `RiderBuild.csproj` to change the retention count.
@@ -182,7 +183,7 @@ On first run, the MCP server extracts bundled wheels to `<user-home>/.ai-debugge
 
 After installing the VS extension and restarting Visual Studio, you just need to **restart Cursor** for the MCP tools to become available.
 
-The Rider plugin will also attempt to register `AIDebuggerRider` on startup and copy MCP server files to `<user-home>/.ai-debugger/mcp_server` if needed.
+The VS install script and Rider plugin both copy MCP server files to `<user-home>/.ai-debugger/mcp_server` when needed.
 
 **Manual Configuration (Optional):**
 
@@ -192,8 +193,8 @@ If auto-registration doesn't work, you can manually add the following to your Cu
 {
   "mcpServers": {
     "AIDebuggerVS": {
-      "command": "python",
-      "args": ["<path-to-vs-extension>/mcp_server/server.py"],
+      "command": "py",
+      "args": ["-3.13", "<user-home>/.ai-debugger/mcp_server/server.py"],
       "env": { "AIDB_PREFERRED_IDE": "vs" }
     },
     "AIDebuggerRider": {
@@ -205,7 +206,7 @@ If auto-registration doesn't work, you can manually add the following to your Cu
 }
 ```
 
-**Note:** Replace `<path-to-vs-extension>` with the actual VS extension installation path (typically under `%LOCALAPPDATA%\Microsoft\VisualStudio\<version>\Extensions\`). Replace `<user-home>` with your home directory; the Rider plugin copies the MCP server to `<user-home>/.ai-debugger/mcp_server` by default.
+**Note:** Replace `<user-home>` with your home directory. If your default `python` points to Python 3.14+, use `py -3.13` (or another 3.10-3.13 interpreter).
 If you only use one IDE, you can omit the other MCP entry.
 
 ## Usage

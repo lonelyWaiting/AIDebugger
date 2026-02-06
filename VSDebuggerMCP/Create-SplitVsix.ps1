@@ -39,6 +39,44 @@ $targets = @(
     "Microsoft.VisualStudio.Enterprise"
 )
 
+function New-ZipFromDirectoryWithForwardSlashes {
+    param(
+        [string]$SourceDirectory,
+        [string]$DestinationZip
+    )
+
+    if (Test-Path $DestinationZip) {
+        Remove-Item -Path $DestinationZip -Force
+    }
+
+    $archive = [System.IO.Compression.ZipFile]::Open($DestinationZip, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $baseLength = $SourceDirectory.Length
+        if (-not $SourceDirectory.EndsWith("\\") -and -not $SourceDirectory.EndsWith("/")) {
+            $baseLength += 1
+        }
+
+        Get-ChildItem -Path $SourceDirectory -Recurse -File | ForEach-Object {
+            $relativePath = $_.FullName.Substring($baseLength)
+            $entryName = $relativePath.Replace("\", "/")
+
+            $entry = $archive.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+            $entryStream = $entry.Open()
+            $fileStream = [System.IO.File]::OpenRead($_.FullName)
+            try {
+                $fileStream.CopyTo($entryStream)
+            }
+            finally {
+                $fileStream.Dispose()
+                $entryStream.Dispose()
+            }
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+}
+
 function New-SplitVsix {
     param(
         [string]$PackageSuffix,
@@ -81,16 +119,7 @@ function New-SplitVsix {
 
         $manifest.Save($manifestPath)
 
-        if (Test-Path $outputFile) {
-            Remove-Item -Path $outputFile -Force
-        }
-
-        [System.IO.Compression.ZipFile]::CreateFromDirectory(
-            $tempDir,
-            $outputFile,
-            [System.IO.Compression.CompressionLevel]::Optimal,
-            $false
-        )
+        New-ZipFromDirectoryWithForwardSlashes -SourceDirectory $tempDir -DestinationZip $outputFile
 
         Write-Host "Created: $outputFile"
     }

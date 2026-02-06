@@ -38,6 +38,7 @@ VSDebuggerMCP/Install-VSIX.cmd -Target all
 ```
 
 Note: `VSDebuggerMCP/bin/Release/VSDebuggerMCP.vsix` is an intermediate package and is deleted at the end of the build.
+The install script also seeds MCP server files to `~/.ai-debugger/mcp_server`.
 
 ### Rider Plugin Only
 ```bash
@@ -79,7 +80,7 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 |-----------|----------|----------|---------|
 | VS Extension | `VSDebuggerMCP/` | C# (.NET 4.7.2) | VSIX package exposing EnvDTE debugger APIs via Named Pipe |
 | Rider Plugin | `RiderDebuggerMCP/` | Kotlin (JDK 21) | IntelliJ plugin exposing Rider debugger APIs via Named Pipe |
-| MCP Server | `mcp_server/` | Python 3.10+ | FastMCP server bridging Named Pipes to Cursor stdio |
+| MCP Server | `mcp_server/` | Python 3.10-3.13 (x64) | FastMCP server bridging Named Pipes to Cursor stdio |
 
 ### Key Files
 

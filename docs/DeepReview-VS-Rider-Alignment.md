@@ -24,7 +24,7 @@
 - 已落地（Rider 对齐增强）：异常详情补齐 `stackTrace/source/hResult/innerException`（可得时返回），模块信息补齐 `FullName/Location/Version` 解析，寄存器增加分类并做 segment/XMM best-effort 读取。
 - 已落地（可维护性）：VS 增加“类名->源码路径”缓存与 miss 缓存，减少 callstack 高频请求下的 solution 递归扫描。
 - 已落地（可维护性）：VS 源码定位缓存改为“类型全名优先 + 短类名回退”，并增加 miss TTL 与 solution 切换自动失效，降低命名冲突和陈旧缓存风险。
-- 已落地（注册体验）：Rider 注册增加 Python 3.10+ 预检，server 文件复制改为 bundle signature 增量策略（签名一致且文件齐全时跳过复制）。
+- 已落地（注册体验）：Rider 注册增加 Python 3.10-3.13 预检，server 文件复制改为 bundle signature 增量策略（签名一致且文件齐全时跳过复制）。
 - 已落地（安全边界）：VS/Rider Named Pipe 增加可选严格模式（`AIDB_PIPE_SECURITY=strict|same_user|owner_only`），支持同用户/owner-only 访问控制。
 - 已落地（稳定性）：VS NamedPipe listener 的等待连接已支持取消联动（stop 时可打断 `BeginWaitForConnection`），避免停机时残留监听任务。
 - 已落地（CI 基线）：新增最小合同测试（协议字段与 bridge 超时语义静态断言）并接入 workflow。
@@ -117,7 +117,7 @@
   - `ensureServerFiles` 每次复制文件：`RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/CursorMcpRegistration.kt:66`
   - VS 有 Python 可用性检查：`VSDebuggerMCP/VSDebuggerMCPPackage.cs:103`
 - 影响：启动耗时增加，且在无 Python 环境下可能写入不可用配置。
-- 进展：已增加 Python 3.10+ 预检，并改为 bundle signature 增量复制（签名一致时跳过重复拷贝）。
+- 进展：已增加 Python 3.10-3.13 预检，并改为 bundle signature 增量复制（签名一致时跳过重复拷贝）。
 
 ### P3 - 安全边界：Named Pipe 对 Everyone 开放写权限（已修复为可配置）
 - 证据：

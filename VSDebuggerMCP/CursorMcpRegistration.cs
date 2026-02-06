@@ -71,33 +71,146 @@ namespace VSDebuggerMCP
         {
             return string.Format(ServerUseInstructionsTemplate, ideLabel, preferredIde);
         }
+
+        private class PythonRuntimeInfo
+        {
+            public string Command { get; set; }
+            public string[] PrefixArgs { get; set; }
+            public string VersionText { get; set; }
+        }
+
+        private static bool IsSupportedPythonVersion(int major, int minor)
+        {
+            return major == 3 && minor >= 10 && minor <= 13;
+        }
+
+        private static bool TryResolvePythonRuntime(Action<string> log, out PythonRuntimeInfo runtime)
+        {
+            runtime = null;
+            log = log ?? ((s) => { });
+
+            var candidates = new[]
+            {
+                new { Command = "py", Args = new[] { "-3.13" } },
+                new { Command = "py", Args = new[] { "-3.12" } },
+                new { Command = "py", Args = new[] { "-3.11" } },
+                new { Command = "py", Args = new[] { "-3.10" } },
+                new { Command = "python", Args = new string[0] }
+            };
+
+            foreach (var candidate in candidates)
+            {
+                if (TryProbePythonRuntime(candidate.Command, candidate.Args, log, out runtime))
+                {
+                    return true;
+                }
+            }
+
+            log("No compatible Python runtime found. Please install Python 3.10-3.13 x64.");
+            return false;
+        }
+
+        private static bool TryProbePythonRuntime(string command, string[] prefixArgs, Action<string> log, out PythonRuntimeInfo runtime)
+        {
+            runtime = null;
+            log = log ?? ((s) => { });
+
+            try
+            {
+                var argsBuilder = new StringBuilder();
+                if (prefixArgs != null && prefixArgs.Length > 0)
+                {
+                    argsBuilder.Append(string.Join(" ", prefixArgs));
+                    argsBuilder.Append(" ");
+                }
+                argsBuilder.Append("--version");
+
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = command,
+                    Arguments = argsBuilder.ToString(),
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using (var process = Process.Start(startInfo))
+                {
+                    if (process == null)
+                    {
+                        return false;
+                    }
+
+                    var output = process.StandardOutput.ReadToEnd();
+                    var error = process.StandardError.ReadToEnd();
+                    process.WaitForExit(5000);
+
+                    if (process.ExitCode != 0)
+                    {
+                        return false;
+                    }
+
+                    var versionText = string.IsNullOrEmpty(output) ? error : output;
+                    var trimmed = versionText.Trim();
+                    var match = Regex.Match(trimmed, @"Python\s+(\d+)\.(\d+)\.(\d+)");
+                    if (!match.Success)
+                    {
+                        log($"Python runtime check returned an unrecognized version string: {trimmed}");
+                        return false;
+                    }
+
+                    var major = int.Parse(match.Groups[1].Value);
+                    var minor = int.Parse(match.Groups[2].Value);
+                    if (!IsSupportedPythonVersion(major, minor))
+                    {
+                        log($"Ignoring unsupported Python runtime: {trimmed} (requires 3.10-3.13)");
+                        return false;
+                    }
+
+                    runtime = new PythonRuntimeInfo
+                    {
+                        Command = command,
+                        PrefixArgs = prefixArgs ?? new string[0],
+                        VersionText = trimmed
+                    };
+
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
         
         /// <summary>
         /// Gets the path to the MCP server Python script.
-        /// The Python files are bundled with the VSIX extension.
+        /// Primary location is ~/.ai-debugger/mcp_server (stable path seeded by Install-VSIX.ps1).
         /// </summary>
         public static string GetMcpServerPath()
         {
-            // The MCP server files are bundled in the VSIX and installed alongside the extension
-            var extensionDir = GetExtensionDirectory();
+            var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             
-            // Primary location: mcp_server folder in the extension directory (bundled with VSIX)
-            var bundledPath = Path.Combine(extensionDir, "mcp_server", "server.py");
-            var normalizedBundledPath = Path.GetFullPath(bundledPath);
+            // Primary location: ~/.ai-debugger/mcp_server (stable path, seeded by Install-VSIX.ps1)
+            var stablePath = Path.Combine(userProfile, ".ai-debugger", "mcp_server", "server.py");
+            var normalizedStablePath = Path.GetFullPath(stablePath);
             
-            if (File.Exists(normalizedBundledPath))
+            if (File.Exists(normalizedStablePath))
             {
-                return normalizedBundledPath;
+                return normalizedStablePath;
             }
             
             // Fallback locations for development scenarios
+            var extensionDir = GetExtensionDirectory();
             var fallbackPaths = new[]
             {
+                // Extension directory (bundled with VSIX, if available)
+                Path.Combine(extensionDir, "mcp_server", "server.py"),
                 // Parent directory (development: running from VSDebuggerMCP/bin/Debug)
                 Path.Combine(extensionDir, "..", "..", "..", "mcp_server", "server.py"),
-                // User profile location (manual installation)
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ai-debugger", "mcp_server", "server.py"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".vs-debugger-mcp", "mcp_server", "server.py"),
+                // Legacy user profile location
+                Path.Combine(userProfile, ".vs-debugger-mcp", "mcp_server", "server.py"),
             };
 
             foreach (var path in fallbackPaths)
@@ -109,8 +222,8 @@ namespace VSDebuggerMCP
                 }
             }
 
-            // Return the bundled path even if it doesn't exist (will show meaningful error)
-            return normalizedBundledPath;
+            // Return the stable path even if it doesn't exist (will show meaningful error)
+            return normalizedStablePath;
         }
 
         /// <summary>
@@ -143,9 +256,17 @@ namespace VSDebuggerMCP
             {
                 var configPath = GetCursorMcpConfigPath();
                 var serverPath = GetMcpServerPath();
+
+                if (!TryResolvePythonRuntime(log, out var pythonRuntime))
+                {
+                    result.Success = false;
+                    result.Message = "No compatible Python runtime found. Please install Python 3.10-3.13 x64.";
+                    return result;
+                }
                 
                 log($"Cursor MCP config path: {configPath}");
                 log($"MCP server path: {serverPath}");
+                log($"Selected Python runtime: {pythonRuntime.VersionText} via '{pythonRuntime.Command}'");
 
                 // Ensure the .cursor directory exists
                 var cursorDir = Path.GetDirectoryName(configPath);
@@ -195,7 +316,7 @@ namespace VSDebuggerMCP
                 if (mcpServers.ContainsKey(entryName))
                 {
                     var existingConfig = mcpServers[entryName] as Dictionary<string, object>;
-                    isCorrect = IsCorrectServerConfig(existingConfig, normalizedPath, preferredIde);
+                    isCorrect = IsCorrectServerConfig(existingConfig, pythonRuntime, normalizedPath, preferredIde);
                     if (!isCorrect)
                     {
                         log($"MCP server '{entryName}' exists but needs update...");
@@ -208,10 +329,17 @@ namespace VSDebuggerMCP
 
                 if (!isCorrect)
                 {
+                    var commandArgs = new List<object>();
+                    foreach (var prefixArg in pythonRuntime.PrefixArgs)
+                    {
+                        commandArgs.Add(prefixArg);
+                    }
+                    commandArgs.Add(normalizedPath);
+
                     var serverConfig = new Dictionary<string, object>
                     {
-                        { "command", "python" },
-                        { "args", new object[] { normalizedPath } },
+                        { "command", pythonRuntime.Command },
+                        { "args", commandArgs.ToArray() },
                         { "env", new Dictionary<string, object> { { "AIDB_PREFERRED_IDE", preferredIde } } },
                         { "serverUseInstructions", instructions }
                     };
@@ -241,7 +369,16 @@ namespace VSDebuggerMCP
                 File.WriteAllText(configPath, json, Encoding.UTF8);
 
                 log($"Successfully registered '{McpServerNameVs}' in Cursor MCP config");
-                log($"Server command: python {normalizedPath}");
+                var commandLine = new StringBuilder();
+                commandLine.Append(pythonRuntime.Command);
+                foreach (var prefixArg in pythonRuntime.PrefixArgs)
+                {
+                    commandLine.Append(" ");
+                    commandLine.Append(prefixArg);
+                }
+                commandLine.Append(" ");
+                commandLine.Append(normalizedPath);
+                log($"Server command: {commandLine}");
                 
                 result.Success = true;
                 result.AlreadyRegistered = false;
@@ -277,52 +414,12 @@ namespace VSDebuggerMCP
         public static bool IsPythonAvailable(Action<string> log = null)
         {
             log = log ?? ((s) => { });
-            try
+            if (TryResolvePythonRuntime(log, out var runtime))
             {
-                var startInfo = new ProcessStartInfo
-                {
-                    FileName = "python",
-                    Arguments = "--version",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-
-                using (var process = Process.Start(startInfo))
-                {
-                    if (process == null) return false;
-                    var output = process.StandardOutput.ReadToEnd();
-                    var error = process.StandardError.ReadToEnd();
-                    process.WaitForExit(5000);
-                    
-                    var version = string.IsNullOrEmpty(output) ? error : output;
-                    if (process.ExitCode == 0)
-                    {
-                        var trimmed = version.Trim();
-                        var match = Regex.Match(trimmed, @"Python\s+(\d+)\.(\d+)\.(\d+)");
-                        if (match.Success)
-                        {
-                            var major = int.Parse(match.Groups[1].Value);
-                            var minor = int.Parse(match.Groups[2].Value);
-                            if (major > 3 || (major == 3 && minor >= 10))
-                            {
-                                log($"Python found: {trimmed}");
-                                return true;
-                            }
-                            log($"Python version {major}.{minor} is not supported. Please install Python 3.10+.");
-                            return false;
-                        }
-
-                        log($"Python found but version could not be parsed: {trimmed}");
-                        return false;
-                    }
-                }
+                log($"Compatible Python found: {runtime.VersionText}");
+                return true;
             }
-            catch (Exception ex)
-            {
-                log($"Python not found: {ex.Message}");
-            }
+
             return false;
         }
 
@@ -453,7 +550,7 @@ namespace VSDebuggerMCP
             return sb.ToString();
         }
 
-        private static bool IsCorrectServerConfig(Dictionary<string, object> existingConfig, string normalizedPath, string preferredIde)
+        private static bool IsCorrectServerConfig(Dictionary<string, object> existingConfig, PythonRuntimeInfo runtime, string normalizedPath, string preferredIde)
         {
             if (existingConfig == null)
             {
@@ -461,25 +558,47 @@ namespace VSDebuggerMCP
             }
 
             var existingCommand = existingConfig.ContainsKey("command") ? existingConfig["command"]?.ToString() : "";
-            if (existingCommand != "python")
+            if (!string.Equals(existingCommand, runtime.Command, StringComparison.OrdinalIgnoreCase))
             {
                 return false;
             }
 
             var existingArgs = existingConfig.ContainsKey("args") ? existingConfig["args"] : null;
-            string firstArg = null;
-            if (existingArgs is object[] argsArray && argsArray.Length > 0)
+            var existingArgValues = new List<string>();
+            if (existingArgs is object[] argsArray)
             {
-                firstArg = argsArray[0]?.ToString();
+                foreach (var arg in argsArray)
+                {
+                    existingArgValues.Add(arg?.ToString() ?? string.Empty);
+                }
             }
-            else if (existingArgs is System.Collections.ArrayList argsList && argsList.Count > 0)
+            else if (existingArgs is System.Collections.ArrayList argsList)
             {
-                firstArg = argsList[0]?.ToString();
+                foreach (var arg in argsList)
+                {
+                    existingArgValues.Add(arg?.ToString() ?? string.Empty);
+                }
             }
-
-            if (!string.Equals(firstArg, normalizedPath, StringComparison.OrdinalIgnoreCase))
+            else
             {
                 return false;
+            }
+
+            var expectedArgValues = new List<string>();
+            expectedArgValues.AddRange(runtime.PrefixArgs ?? new string[0]);
+            expectedArgValues.Add(normalizedPath);
+
+            if (existingArgValues.Count != expectedArgValues.Count)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < expectedArgValues.Count; i++)
+            {
+                if (!string.Equals(existingArgValues[i], expectedArgValues[i], StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
             }
 
             var hasServerUseInstructions = existingConfig.ContainsKey("serverUseInstructions")

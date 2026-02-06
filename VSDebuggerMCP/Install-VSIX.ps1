@@ -6,6 +6,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $splitVs2022Path = Join-Path $scriptDir "bin\Release\VSDebuggerMCP.VS2022.vsix"
@@ -97,6 +99,85 @@ function Get-PackageForInstance {
     }
 
     throw "Unsupported Visual Studio version '$($instance.installationVersion)' for instance '$($instance.displayName)'"
+}
+
+function Sync-McpServerFromPackage {
+    param([string]$packagePath)
+
+    $userMcpRoot = Join-Path $env:USERPROFILE ".ai-debugger\mcp_server"
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("AIDebuggerMcpPayload_" + [Guid]::NewGuid().ToString("N"))
+
+    try {
+        New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($packagePath)
+        try {
+            $payloadEntries = @($zip.Entries | Where-Object {
+                $name = $_.FullName.Replace("\", "/")
+                $name.StartsWith("mcp_server/") -and -not $name.EndsWith("/")
+            })
+
+            if ($payloadEntries.Count -eq 0) {
+                throw "No mcp_server payload found in package: $packagePath"
+            }
+
+            foreach ($entry in $payloadEntries) {
+                $normalizedName = $entry.FullName.Replace("\", "/")
+                $relativeName = $normalizedName.Substring("mcp_server/".Length).Replace("/", "\")
+                $destFile = Join-Path $tempRoot (Join-Path "mcp_server" $relativeName)
+                $destDir = Split-Path -Parent $destFile
+
+                if (-not (Test-Path $destDir)) {
+                    New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+                }
+
+                $entryStream = $entry.Open()
+                $fileStream = [System.IO.File]::Create($destFile)
+                try {
+                    $entryStream.CopyTo($fileStream)
+                }
+                finally {
+                    $fileStream.Dispose()
+                    $entryStream.Dispose()
+                }
+            }
+        }
+        finally {
+            $zip.Dispose()
+        }
+
+        $extractedServerPath = Join-Path $tempRoot "mcp_server\server.py"
+        if (-not (Test-Path $extractedServerPath)) {
+            throw "Extracted payload is missing server.py"
+        }
+
+        if (Test-Path $userMcpRoot) {
+            Remove-Item -Path $userMcpRoot -Recurse -Force
+        }
+
+        New-Item -ItemType Directory -Path (Split-Path -Parent $userMcpRoot) -Force | Out-Null
+        Copy-Item -Path (Join-Path $tempRoot "mcp_server") -Destination $userMcpRoot -Recurse -Force
+
+        Write-Host "Seeded MCP server payload: $userMcpRoot"
+    }
+    finally {
+        if (Test-Path $tempRoot) {
+            Remove-Item -Path $tempRoot -Recurse -Force
+        }
+    }
+}
+
+$packageSet = @{}
+foreach ($instance in $candidates) {
+    $packagePath = Get-PackageForInstance -instance $instance
+    if (-not (Test-Path $packagePath)) {
+        throw "VSIX not found: $packagePath"
+    }
+    $packageSet[$packagePath] = $true
+}
+
+foreach ($packagePath in $packageSet.Keys) {
+    Sync-McpServerFromPackage -packagePath $packagePath
 }
 
 $failures = @()
