@@ -73,7 +73,7 @@ class ContractTests(unittest.TestCase):
             self.assertIn("GetOverlappedResult", bridge_code)
 
     def test_rider_registration_guards_present(self) -> None:
-        rider_registration = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/CursorMcpRegistration.kt")
+        rider_registration = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/McpClientRegistration.kt")
         self.assertIn("isPythonAvailable()", rider_registration)
         self.assertIn("computeBundleSignature", rider_registration)
         self.assertIn(".bundle-signature", rider_registration)
@@ -81,7 +81,7 @@ class ContractTests(unittest.TestCase):
         self.assertIn("evaluate_expressions_batch", rider_registration)
 
     def test_vs_registration_instructions_include_snapshot_workflow(self) -> None:
-        vs_registration = read("VSDebuggerMCP/CursorMcpRegistration.cs")
+        vs_registration = read("VSDebuggerMCP/McpClientRegistration.cs")
         self.assertIn("capture_debug_bundle", vs_registration)
         self.assertIn("evaluate_expressions_batch", vs_registration)
         self.assertIn("stopReason", vs_registration)
