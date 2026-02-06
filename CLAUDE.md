@@ -26,7 +26,18 @@ msbuild AIDebugger.sln /p:Configuration=Release
 nuget restore VSDebuggerMCP/VSDebuggerMCP.csproj
 msbuild VSDebuggerMCP/VSDebuggerMCP.csproj /p:Configuration=Release /p:DeployExtension=false
 ```
-Output: `VSDebuggerMCP/bin/Release/VSDebuggerMCP.vsix`
+Output:
+- `VSDebuggerMCP/bin/Release/VSDebuggerMCP.VS2022.vsix`
+- `VSDebuggerMCP/bin/Release/VSDebuggerMCP.VS2026.vsix`
+
+Install examples:
+```bash
+VSDebuggerMCP/Install-VSIX.cmd -Target vs2022
+VSDebuggerMCP/Install-VSIX.cmd -Target vs2026
+VSDebuggerMCP/Install-VSIX.cmd -Target all
+```
+
+Note: `VSDebuggerMCP/bin/Release/VSDebuggerMCP.vsix` is an intermediate package and is deleted at the end of the build.
 
 ### Rider Plugin Only
 ```bash

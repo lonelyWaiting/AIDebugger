@@ -156,7 +156,15 @@ A Python-based MCP server that connects to the VS extension and Rider plugin and
 1. Open `AIDebugger.sln` in Visual Studio
 2. Build the solution in Release mode (builds the VSIX and triggers the Rider plugin build via `RiderBuild.csproj`)
    - The first build will download Gradle via the wrapper in `RiderDebuggerMCP/`
-3. Install the generated VSIX from `VSDebuggerMCP/bin/Release/VSDebuggerMCP.vsix`
+3. Install the generated VSIX package for your Visual Studio version:
+   - `VSDebuggerMCP/bin/Release/VSDebuggerMCP.VS2022.vsix` (targets VS 2022 only)
+   - `VSDebuggerMCP/bin/Release/VSDebuggerMCP.VS2026.vsix` (targets VS 2026 only)
+   - The generic `VSDebuggerMCP.vsix` is removed after build to avoid accidentally installing the wrong package.
+   - The VS 2026 package does not target VS 2022, so the installer will not prompt to install it into VS 2022.
+   - Optional scripted install (instance-aware):
+     - `VSDebuggerMCP/Install-VSIX.cmd -Target vs2022`
+     - `VSDebuggerMCP/Install-VSIX.cmd -Target vs2026`
+     - `VSDebuggerMCP/Install-VSIX.cmd -Target all`
 4. The Rider plugin ZIP is created in `RiderDebuggerMCP/build-<id>/distributions/` when building via Visual Studio.
    - When building directly with Gradle, the ZIP is created in `RiderDebuggerMCP/build/distributions/`
    - Visual Studio builds keep only the most recent Rider build folders by default. Adjust `RiderBuildRetention` in `RiderBuild.csproj` to change the retention count.

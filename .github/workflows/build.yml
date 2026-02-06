@@ -123,11 +123,13 @@ jobs:
     - name: Build VSIX (Release)
       run: msbuild VSDebuggerMCP/VSDebuggerMCP.csproj /p:Configuration=Release /p:DeployExtension=false
 
-    - name: Upload VSIX artifact
+    - name: Upload VSIX artifacts
       uses: actions/upload-artifact@v4
       with:
         name: AIDebugger-VSIX
-        path: VSDebuggerMCP/bin/Release/VSDebuggerMCP.vsix
+        path: |
+          VSDebuggerMCP/bin/Release/VSDebuggerMCP.VS2022.vsix
+          VSDebuggerMCP/bin/Release/VSDebuggerMCP.VS2026.vsix
         if-no-files-found: error
 
   build-rider:
