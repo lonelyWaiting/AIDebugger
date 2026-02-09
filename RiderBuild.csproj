@@ -13,11 +13,23 @@
   <PropertyGroup>
     <GradleProjectDir>$(MSBuildProjectDirectory)\RiderDebuggerMCP</GradleProjectDir>
     <GradleWrapper>$(GradleProjectDir)\gradlew.bat</GradleWrapper>
-    <GradleBuildId>$([System.Guid]::NewGuid().ToString("N"))</GradleBuildId>
+    <!--
+      Build directory strategy:
+      - If AIDB_GRADLE_BUILD_ID is set (e.g. from CI), use build-<id> for isolation.
+      - Otherwise use the default 'build' directory for incremental compilation.
+    -->
+    <GradleBuildId Condition="'$(AIDB_GRADLE_BUILD_ID)' != ''">$(AIDB_GRADLE_BUILD_ID)</GradleBuildId>
     <GradleUserHome>$(TEMP)\AIDebuggerGradle\cache</GradleUserHome>
-    <GradleCommand Condition="Exists('$(GradleWrapper)')">"$(GradleWrapper)" -p "$(GradleProjectDir)" --no-daemon --gradle-user-home "$(GradleUserHome)"</GradleCommand>
-    <GradleCommand Condition="'$(GradleCommand)' == ''">gradle -p "$(GradleProjectDir)" --no-daemon --gradle-user-home "$(GradleUserHome)"</GradleCommand>
-    <RiderBuildDir>$(GradleProjectDir)\build-$(GradleBuildId)</RiderBuildDir>
+    <!--
+      Local builds: let gradle.properties control daemon (daemon=true for warm JVM reuse).
+      CI builds: pass ==no-daemon explicitly via AIDB_GRADLE_BUILD_ID presence.
+    -->
+    <GradleDaemonArg Condition="'$(GradleBuildId)' != ''">--no-daemon</GradleDaemonArg>
+    <GradleDaemonArg Condition="'$(GradleBuildId)' == ''"></GradleDaemonArg>
+    <GradleCommand Condition="Exists('$(GradleWrapper)')">"$(GradleWrapper)" -p "$(GradleProjectDir)" $(GradleDaemonArg) --gradle-user-home "$(GradleUserHome)"</GradleCommand>
+    <GradleCommand Condition="'$(GradleCommand)' == ''">gradle -p "$(GradleProjectDir)" $(GradleDaemonArg) --gradle-user-home "$(GradleUserHome)"</GradleCommand>
+    <RiderBuildDir Condition="'$(GradleBuildId)' != ''">$(GradleProjectDir)\build-$(GradleBuildId)</RiderBuildDir>
+    <RiderBuildDir Condition="'$(GradleBuildId)' == ''">$(GradleProjectDir)\build</RiderBuildDir>
     <RiderPluginOutputDir>$(RiderBuildDir)\distributions</RiderPluginOutputDir>
     <RiderBuildRetention>3</RiderBuildRetention>
     <!--
@@ -51,8 +63,9 @@
   <!-- Set GradleEnvironment after JBR detection -->
   <Target Name="SetGradleEnvironment" BeforeTargets="BuildRiderPlugin" DependsOnTargets="DetectRiderJbr">
     <PropertyGroup>
-      <GradleEnvironment>GRADLE_USER_HOME=$(GradleUserHome);AIDB_GRADLE_BUILD_ID=$(GradleBuildId)</GradleEnvironment>
-      <GradleEnvironment Condition="'$(RiderJbrHome)' != ''">JAVA_HOME=$(RiderJbrHome);GRADLE_USER_HOME=$(GradleUserHome);AIDB_GRADLE_BUILD_ID=$(GradleBuildId)</GradleEnvironment>
+      <GradleEnvironment Condition="'$(GradleBuildId)' != ''">GRADLE_USER_HOME=$(GradleUserHome);AIDB_GRADLE_BUILD_ID=$(GradleBuildId)</GradleEnvironment>
+      <GradleEnvironment Condition="'$(GradleBuildId)' == ''">GRADLE_USER_HOME=$(GradleUserHome)</GradleEnvironment>
+      <GradleEnvironment Condition="'$(RiderJbrHome)' != ''">JAVA_HOME=$(RiderJbrHome);$(GradleEnvironment)</GradleEnvironment>
     </PropertyGroup>
   </Target>
 
@@ -67,7 +80,8 @@
     <Error Condition="'@(RiderPluginZips)' == ''" Text="Rider plugin build failed: no ZIP found in $(RiderPluginOutputDir)." />
   </Target>
 
-  <Target Name="CleanupRiderBuilds" AfterTargets="BuildRiderPlugin">
+  <!-- Only clean up GUID-based build dirs; the default 'build' dir is kept for incremental builds -->
+  <Target Name="CleanupRiderBuilds" AfterTargets="BuildRiderPlugin" Condition="'$(GradleBuildId)' != ''">
     <Message Importance="low" Text="Cleaning old Rider build directories (keeping last $(RiderBuildRetention))." />
     <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -Command &quot;$root='$(GradleProjectDir)'; if (Test-Path $root) { $current=[System.IO.Path]::GetFullPath('$(RiderBuildDir)'); $keep=[Math]::Max([int]'$(RiderBuildRetention)',1); $dirs=Get-ChildItem -Path $root -Directory -Filter 'build-*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending; $kept=$dirs | Select-Object -First $keep; $toDelete=$dirs | Where-Object { $kept -notcontains $_ -and $_.FullName -ne $current }; foreach ($dir in $toDelete) { try { Get-ChildItem -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Attributes = 'Normal' }; Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction Stop } catch { Write-Host ('CleanupRiderBuilds: failed to delete ' + $dir.FullName + ': ' + $_.Exception.Message) } if (Test-Path $dir.FullName) { Write-Host ('CleanupRiderBuilds: still exists ' + $dir.FullName) } } }&quot;" />
   </Target>

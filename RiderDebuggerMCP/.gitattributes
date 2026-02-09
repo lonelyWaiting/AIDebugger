@@ -1,0 +1,3 @@
+# Ensure Unix shell scripts keep LF line endings on all platforms
+*.sh    text eol=lf
+gradlew text eol=lf
