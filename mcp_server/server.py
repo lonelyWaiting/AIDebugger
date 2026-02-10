@@ -1160,8 +1160,12 @@ async def search_memory(
         start_address: 搜索起始地址（十六进制如0x7ff61234或表达式如&myVar）
         pattern: 搜索模式，可以是十六进制字节(如"4D 5A")或ASCII字符串
         max_results: 最大返回结果数，默认100
-        search_size: 搜索范围大小（字节），默认64KB
+        search_size: 搜索范围大小（字节），默认64KB，最大10MB
     """
+    # Clamp parameters to safe ranges
+    search_size = max(1, min(search_size, 10 * 1024 * 1024))  # max 10 MB
+    max_results = max(1, min(max_results, 10000))
+    
     try:
         result = await ide_bridge.call("search_memory", {
             "startAddress": start_address,

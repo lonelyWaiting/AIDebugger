@@ -22,6 +22,7 @@ namespace VSDebuggerMCP
     {
         private const string PipeNamePrefix = "AIDebuggerVS";
         private const int MaxConnections = 10;
+        private const int MaxMessageSize = 10 * 1024 * 1024; // 10 MB per message
         
         // Unique pipe name for this VS instance (includes process ID)
         private readonly string _pipeName;
@@ -31,8 +32,8 @@ namespace VSDebuggerMCP
         private readonly CancellationTokenSource _cts;
         private readonly JavaScriptSerializer _serializer;
         private readonly List<Task> _connectionTasks;
-        private bool _isRunning;
-        private bool _disposed;
+        private volatile bool _isRunning;
+        private volatile bool _disposed;
 
         /// <summary>
         /// Gets the unique pipe name for this VS instance.
@@ -242,9 +243,9 @@ namespace VSDebuggerMCP
 
                     while (pipeServer.IsConnected && !cancellationToken.IsCancellationRequested)
                     {
-                        // Read request
-                        string requestLine = await reader.ReadLineAsync();
-                        if (string.IsNullOrEmpty(requestLine))
+                        // Read request with size limit to prevent OOM from malicious/buggy clients
+                        string requestLine = await ReadLineWithLimitAsync(reader, MaxMessageSize);
+                        if (requestLine == null)
                         {
                             break;
                         }
@@ -274,6 +275,52 @@ namespace VSDebuggerMCP
             catch (Exception ex)
             {
                 _log($"Error handling connection: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Reads a line from the stream with a maximum size limit.
+        /// Returns null on end-of-stream or empty input. Throws IOException if limit exceeded.
+        /// </summary>
+        private static async Task<string> ReadLineWithLimitAsync(StreamReader reader, int maxSize)
+        {
+            var sb = new StringBuilder();
+            var buffer = new char[4096];
+            
+            while (true)
+            {
+                int ch = reader.Peek();
+                if (ch == -1)
+                {
+                    // End of stream
+                    return sb.Length > 0 ? sb.ToString() : null;
+                }
+
+                int read = await reader.ReadAsync(buffer, 0, Math.Min(buffer.Length, maxSize - sb.Length + 1));
+                if (read == 0)
+                {
+                    return sb.Length > 0 ? sb.ToString() : null;
+                }
+
+                for (int i = 0; i < read; i++)
+                {
+                    char c = buffer[i];
+                    if (c == '\n')
+                    {
+                        // End of line found - return what we have (trim trailing \r if present)
+                        string result = sb.ToString();
+                        if (result.Length > 0 && result[result.Length - 1] == '\r')
+                            result = result.Substring(0, result.Length - 1);
+                        return result.Length > 0 ? result : null;
+                    }
+                    
+                    sb.Append(c);
+                    
+                    if (sb.Length > maxSize)
+                    {
+                        throw new IOException($"Message exceeds maximum size of {maxSize} bytes");
+                    }
+                }
             }
         }
 
@@ -609,8 +656,10 @@ namespace VSDebuggerMCP
             catch (Exception ex)
             {
                 _log($"Error serializing response: {ex.Message}");
-                // Fallback to simple error JSON
-                return $"{{\"id\":\"{response?.Id}\",\"error\":{{\"code\":\"SERIALIZE_ERROR\",\"message\":\"{ex.Message.Replace("\"", "\\\"")}\"}}}}";
+                // Fallback to simple error JSON with proper escaping
+                string safeId = EscapeJsonString(response?.Id);
+                string safeMessage = EscapeJsonString(ex.Message);
+                return $"{{\"id\":\"{safeId}\",\"error\":{{\"code\":\"SERIALIZE_ERROR\",\"message\":\"{safeMessage}\"}}}}";
             }
         }
 
@@ -634,6 +683,38 @@ namespace VSDebuggerMCP
             return value.Equals("strict", StringComparison.OrdinalIgnoreCase) ||
                    value.Equals("same_user", StringComparison.OrdinalIgnoreCase) ||
                    value.Equals("owner_only", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Escapes a string for safe inclusion in a JSON string value.
+        /// Handles quotes, backslashes, newlines, tabs, and other control characters.
+        /// </summary>
+        private static string EscapeJsonString(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return value ?? "";
+
+            var sb = new StringBuilder(value.Length);
+            foreach (char c in value)
+            {
+                switch (c)
+                {
+                    case '"':  sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    default:
+                        if (c < ' ')
+                            sb.AppendFormat("\\u{0:X4}", (int)c);
+                        else
+                            sb.Append(c);
+                        break;
+                }
+            }
+            return sb.ToString();
         }
     }
 }

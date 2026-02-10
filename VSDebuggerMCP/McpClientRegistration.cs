@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Web.Script.Serialization;
 using System.Collections.Generic;
 
@@ -378,6 +379,9 @@ namespace VSDebuggerMCP
                 log($"[{ClientNameOpenCode}] MCP server path: {serverPath}");
                 log($"[{ClientNameOpenCode}] Python runtime: {pythonRuntime.VersionText} via '{pythonRuntime.Command}'");
 
+                // Use a named mutex to prevent concurrent read-modify-write from multiple IDE instances
+                WithConfigFileLock(configPath, log, () =>
+                {
                 // Read existing config or create new one
                 Dictionary<string, object> config;
                 if (File.Exists(configPath))
@@ -422,7 +426,7 @@ namespace VSDebuggerMCP
                         result.Success = true;
                         result.AlreadyRegistered = true;
                         result.Message = "Already registered";
-                        return result;
+                        return;
                     }
                     log($"[{ClientNameOpenCode}] MCP server '{entryName}' exists but needs update...");
                 }
@@ -465,6 +469,7 @@ namespace VSDebuggerMCP
                 result.Message = $"Successfully registered. Please restart {ClientNameOpenCode} to use the AIDebugger tools.";
                 result.ConfigPath = configPath;
                 result.ServerPath = serverPath;
+                }); // end WithConfigFileLock
 
                 return result;
             }
@@ -607,6 +612,9 @@ namespace VSDebuggerMCP
                     }
                 }
 
+                // Use a named mutex to prevent concurrent read-modify-write from multiple IDE instances
+                WithConfigFileLock(configPath, log, () =>
+                {
                 // Read existing config or create new one
                 Dictionary<string, object> config;
                 if (File.Exists(configPath))
@@ -691,7 +699,7 @@ namespace VSDebuggerMCP
                     result.Success = true;
                     result.AlreadyRegistered = true;
                     result.Message = "Already registered";
-                    return result;
+                    return;
                 }
 
                 // Write updated config
@@ -706,6 +714,7 @@ namespace VSDebuggerMCP
                 result.Message = $"Successfully registered. Please restart {clientName} to use the AIDebugger tools.";
                 result.ConfigPath = configPath;
                 result.ServerPath = serverPath;
+                }); // end WithConfigFileLock
 
                 return result;
             }
@@ -787,6 +796,8 @@ namespace VSDebuggerMCP
                     return true;
                 }
 
+                WithConfigFileLock(configPath, log, () =>
+                {
                 var existingJson = File.ReadAllText(configPath, Encoding.UTF8);
                 var serializer = new JavaScriptSerializer();
                 var config = serializer.Deserialize<Dictionary<string, object>>(existingJson);
@@ -794,14 +805,14 @@ namespace VSDebuggerMCP
                 if (config == null || !config.ContainsKey("mcp"))
                 {
                     log("No mcp in config, nothing to unregister");
-                    return true;
+                    return;
                 }
 
                 var mcpServers = config["mcp"] as Dictionary<string, object>;
                 if (mcpServers == null)
                 {
                     log("mcp is not a valid object, nothing to unregister");
-                    return true;
+                    return;
                 }
 
                 bool removed = false;
@@ -818,13 +829,15 @@ namespace VSDebuggerMCP
                 if (!removed)
                 {
                     log("No AIDebugger MCP servers found in config, nothing to unregister");
-                    return true;
+                    return;
                 }
 
                 var json = FormatJson(serializer.Serialize(config));
                 File.WriteAllText(configPath, json, Encoding.UTF8);
 
                 log($"Successfully unregistered AIDebugger from {ClientNameOpenCode}");
+                }); // end WithConfigFileLock
+
                 return true;
             }
             catch (Exception ex)
@@ -840,6 +853,7 @@ namespace VSDebuggerMCP
         private static bool UnregisterFromConfig(string configPath, string clientName, Action<string> log)
         {
             log = log ?? ((s) => { });
+            bool success = true;
 
             try
             {
@@ -849,6 +863,8 @@ namespace VSDebuggerMCP
                     return true;
                 }
 
+                WithConfigFileLock(configPath, log, () =>
+                {
                 var existingJson = File.ReadAllText(configPath, Encoding.UTF8);
                 var serializer = new JavaScriptSerializer();
                 var config = serializer.Deserialize<Dictionary<string, object>>(existingJson);
@@ -856,14 +872,14 @@ namespace VSDebuggerMCP
                 if (config == null || !config.ContainsKey("mcpServers"))
                 {
                     log("No mcpServers in config, nothing to unregister");
-                    return true;
+                    return;
                 }
 
                 var mcpServers = config["mcpServers"] as Dictionary<string, object>;
                 if (mcpServers == null)
                 {
                     log("mcpServers is not a valid object, nothing to unregister");
-                    return true;
+                    return;
                 }
 
                 bool removed = false;
@@ -880,14 +896,16 @@ namespace VSDebuggerMCP
                 if (!removed)
                 {
                     log("No AIDebugger MCP servers found in config, nothing to unregister");
-                    return true;
+                    return;
                 }
 
                 var json = FormatJson(serializer.Serialize(config));
                 File.WriteAllText(configPath, json, Encoding.UTF8);
 
                 log($"Successfully unregistered AIDebugger from {clientName}");
-                return true;
+                }); // end WithConfigFileLock
+
+                return success;
             }
             catch (Exception ex)
             {
@@ -1035,6 +1053,47 @@ namespace VSDebuggerMCP
             }
 
             return false;
+        }
+
+        /// <summary>
+        /// Creates a named Mutex based on a config file path to prevent concurrent read-modify-write.
+        /// Multiple VS/Rider instances may try to register/unregister simultaneously against the same config file.
+        /// </summary>
+        private static Mutex GetConfigFileMutex(string configPath)
+        {
+            // Use a sanitized version of the absolute path as the mutex name
+            var normalizedPath = Path.GetFullPath(configPath).ToLowerInvariant().Replace('\\', '/');
+            var mutexName = "Global\\AIDebugger_Config_" + normalizedPath.GetHashCode().ToString("X8");
+            return new Mutex(false, mutexName);
+        }
+
+        /// <summary>
+        /// Safely reads, modifies, and writes a config file under a named mutex.
+        /// The modifyAction receives the parsed config dictionary and should return true if changes were made.
+        /// </summary>
+        private static void WithConfigFileLock(string configPath, Action<string> log, Action action)
+        {
+            using (var mutex = GetConfigFileMutex(configPath))
+            {
+                bool acquired = false;
+                try
+                {
+                    acquired = mutex.WaitOne(TimeSpan.FromSeconds(10));
+                    if (!acquired)
+                    {
+                        log("Warning: Could not acquire config file lock within 10 seconds, proceeding anyway");
+                    }
+                    action();
+                }
+                finally
+                {
+                    if (acquired)
+                    {
+                        try { mutex.ReleaseMutex(); }
+                        catch (ApplicationException) { /* mutex not owned */ }
+                    }
+                }
+            }
         }
     }
 

@@ -977,38 +977,33 @@ namespace VSDebuggerMCP
                 if (nameRva == 0)
                     return null;
                 
-                // Read the name string (up to 256 chars)
-                var nameBuilder = new System.Text.StringBuilder();
-                for (int i = 0; i < 256; i++)
+                // Read the name string using bulk memory read instead of char-by-char IPC
+                const int maxNameLen = 256;
+                ulong nameAddress;
+                try
                 {
-                    var charExpr = debugger.GetExpression($"*(char*)({baseAddress} + {nameRva} + {i})");
-                    if (charExpr == null || !charExpr.IsValidValue)
-                        break;
-                    
-                    // Parse char value
-                    string charVal = charExpr.Value.Trim();
-                    int charCode = 0;
-                    
-                    if (charVal.StartsWith("'") && charVal.EndsWith("'") && charVal.Length >= 3)
-                    {
-                        charCode = charVal[1];
-                    }
-                    else if (charVal.StartsWith("0x"))
-                    {
-                        charCode = Convert.ToInt32(charVal, 16);
-                    }
-                    else if (int.TryParse(charVal, out int parsed))
-                    {
-                        charCode = parsed;
-                    }
-                    
-                    if (charCode == 0)
-                        break;
-                    
-                    nameBuilder.Append((char)charCode);
+                    var nameAddrExpr = debugger.GetExpression($"(unsigned __int64)({baseAddress} + {nameRva})");
+                    if (nameAddrExpr == null || !nameAddrExpr.IsValidValue)
+                        return null;
+                    nameAddress = ParseAddress(nameAddrExpr.Value);
+                    if (nameAddress == 0)
+                        return null;
+                }
+                catch
+                {
+                    return null;
                 }
                 
-                string name = nameBuilder.ToString();
+                byte[] nameBytes = ReadMemoryBlockOptimized(debugger, nameAddress, maxNameLen);
+                if (nameBytes == null || nameBytes.Length == 0)
+                    return null;
+                
+                // Find null terminator
+                int nameLen = Array.IndexOf(nameBytes, (byte)0);
+                if (nameLen < 0) nameLen = nameBytes.Length;
+                if (nameLen == 0) return null;
+                
+                string name = System.Text.Encoding.ASCII.GetString(nameBytes, 0, nameLen);
                 return string.IsNullOrEmpty(name) ? null : name;
             }
             catch (Exception ex)
@@ -1456,8 +1451,18 @@ namespace VSDebuggerMCP
                 return false;
             }
 
-            var numericTypes = new[] { "int", "uint", "long", "ulong", "short", "ushort", "byte", "sbyte", "IntPtr", "UIntPtr", "nint", "nuint" };
-            return numericTypes.Any(t => type.Contains(t));
+            // Strip pointer/reference/array suffixes and whitespace for matching
+            string cleanType = type.TrimEnd(' ', '*', '&', '[', ']');
+
+            var numericTypes = new HashSet<string>(StringComparer.Ordinal)
+            {
+                "int", "uint", "long", "ulong", "short", "ushort", "byte", "sbyte",
+                "IntPtr", "UIntPtr", "nint", "nuint",
+                "System.Int32", "System.UInt32", "System.Int64", "System.UInt64",
+                "System.Int16", "System.UInt16", "System.Byte", "System.SByte",
+                "System.IntPtr", "System.UIntPtr"
+            };
+            return numericTypes.Contains(cleanType);
         }
 
         private List<string> NormalizeExpressions(IEnumerable<string> expressions)
@@ -2071,6 +2076,7 @@ namespace VSDebuggerMCP
         /// </summary>
         private byte[] ReadMemoryBlockOptimized(EnvDTE.Debugger debugger, ulong address, int size)
         {
+            ThreadHelper.ThrowIfNotOnUIThread();
             var result = new List<byte>();
 
             // Read in 4-byte chunks (DWORD at a time)
@@ -2534,15 +2540,35 @@ namespace VSDebuggerMCP
 
         public FullContextResult GetFullContext()
         {
-            return new FullContextResult
+            return ExecuteOnMainThread(() =>
             {
-                Status = GetDebugStatus(),
-                Callstack = GetCallStack(),
-                Locals = GetLocals(),
-                Exception = GetException(),
-                Threads = GetThreads(),
-                Modules = GetModules()
-            };
+                ThreadHelper.ThrowIfNotOnUIThread();
+                var debugger = Debugger;
+                var fullContext = new FullContextResult();
+                
+                // Build all results in a single UI thread acquisition for atomicity
+                try { fullContext.Status = BuildDebugStatus(debugger); }
+                catch (Exception ex) { _log($"GetFullContext: Status failed: {ex.Message}"); }
+                
+                try
+                {
+                    if (debugger?.CurrentMode == dbgDebugMode.dbgBreakMode)
+                    {
+                        fullContext.Callstack = BuildCallStackResult(debugger);
+                        fullContext.Locals = BuildLocalsResult(debugger, 2);
+                        fullContext.Threads = BuildThreadsResult(debugger);
+                    }
+                }
+                catch (Exception ex) { _log($"GetFullContext: Debug data failed: {ex.Message}"); }
+                
+                try { fullContext.Exception = BuildExceptionResult(debugger); }
+                catch (Exception ex) { _log($"GetFullContext: Exception failed: {ex.Message}"); }
+                
+                try { fullContext.Modules = BuildModulesResult(debugger); }
+                catch (Exception ex) { _log($"GetFullContext: Modules failed: {ex.Message}"); }
+                
+                return fullContext;
+            });
         }
 
         public DebugBundleResult CaptureDebugBundle(List<string> expressions = null, bool expandChildren = false, int maxDepth = 2, int outputTailLines = 80)
@@ -2991,9 +3017,8 @@ namespace VSDebuggerMCP
                     result.Success = true;
                     result.Message = "Stepped into";
                     
-                    // Get new location after step
-                    System.Threading.Thread.Sleep(100); // Brief wait for debugger to settle
-                    if (debugger.CurrentStackFrame != null)
+                    // Wait for debugger to re-enter break mode before reading location
+                    if (WaitForBreakMode(debugger, 2000) && debugger.CurrentStackFrame != null)
                     {
                         result.NewLocation = new LocationInfo
                         {
@@ -3037,8 +3062,7 @@ namespace VSDebuggerMCP
                     result.Success = true;
                     result.Message = "Stepped over";
                     
-                    System.Threading.Thread.Sleep(100);
-                    if (debugger.CurrentStackFrame != null)
+                    if (WaitForBreakMode(debugger, 2000) && debugger.CurrentStackFrame != null)
                     {
                         result.NewLocation = new LocationInfo
                         {
@@ -3082,8 +3106,7 @@ namespace VSDebuggerMCP
                     result.Success = true;
                     result.Message = "Stepped out";
                     
-                    System.Threading.Thread.Sleep(100);
-                    if (debugger.CurrentStackFrame != null)
+                    if (WaitForBreakMode(debugger, 2000) && debugger.CurrentStackFrame != null)
                     {
                         result.NewLocation = new LocationInfo
                         {
@@ -3341,10 +3364,11 @@ namespace VSDebuggerMCP
                 // Just warn but don't reject
             }
 
-            // C# specific: check for using statements, namespace declarations, etc.
+            // C# specific: check for using directives (not using declarations/statements), namespace declarations, etc.
             if (extension == ".cs")
             {
-                if (targetLine.StartsWith("using ") && targetLine.EndsWith(";"))
+                // Only reject top-level "using Namespace;" directives, not "using var x = ..." declarations
+                if (targetLine.StartsWith("using ") && targetLine.EndsWith(";") && !targetLine.Contains("=") && !targetLine.Contains("("))
                 {
                     return (false, $"Line {lineNumber} is a using directive - cannot set execution point on using statement");
                 }
@@ -3526,7 +3550,7 @@ namespace VSDebuggerMCP
                     bool deleted = false;
                     foreach (EnvDTE.Breakpoint bp in debugger.Breakpoints)
                     {
-                        if (bp.File == filePath && bp.FileLine == lineNumber)
+                        if (string.Equals(bp.File, filePath, StringComparison.OrdinalIgnoreCase) && bp.FileLine == lineNumber)
                         {
                             bp.Delete();
                             deleted = true;
@@ -3561,7 +3585,13 @@ namespace VSDebuggerMCP
                 try
                 {
                     int count = debugger.Breakpoints.Count;
+                    // Collect breakpoints first to avoid modifying collection during enumeration
+                    var breakpointsToDelete = new List<EnvDTE.Breakpoint>();
                     foreach (EnvDTE.Breakpoint bp in debugger.Breakpoints)
+                    {
+                        breakpointsToDelete.Add(bp);
+                    }
+                    foreach (var bp in breakpointsToDelete)
                     {
                         bp.Delete();
                     }
@@ -3595,7 +3625,7 @@ namespace VSDebuggerMCP
                     bool found = false;
                     foreach (EnvDTE.Breakpoint bp in debugger.Breakpoints)
                     {
-                        if (bp.File == filePath && bp.FileLine == lineNumber)
+                        if (string.Equals(bp.File, filePath, StringComparison.OrdinalIgnoreCase) && bp.FileLine == lineNumber)
                         {
                             bp.Enabled = enabled;
                             found = true;
@@ -3980,9 +4010,11 @@ namespace VSDebuggerMCP
 
             // Parse pattern (hex bytes like "4D 5A" or string)
             byte[] patternBytes;
-            if (pattern.Contains(" ") || (pattern.Length % 2 == 0 && pattern.All(c => "0123456789ABCDEFabcdef".Contains(c))))
+            // Hex pattern: contains spaces between byte pairs (e.g., "4D 5A 90 00")
+            // or is exactly 2 hex chars (a single byte like "4D")
+            if (pattern.Contains(" ") && pattern.Replace(" ", "").All(c => "0123456789ABCDEFabcdef".Contains(c)))
             {
-                // Hex pattern
+                // Space-separated hex bytes
                 var hexBytes = pattern.Replace(" ", "").Trim();
                 if (hexBytes.Length % 2 != 0)
                 {
@@ -3994,7 +4026,7 @@ namespace VSDebuggerMCP
             }
             else
             {
-                // String pattern (ASCII)
+                // String pattern (ASCII) — treat non-space-separated input as literal text
                 patternBytes = System.Text.Encoding.ASCII.GetBytes(pattern);
             }
 
@@ -4281,7 +4313,7 @@ namespace VSDebuggerMCP
                     {
                         try
                         {
-                            regex = new Regex(pattern, RegexOptions.IgnoreCase);
+                            regex = new Regex(pattern, RegexOptions.IgnoreCase, TimeSpan.FromSeconds(5));
                         }
                         catch (Exception ex)
                         {
@@ -4492,24 +4524,7 @@ namespace VSDebuggerMCP
                 {
                     try
                     {
-                        // Try to get from active document if this is the current frame
-                        var debugger = Debugger;
-                        if (debugger != null && debugger.CurrentStackFrame == frame)
-                        {
-                            var activeDoc = _dte.ActiveDocument;
-                            if (activeDoc != null && !string.IsNullOrEmpty(activeDoc.FullName))
-                            {
-                                // Verify the file is a source file
-                                if (activeDoc.FullName.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) ||
-                                    activeDoc.FullName.EndsWith(".vb", StringComparison.OrdinalIgnoreCase) ||
-                                    activeDoc.FullName.EndsWith(".fs", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    return activeDoc.FullName;
-                                }
-                            }
-                        }
-                        
-                        // Try to find source file by class name
+                        // Try to find source file by class name (more reliable than ActiveDocument)
                         var parts = ParseFunctionName(frame.FunctionName);
                         if (!string.IsNullOrEmpty(parts.TypeName) || !string.IsNullOrEmpty(parts.ClassName))
                         {
@@ -4517,6 +4532,23 @@ namespace VSDebuggerMCP
                             if (!string.IsNullOrEmpty(filePath))
                             {
                                 return filePath;
+                            }
+                        }
+
+                        // Fallback: use ActiveDocument only if this is the current frame 
+                        // and the document matches the function name
+                        var debugger = Debugger;
+                        if (debugger != null && debugger.CurrentStackFrame == frame)
+                        {
+                            var activeDoc = _dte.ActiveDocument;
+                            if (activeDoc != null && !string.IsNullOrEmpty(activeDoc.FullName))
+                            {
+                                if (activeDoc.FullName.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) ||
+                                    activeDoc.FullName.EndsWith(".vb", StringComparison.OrdinalIgnoreCase) ||
+                                    activeDoc.FullName.EndsWith(".fs", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    return activeDoc.FullName;
+                                }
                             }
                         }
                     }
@@ -4599,23 +4631,17 @@ namespace VSDebuggerMCP
                 string language = frame.Language ?? "";
                 bool isManagedCode = language == "C#" || language == "VB" || language == "F#" || language == "Basic";
 
-                // Method 1: For managed code current frame, use active document cursor position
+                // Method 1: For managed code current frame, use the debugger's current statement position
                 if (isManagedCode && isCurrentFrame)
                 {
                     try
                     {
-                        var activeDoc = _dte.ActiveDocument;
-                        if (activeDoc != null)
+                        // Use DTE's debugger to get the actual execution line, not the cursor position
+                        if (debugger != null)
                         {
-                            var textDoc = activeDoc.Object("TextDocument") as EnvDTE.TextDocument;
-                            if (textDoc != null && textDoc.Selection != null)
-                            {
-                                int line = textDoc.Selection.ActivePoint.Line;
-                                if (line > 0)
-                                {
-                                    return (line, true);
-                                }
-                            }
+                            // The debugger.CurrentStackFrame is the authoritative source for the execution line.
+                            // We attempt to read it via the context below (Method 3 fallback).
+                            // ActiveDocument cursor position is NOT reliable — user may have scrolled/clicked elsewhere.
                         }
                     }
                     catch (Exception ex)
@@ -5166,8 +5192,38 @@ namespace VSDebuggerMCP
             }
         }
 
+        /// <summary>
+        /// Waits for the debugger to re-enter break mode after a step operation.
+        /// Returns true if break mode was reached within the timeout.
+        /// </summary>
+        private bool WaitForBreakMode(Debugger5 debugger, int timeoutMs)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                try
+                {
+                    if (debugger.CurrentMode == dbgDebugMode.dbgBreakMode)
+                        return true;
+                }
+                catch
+                {
+                    // Debugger state may be in transition
+                }
+                System.Threading.Thread.Sleep(10);
+            }
+            return false;
+        }
+
         private T ExecuteOnMainThread<T>(Func<T> action)
         {
+            // If already on UI thread, execute directly to avoid deadlock
+            if (ThreadHelper.CheckAccess())
+            {
+                return action();
+            }
+
             T result = default(T);
             Exception capturedException = null;
             
