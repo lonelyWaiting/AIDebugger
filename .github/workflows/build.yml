@@ -101,7 +101,7 @@ jobs:
         cache-read-only: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
         # Rider SDK is cached separately above with a more stable key.
         # Exclude it from setup-gradle's cache to avoid redundant storage.
-        cache-exclude: |
+        gradle-home-cache-excludes: |
           caches/modules-2/files-2.1/com.jetbrains.intellij.rider
 
     - name: Build Rider plugin
