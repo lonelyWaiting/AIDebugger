@@ -86,6 +86,16 @@ jobs:
         distribution: temurin
         java-version: '21'
 
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v4
+      with:
+        validate-wrappers: true
+        cache-read-only: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
+        # Rider SDK is cached separately below with a more stable key.
+        # Exclude it from setup-gradle's cache to avoid redundant storage.
+        gradle-home-cache-excludes: |
+          caches/modules-2/files-2.1/com.jetbrains.intellij.rider
+
     - name: Cache Rider SDK
       uses: actions/cache@v4
       with:
@@ -93,16 +103,6 @@ jobs:
         key: rider-sdk-${{ hashFiles('RiderDebuggerMCP/gradle.properties') }}
         restore-keys: |
           rider-sdk-
-
-    - name: Setup Gradle
-      uses: gradle/actions/setup-gradle@v4
-      with:
-        validate-wrappers: true
-        cache-read-only: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
-        # Rider SDK is cached separately above with a more stable key.
-        # Exclude it from setup-gradle's cache to avoid redundant storage.
-        gradle-home-cache-excludes: |
-          caches/modules-2/files-2.1/com.jetbrains.intellij.rider
 
     - name: Build Rider plugin
       run: ./RiderDebuggerMCP/gradlew -p RiderDebuggerMCP buildPlugin --no-daemon
