@@ -446,11 +446,12 @@ async def get_callstack() -> str:
 # ============== Variables Tools ==============
 
 @mcp.tool()
-async def get_locals() -> str:
+async def get_locals(depth: int = 2) -> str:
     """
     获取当前栈帧的所有局部变量和参数，包含变量名、类型和当前值。
     
-    无需任何参数。
+    Args:
+        depth: 变量展开深度（0-10），默认2。值越大展开的子成员层级越多。
     
     返回示例:
     ```json
@@ -465,7 +466,7 @@ async def get_locals() -> str:
     **触发场景**: 当用户询问"变量值是什么"、"参数是多少"、"局部变量"、"当前状态"时调用此工具。
     """
     try:
-        result = await ide_bridge.call("get_locals")
+        result = await ide_bridge.call("get_locals", {"depth": max(0, min(depth, 10))})
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_locals")

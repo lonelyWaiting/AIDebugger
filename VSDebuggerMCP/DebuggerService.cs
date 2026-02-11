@@ -321,6 +321,7 @@ namespace VSDebuggerMCP
             result.ThreadName = currentThread.Name ?? $"Thread {currentThread.ID}";
 
             int index = 0;
+            const int maxArgumentFrames = 5;
             try
             {
                 foreach (EnvDTE.StackFrame frame in currentThread.StackFrames)
@@ -328,9 +329,9 @@ namespace VSDebuggerMCP
                     try
                     {
                         var lineInfo = GetFrameLineNumberEx(frame);
-                        result.Frames.Add(new StackFrameInfo
+                        var frameInfo = new StackFrameInfo
                         {
-                            Index = index++,
+                            Index = index,
                             FunctionName = frame.FunctionName,
                             FilePath = GetFrameFileName(frame),
                             LineNumber = lineInfo.LineNumber,
@@ -339,7 +340,37 @@ namespace VSDebuggerMCP
                             Module = frame.Module,
                             Language = frame.Language,
                             ReturnType = frame.ReturnType
-                        });
+                        };
+
+                        if (index < maxArgumentFrames)
+                        {
+                            try
+                            {
+                                var args = new List<VariableInfo>();
+                                foreach (EnvDTE.Expression arg in frame.Arguments)
+                                {
+                                    args.Add(new VariableInfo
+                                    {
+                                        Name = arg.Name,
+                                        Type = arg.Type,
+                                        Value = arg.Value,
+                                        HasChildren = false,
+                                        IsReadOnly = true
+                                    });
+                                }
+                                if (args.Count > 0)
+                                {
+                                    frameInfo.Arguments = args;
+                                }
+                            }
+                            catch
+                            {
+                                // Arguments may not be available for this frame
+                            }
+                        }
+
+                        result.Frames.Add(frameInfo);
+                        index++;
                     }
                     catch
                     {
@@ -359,12 +390,12 @@ namespace VSDebuggerMCP
 
         #region Locals
 
-        public LocalsResult GetLocals()
+        public LocalsResult GetLocals(int maxDepth = 2)
         {
             return ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
-                return BuildLocalsResult(Debugger, 2);
+                return BuildLocalsResult(Debugger, Math.Max(0, Math.Min(maxDepth, 10)));
             });
         }
 
@@ -549,6 +580,35 @@ namespace VSDebuggerMCP
                             {
                                 var lineNum = GetFrameLineNumber(topFrame);
                                 threadInfo.Location = $"{topFrame.FunctionName} ({GetFrameFileName(topFrame)}:{lineNum})";
+                            }
+
+                            var framesList = new List<StackFrameInfo>();
+                            int frameIndex = 0;
+                            foreach (EnvDTE.StackFrame frame in thread.StackFrames)
+                            {
+                                try
+                                {
+                                    var lineInfo = GetFrameLineNumberEx(frame);
+                                    framesList.Add(new StackFrameInfo
+                                    {
+                                        Index = frameIndex++,
+                                        FunctionName = frame.FunctionName,
+                                        FilePath = GetFrameFileName(frame),
+                                        LineNumber = lineInfo.LineNumber,
+                                        LineNumberReliable = lineInfo.IsReliable,
+                                        ColumnNumber = 1,
+                                        Module = frame.Module,
+                                        Language = frame.Language,
+                                        ReturnType = frame.ReturnType
+                                    });
+                                }
+                                catch
+                                {
+                                }
+                            }
+                            if (framesList.Count > 0)
+                            {
+                                threadInfo.Frames = framesList;
                             }
                         }
                     }
@@ -1199,16 +1259,27 @@ namespace VSDebuggerMCP
                     result.Source = GetExpressionMemberValue(exceptionExpr, "Source");
                     result.HResult = GetExpressionMemberValue(exceptionExpr, "HResult");
 
-                    var innerExpr = GetExpressionMember(exceptionExpr, "InnerException");
-                    if (innerExpr != null && innerExpr.IsValidValue && innerExpr.Value != "null")
+                    const int maxInnerDepth = 10;
+                    var currentExpr = exceptionExpr;
+                    var currentResult = result;
+                    for (int depth = 0; depth < maxInnerDepth; depth++)
                     {
-                        result.InnerException = new ExceptionResult
+                        var innerExpr = GetExpressionMember(currentExpr, "InnerException");
+                        if (innerExpr == null || !innerExpr.IsValidValue || innerExpr.Value == "null")
+                            break;
+                        var innerResult = new ExceptionResult
                         {
                             HasException = true,
                             Type = innerExpr.Type,
                             Message = GetExpressionMemberValue(innerExpr, "Message"),
+                            StackTrace = GetExpressionMemberValue(innerExpr, "StackTrace"),
+                            Source = GetExpressionMemberValue(innerExpr, "Source"),
+                            HResult = GetExpressionMemberValue(innerExpr, "HResult"),
                             Capability = "full_exception_details"
                         };
+                        currentResult.InnerException = innerResult;
+                        currentResult = innerResult;
+                        currentExpr = innerExpr;
                     }
                 }
             }

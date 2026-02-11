@@ -108,6 +108,9 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "returnType")]
         public string ReturnType { get; set; }
+
+        [DataMember(Name = "arguments")]
+        public List<VariableInfo> Arguments { get; set; }
     }
 
     #endregion
@@ -195,6 +198,9 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "suspendCount")]
         public int SuspendCount { get; set; }
+
+        [DataMember(Name = "frames")]
+        public List<StackFrameInfo> Frames { get; set; }
     }
 
     #endregion

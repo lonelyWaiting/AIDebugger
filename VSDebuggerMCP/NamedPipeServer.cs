@@ -364,7 +364,8 @@ namespace VSDebuggerMCP
                     return _debuggerService.GetCallStack();
 
                 case "get_locals":
-                    return _debuggerService.GetLocals();
+                    int localsDepth = GetParam<int>(request.Params, "depth", 2);
+                    return _debuggerService.GetLocals(localsDepth);
 
                 case "get_threads":
                     return _debuggerService.GetThreads();

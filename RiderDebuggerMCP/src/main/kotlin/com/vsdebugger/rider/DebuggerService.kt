@@ -70,7 +70,10 @@ class DebuggerService {
         return when (method) {
             "get_debug_status" -> getDebugStatus()
             "get_callstack" -> getCallStack()
-            "get_locals" -> getLocals()
+            "get_locals" -> {
+                val depth = getParam(request.params, "depth", 2)
+                getLocals(depth)
+            }
             "get_threads" -> getThreads()
             "get_modules" -> getModules()
             "get_exception" -> getException()
@@ -331,14 +334,14 @@ class DebuggerService {
         return bestEffort
     }
 
-    private fun getLocals(): LocalsResult {
+    private fun getLocals(maxDepth: Int = 2): LocalsResult {
         val session = currentSession() ?: return LocalsResult()
-        return buildLocalsResult(session, 2)
+        return buildLocalsResult(session, maxDepth)
     }
 
     private fun buildLocalsResult(session: XDebugSession, maxDepth: Int): LocalsResult {
         val frame = getSelectedFrame(session) ?: return LocalsResult()
-        val variables = collectVariables(frame, 0, maxDepth.coerceIn(0, 4))
+        val variables = collectVariables(frame, 0, maxDepth.coerceIn(0, 10))
         return LocalsResult(frameIndex = selectedFrameIndex ?: 0, variables = variables.toMutableList())
     }
 
@@ -1653,10 +1656,21 @@ class DebuggerService {
             result.threadId = threadId(stack)
             result.threadName = stack.displayName
         }
+        val maxArgumentFrames = 5
         frames.forEachIndexed { index, frame ->
             val location = getFrameLocation(frame)
             val frameName = getFrameName(frame)
             val inferredLanguage = inferLanguage(location?.filePath, frameName)
+            val arguments = if (index < maxArgumentFrames) {
+                try {
+                    val vars = collectVariables(frame, 0, 1)
+                    vars.toMutableList().takeIf { it.isNotEmpty() }
+                } catch (_: Exception) {
+                    null
+                }
+            } else {
+                null
+            }
             result.frames.add(
                 StackFrameInfo(
                     index = index,
@@ -1667,7 +1681,8 @@ class DebuggerService {
                     columnNumber = location?.columnNumber ?: 1,
                     module = parseModuleFromFrameName(frameName),
                     language = inferredLanguage,
-                    returnType = null
+                    returnType = null,
+                    arguments = arguments
                 )
             )
         }
@@ -1681,6 +1696,30 @@ class DebuggerService {
         stacks.forEach { stack ->
             val id = threadId(stack)
             val location = getStackLocation(stack)
+            val threadFrames = try {
+                val xFrames = collectStackFrames(stack)
+                val frameInfos = mutableListOf<StackFrameInfo>()
+                xFrames.forEachIndexed { index, frame ->
+                    val loc = getFrameLocation(frame)
+                    val frameName = getFrameName(frame)
+                    frameInfos.add(
+                        StackFrameInfo(
+                            index = index,
+                            functionName = frameName,
+                            filePath = loc?.filePath ?: "",
+                            lineNumber = loc?.lineNumber ?: 0,
+                            lineNumberReliable = loc != null,
+                            columnNumber = loc?.columnNumber ?: 1,
+                            module = parseModuleFromFrameName(frameName),
+                            language = inferLanguage(loc?.filePath, frameName),
+                            returnType = null
+                        )
+                    )
+                }
+                frameInfos.takeIf { it.isNotEmpty() }
+            } catch (_: Exception) {
+                null
+            }
             result.threads.add(
                 ThreadInfo(
                     id = id,
@@ -1689,7 +1728,8 @@ class DebuggerService {
                     isFrozen = false,
                     location = location,
                     priority = "unknown",
-                    suspendCount = -1
+                    suspendCount = -1,
+                    frames = threadFrames?.toMutableList()
                 )
             )
         }
@@ -2077,10 +2117,13 @@ class DebuggerService {
         return extractVariableValueByName(variable.children, *names)
     }
 
-    private fun toInnerException(variable: VariableInfo?): ExceptionResult? {
-        if (variable == null) return null
+    private fun toInnerException(variable: VariableInfo?, depth: Int = 0): ExceptionResult? {
+        if (variable == null || depth >= 10) return null
         val message = extractVariableChildValue(variable, "Message") ?: normalizeVariableValue(variable.value)
         if (message.isNullOrBlank()) return null
+
+        val nestedInner = extractVariableByName(variable.children, "InnerException")
+        val innerResult = toInnerException(nestedInner, depth + 1)
 
         return ExceptionResult(
             hasException = true,
@@ -2089,7 +2132,8 @@ class DebuggerService {
             message = message,
             stackTrace = extractVariableChildValue(variable, "StackTrace"),
             source = extractVariableChildValue(variable, "Source"),
-            hResult = extractVariableChildValue(variable, "HResult")
+            hResult = extractVariableChildValue(variable, "HResult"),
+            innerException = innerResult
         )
     }
 

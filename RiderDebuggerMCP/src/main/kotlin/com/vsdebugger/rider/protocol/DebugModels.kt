@@ -42,7 +42,8 @@ data class StackFrameInfo(
     @SerializedName("columnNumber") val columnNumber: Int = 1,
     @SerializedName("module") val module: String? = null,
     @SerializedName("language") val language: String? = null,
-    @SerializedName("returnType") val returnType: String? = null
+    @SerializedName("returnType") val returnType: String? = null,
+    @SerializedName("arguments") val arguments: MutableList<VariableInfo>? = null
 )
 
 // Locals
@@ -79,7 +80,8 @@ data class ThreadInfo(
     @SerializedName("isFrozen") val isFrozen: Boolean = false,
     @SerializedName("location") val location: String? = null,
     @SerializedName("priority") val priority: String? = null,
-    @SerializedName("suspendCount") val suspendCount: Int = 0
+    @SerializedName("suspendCount") val suspendCount: Int = 0,
+    @SerializedName("frames") val frames: MutableList<StackFrameInfo>? = null
 )
 
 // Modules
