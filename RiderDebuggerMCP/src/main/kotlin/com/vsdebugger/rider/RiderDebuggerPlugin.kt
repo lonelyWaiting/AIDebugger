@@ -8,6 +8,7 @@ class RiderDebuggerPlugin : StartupActivity {
         RiderDebuggerServerService.getInstance().ensureStarted()
         McpClientRegistration.registerWithCursor()
         McpClientRegistration.registerWithClaudeDesktop()
+        McpClientRegistration.registerWithClaudeCode()
         McpClientRegistration.registerWithOpenCode()
     }
 }

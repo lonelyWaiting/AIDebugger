@@ -57,7 +57,7 @@ namespace VSDebuggerMCP
 
                 LogMessage("AIDebugger initialized successfully. Named Pipe server is running.");
 
-                // Auto-register with MCP clients (Cursor, Claude Desktop)
+                // Auto-register with MCP clients (Cursor, Claude Desktop, Claude Code, OpenCode)
                 await Task.Run(() => AutoRegisterMcpClients());
             }
             catch (Exception ex)
@@ -101,7 +101,8 @@ namespace VSDebuggerMCP
         }
 
         /// <summary>
-        /// Automatically registers this extension with MCP clients (Cursor, Claude Desktop, OpenCode).
+        /// Automatically registers this extension with MCP clients
+        /// (Cursor, Claude Desktop, Claude Code, OpenCode).
         /// </summary>
         private void AutoRegisterMcpClients()
         {
@@ -128,7 +129,12 @@ namespace VSDebuggerMCP
                 var claudeResult = McpClientRegistration.RegisterWithClaudeDesktop(msg => LogMessage($"[Claude Desktop] {msg}"));
                 HandleRegistrationResult(claudeResult, "Claude Desktop");
 
-                // Step 5: Register with OpenCode
+                // Step 5: Register with Claude Code
+                LogMessage("[Claude Code] Checking MCP registration...");
+                var claudeCodeResult = McpClientRegistration.RegisterWithClaudeCode(msg => LogMessage($"[Claude Code] {msg}"));
+                HandleRegistrationResult(claudeCodeResult, "Claude Code");
+
+                // Step 6: Register with OpenCode
                 LogMessage("[OpenCode] Checking MCP registration...");
                 var openCodeResult = McpClientRegistration.RegisterWithOpenCode(msg => LogMessage(msg));
                 HandleRegistrationResult(openCodeResult, "OpenCode");

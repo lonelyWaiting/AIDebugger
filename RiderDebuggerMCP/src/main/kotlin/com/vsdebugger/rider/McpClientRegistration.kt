@@ -18,6 +18,7 @@ object McpClientRegistration {
     // Client display names for logging
     private const val ClientNameCursor = "Cursor"
     private const val ClientNameClaudeDesktop = "Claude Desktop"
+    private const val ClientNameClaudeCode = "Claude Code"
     private const val ClientNameOpenCode = "OpenCode"
     private const val CursorAllowListSyncScript = "cursor_allowlist_sync.py"
 
@@ -69,6 +70,20 @@ object McpClientRegistration {
             registerToConfig(configPath, serverPath, ClientNameClaudeDesktop, createDirIfMissing = true)
         } catch (ex: Exception) {
             log.warn("Failed to register MCP server with Claude Desktop: ${ex.message}", ex)
+        }
+    }
+    fun registerWithClaudeCode() {
+        try {
+            if (!isPythonAvailable()) {
+                log.warn("Python 3.10+ is required for MCP server registration. Skipping Claude Code registration.")
+                return
+            }
+
+            val serverPath = ensureServerFiles() ?: return
+            val configPath = File(System.getProperty("user.home"), ".claude.json").absolutePath
+            registerToClaudeCodeConfig(configPath, serverPath, ClientNameClaudeCode, createDirIfMissing = true)
+        } catch (ex: Exception) {
+            log.warn("Failed to register MCP server with Claude Code: ${ex.message}", ex)
         }
     }
 
@@ -185,6 +200,42 @@ object McpClientRegistration {
 
         val existing = mcpServers[McpServerName] as? Map<*, *>
         if (isCorrectConfig(existing, normalizedPath)) {
+            log.debug("[$clientName] MCP server '$McpServerName' already registered.")
+            return
+        }
+
+        mcpServers[McpServerName] = serverConfig
+        writeConfig(configPath, config)
+        log.info("[$clientName] Registered MCP server '$McpServerName'.")
+    }
+
+    private fun registerToClaudeCodeConfig(configPath: String, serverPath: String, clientName: String, createDirIfMissing: Boolean) {
+        val configFile = File(configPath)
+        val configDir = configFile.parentFile
+
+        if (configDir != null && !configDir.exists()) {
+            if (createDirIfMissing) {
+                configDir.mkdirs()
+                log.info("[$clientName] Created directory: ${configDir.absolutePath}")
+            } else {
+                log.debug("[$clientName] Directory does not exist, skipping.")
+                return
+            }
+        }
+
+        val config = readConfig(configPath)
+        val mcpServers = getOrCreateMap(config, "mcpServers")
+        val normalizedPath = serverPath.replace("\\", "/")
+
+        val serverConfig = linkedMapOf<String, Any>(
+            "type" to "stdio",
+            "command" to "python",
+            "args" to listOf(normalizedPath),
+            "env" to mapOf("AIDB_PREFERRED_IDE" to PreferredIde, "PYTHONIOENCODING" to "utf-8")
+        )
+
+        val existing = mcpServers[McpServerName] as? Map<*, *>
+        if (isCorrectClaudeCodeConfig(existing, normalizedPath)) {
             log.debug("[$clientName] MCP server '$McpServerName' already registered.")
             return
         }
@@ -346,6 +397,24 @@ object McpClientRegistration {
 
     private fun isCorrectConfig(existing: Map<*, *>?, normalizedPath: String): Boolean {
         if (existing == null) return false
+        val command = existing["command"]?.toString() ?: return false
+        if (command != "python") return false
+        val args = existing["args"]
+        val firstArg = when (args) {
+            is List<*> -> args.firstOrNull()?.toString()
+            is Array<*> -> args.firstOrNull()?.toString()
+            else -> null
+        }
+        if (!normalizedPath.equals(firstArg, ignoreCase = true)) return false
+        val env = existing["env"] as? Map<*, *> ?: return false
+        val preferred = env["AIDB_PREFERRED_IDE"]?.toString() ?: return false
+        return preferred.equals(PreferredIde, ignoreCase = true)
+    }
+
+    private fun isCorrectClaudeCodeConfig(existing: Map<*, *>?, normalizedPath: String): Boolean {
+        if (existing == null) return false
+        val type = existing["type"]?.toString() ?: return false
+        if (!type.equals("stdio", ignoreCase = true)) return false
         val command = existing["command"]?.toString() ?: return false
         if (command != "python") return false
         val args = existing["args"]

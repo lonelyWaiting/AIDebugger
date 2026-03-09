@@ -172,9 +172,9 @@ A Python-based MCP server that connects to the VS extension and Rider plugin and
    - Visual Studio builds keep only the most recent Rider build folders by default. Adjust `RiderBuildRetention` in `RiderBuild.csproj` to change the retention count.
 5. Restart Visual Studio
 
-### Step 2: Configure Cursor (Automatic!)
+### Step 2: Configure MCP Clients (Automatic!)
 
-Each extension **registers its own MCP server** with Cursor on first start:
+Each extension **registers its own MCP server** on first start:
 
 - VS extension: `AIDebuggerVS` (strictly Visual Studio)
 - Rider plugin: `AIDebuggerRider` (strictly Rider)
@@ -182,7 +182,13 @@ Each extension **registers its own MCP server** with Cursor on first start:
 The Python MCP server files and dependencies are **bundled with each extension**, so no manual pip install is required.
 On first run, the MCP server extracts bundled wheels to `<user-home>/.ai-debugger/pydeps`.
 
-After installing the VS extension and restarting Visual Studio, you just need to **restart Cursor** for the MCP tools to become available.
+Automatic registration targets:
+
+- Cursor: `~/.cursor/mcp.json`
+- Claude Desktop: `%APPDATA%/Claude/claude_desktop_config.json`
+- Claude Code (including the Claude Code extension used inside Cursor/VS Code): `~/.claude.json`
+
+After installing the VS extension and restarting Visual Studio, restart the MCP client you want to use so the new server list is picked up.
 
 The VS install script and Rider plugin both copy MCP server files to `<user-home>/.ai-debugger/mcp_server` when needed.
 

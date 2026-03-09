@@ -10,7 +10,8 @@ using System.Collections.Generic;
 namespace VSDebuggerMCP
 {
     /// <summary>
-    /// Handles automatic registration of the MCP server in MCP client configurations (Cursor, Claude Desktop).
+    /// Handles automatic registration of the MCP server in MCP client configurations
+    /// (Cursor, Claude Desktop, Claude Code, OpenCode).
     /// </summary>
     public static class McpClientRegistration
     {
@@ -20,6 +21,7 @@ namespace VSDebuggerMCP
         // Client display names for logging
         private const string ClientNameCursor = "Cursor";
         private const string ClientNameClaudeDesktop = "Claude Desktop";
+        private const string ClientNameClaudeCode = "Claude Code";
         private const string ClientNameOpenCode = "OpenCode";
         private const string CursorAllowListSyncScript = "cursor_allowlist_sync.py";
 
@@ -436,6 +438,16 @@ namespace VSDebuggerMCP
         }
 
         /// <summary>
+        /// Gets the path to Claude Code's user-scoped configuration file.
+        /// Anthropic stores user-scoped Claude Code MCP servers in ~/.claude.json.
+        /// </summary>
+        public static string GetClaudeCodeUserConfigPath()
+        {
+            var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            return Path.Combine(userProfile, ".claude.json");
+        }
+
+        /// <summary>
         /// Gets the path to OpenCode's configuration file.
         /// Windows: %USERPROFILE%\.config\opencode\opencode.json
         /// </summary>
@@ -470,6 +482,16 @@ namespace VSDebuggerMCP
         {
             var configPath = GetClaudeDesktopConfigPath();
             return RegisterToConfig(configPath, ClientNameClaudeDesktop, log, createDirIfMissing: true);
+        }
+
+        /// <summary>
+        /// Registers the AIDebugger server in Claude Code's user-scoped configuration.
+        /// Claude Code uses ~/.claude.json for user-scoped MCP servers on all projects.
+        /// </summary>
+        public static RegistrationResult RegisterWithClaudeCode(Action<string> log = null)
+        {
+            var configPath = GetClaudeCodeUserConfigPath();
+            return RegisterToClaudeCodeConfig(configPath, ClientNameClaudeCode, log, createDirIfMissing: true);
         }
 
         /// <summary>
@@ -605,6 +627,156 @@ namespace VSDebuggerMCP
             catch (Exception ex)
             {
                 log($"[{ClientNameOpenCode}] Error registering: {ex.Message}");
+                result.Success = false;
+                result.Message = $"Failed to register: {ex.Message}";
+                return result;
+            }
+        }
+
+        /// <summary>
+        /// Registers the AIDebugger server in Claude Code's user-scoped configuration file.
+        /// Claude Code uses the same top-level "mcpServers" object, but stdio entries should
+        /// explicitly set type="stdio" and do not use Cursor-specific server instructions.
+        /// </summary>
+        private static RegistrationResult RegisterToClaudeCodeConfig(string configPath, string clientName, Action<string> log, bool createDirIfMissing)
+        {
+            log = log ?? ((s) => { });
+            var result = new RegistrationResult();
+
+            try
+            {
+                var serverPath = GetMcpServerPath();
+
+                if (!TryResolvePythonRuntime(log, out var pythonRuntime))
+                {
+                    result.Success = false;
+                    result.Message = "No compatible Python runtime found. Please install Python 3.10-3.13 x64.";
+                    return result;
+                }
+
+                log($"Config path: {configPath}");
+                log($"MCP server path: {serverPath}");
+                log($"Python runtime: {pythonRuntime.VersionText} via '{pythonRuntime.Command}'");
+
+                var configDir = Path.GetDirectoryName(configPath);
+                if (!string.IsNullOrEmpty(configDir) && !Directory.Exists(configDir))
+                {
+                    if (createDirIfMissing)
+                    {
+                        Directory.CreateDirectory(configDir);
+                        log($"Created directory: {configDir}");
+                    }
+                    else
+                    {
+                        result.Success = true;
+                        result.Skipped = true;
+                        result.Message = $"{clientName} directory does not exist";
+                        return result;
+                    }
+                }
+
+                WithConfigFileLock(configPath, log, () =>
+                {
+                    Dictionary<string, object> config;
+                    if (File.Exists(configPath))
+                    {
+                        var existingJson = File.ReadAllText(configPath, Encoding.UTF8);
+                        var serializer = new JavaScriptSerializer();
+                        config = serializer.Deserialize<Dictionary<string, object>>(existingJson)
+                                 ?? new Dictionary<string, object>();
+                        log("Read existing config");
+                    }
+                    else
+                    {
+                        config = new Dictionary<string, object>();
+                        log("Creating new config");
+                    }
+
+                    Dictionary<string, object> mcpServers;
+                    if (config.ContainsKey("mcpServers") && config["mcpServers"] is Dictionary<string, object>)
+                    {
+                        mcpServers = (Dictionary<string, object>)config["mcpServers"];
+                    }
+                    else
+                    {
+                        mcpServers = new Dictionary<string, object>();
+                        config["mcpServers"] = mcpServers;
+                    }
+
+                    var normalizedPath = serverPath.Replace("\\", "/");
+                    var entryName = McpServerNameVs;
+                    var preferredIde = "vs";
+
+                    bool allCorrect = true;
+                    bool isCorrect = false;
+                    if (mcpServers.ContainsKey(entryName))
+                    {
+                        var existingConfig = mcpServers[entryName] as Dictionary<string, object>;
+                        isCorrect = IsCorrectClaudeCodeConfig(existingConfig, pythonRuntime, normalizedPath, preferredIde);
+                        if (!isCorrect)
+                        {
+                            log($"MCP server '{entryName}' exists but needs update...");
+                        }
+                    }
+                    else
+                    {
+                        allCorrect = false;
+                    }
+
+                    if (!isCorrect)
+                    {
+                        var commandArgs = new List<object>();
+                        foreach (var prefixArg in pythonRuntime.PrefixArgs)
+                        {
+                            commandArgs.Add(prefixArg);
+                        }
+                        commandArgs.Add(normalizedPath);
+
+                        var serverConfig = new Dictionary<string, object>
+                        {
+                            { "type", "stdio" },
+                            { "command", pythonRuntime.Command },
+                            { "args", commandArgs.ToArray() },
+                            { "env", new Dictionary<string, object> { { "AIDB_PREFERRED_IDE", preferredIde }, { "PYTHONIOENCODING", "utf-8" } } }
+                        };
+                        mcpServers[entryName] = serverConfig;
+                        allCorrect = false;
+                    }
+
+                    if (mcpServers.ContainsKey(LegacyMcpServerName))
+                    {
+                        log($"Removing legacy MCP server entry '{LegacyMcpServerName}'.");
+                        mcpServers.Remove(LegacyMcpServerName);
+                        allCorrect = false;
+                    }
+
+                    if (allCorrect)
+                    {
+                        log("MCP server already correctly registered");
+                        result.Success = true;
+                        result.AlreadyRegistered = true;
+                        result.Message = "Already registered";
+                        return;
+                    }
+
+                    var serializer2 = new JavaScriptSerializer();
+                    var json = FormatJson(serializer2.Serialize(config));
+                    File.WriteAllText(configPath, json, Encoding.UTF8);
+
+                    log($"Successfully registered '{McpServerNameVs}'");
+
+                    result.Success = true;
+                    result.AlreadyRegistered = false;
+                    result.Message = $"Successfully registered. Please restart {clientName} to use the AIDebugger tools.";
+                    result.ConfigPath = configPath;
+                    result.ServerPath = serverPath;
+                });
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                log($"Error registering with {clientName}: {ex.Message}");
                 result.Success = false;
                 result.Message = $"Failed to register: {ex.Message}";
                 return result;
@@ -1163,6 +1335,82 @@ namespace VSDebuggerMCP
             if (!hasServerUseInstructions)
             {
                 return false;
+            }
+
+            if (!existingConfig.ContainsKey("env"))
+            {
+                return false;
+            }
+
+            var envObj = existingConfig["env"];
+            if (envObj is Dictionary<string, object> envDict)
+            {
+                if (!envDict.ContainsKey("AIDB_PREFERRED_IDE"))
+                {
+                    return false;
+                }
+                var envValue = envDict["AIDB_PREFERRED_IDE"]?.ToString();
+                return string.Equals(envValue, preferredIde, StringComparison.OrdinalIgnoreCase);
+            }
+
+            return false;
+        }
+
+        private static bool IsCorrectClaudeCodeConfig(Dictionary<string, object> existingConfig, PythonRuntimeInfo runtime, string normalizedPath, string preferredIde)
+        {
+            if (existingConfig == null)
+            {
+                return false;
+            }
+
+            var existingType = existingConfig.ContainsKey("type") ? existingConfig["type"]?.ToString() : "";
+            if (!string.Equals(existingType, "stdio", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var existingCommand = existingConfig.ContainsKey("command") ? existingConfig["command"]?.ToString() : "";
+            if (!string.Equals(existingCommand, runtime.Command, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var existingArgs = existingConfig.ContainsKey("args") ? existingConfig["args"] : null;
+            var existingArgValues = new List<string>();
+            if (existingArgs is object[] argsArray)
+            {
+                foreach (var arg in argsArray)
+                {
+                    existingArgValues.Add(arg?.ToString() ?? string.Empty);
+                }
+            }
+            else if (existingArgs is System.Collections.ArrayList argsList)
+            {
+                foreach (var arg in argsList)
+                {
+                    existingArgValues.Add(arg?.ToString() ?? string.Empty);
+                }
+            }
+            else
+            {
+                return false;
+            }
+
+            var expectedArgValues = new List<string>();
+            expectedArgValues.AddRange(runtime.PrefixArgs ?? new string[0]);
+            expectedArgValues.Add(normalizedPath);
+
+            if (existingArgValues.Count != expectedArgValues.Count)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < expectedArgValues.Count; i++)
+            {
+                if (!string.Equals(existingArgValues[i], expectedArgValues[i], StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
             }
 
             if (!existingConfig.ContainsKey("env"))
