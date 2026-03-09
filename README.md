@@ -107,6 +107,7 @@ A Python-based MCP server that connects to the VS extension and Rider plugin and
 | Tool | Description |
 |------|-------------|
 | `debug_continue` | Continue execution (F5) |
+| `continue_and_wait_for_break` | Continue or wait for the next debug stop, then auto-capture a debug bundle |
 | `debug_step_over` | Step over current line (F10) |
 | `debug_step_into` | Step into function (F11) |
 | `debug_step_out` | Step out of function (Shift+F11) |
@@ -216,6 +217,7 @@ If you only use one IDE, you can omit the other MCP entry.
 1. Start Visual Studio or Rider with the extension installed
 2. Open your project and start debugging (F5)
 3. When the debugger hits a breakpoint, use Cursor to query debugging information
+4. Or use `continue_and_wait_for_break` to let the program run, reproduce the issue, and auto-capture a bundle on the next stop
 
 ### Multiple IDE Instances (VS + Rider)
 
@@ -350,5 +352,3 @@ The VS extension and Python server communicate using JSON-RPC style messages ove
 ## License
 
 MIT License
-
-

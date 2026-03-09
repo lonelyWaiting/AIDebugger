@@ -36,6 +36,7 @@ object McpClientRegistration {
             "Before using any debugging tools, call detect_debug_sessions(prefer_ide=\"rider\") to locate a live session.\n" +
             "If auto-selection fails, use list_ide_instances + select_ide_instance.\n" +
             "For crash/bug diagnosis, prefer capture_debug_bundle first (optionally with expressions).\n" +
+            "For repro workflows, use continue_and_wait_for_break to resume and auto-capture the next stop.\n" +
             "Use get_debug_status.stopReason to branch analysis flow (breakpoint/exception/step/user_break).\n" +
             "When checking multiple values, prefer evaluate_expressions_batch to avoid drift.\n"
 

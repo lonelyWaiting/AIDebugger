@@ -63,9 +63,10 @@ namespace VSDebuggerMCP
 
 ### 断点调试流程：
 1. get_debug_status 确认调试状态
-2. get_callstack 查看调用链
-3. get_locals 查看当前变量
-4. evaluate_expression 求值特定表达式
+2. 若需要放行复现，优先 continue_and_wait_for_break 自动等待并抓取 bundle
+3. get_callstack 查看调用链
+4. get_locals 查看当前变量
+5. evaluate_expression 求值特定表达式
 
 ## 重要注意事项
 

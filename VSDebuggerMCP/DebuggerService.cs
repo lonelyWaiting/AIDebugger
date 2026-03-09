@@ -3065,6 +3065,85 @@ namespace VSDebuggerMCP
         }
 
         /// <summary>
+        /// Continues execution if needed, waits for the debugger to stop again, and captures a debug bundle.
+        /// </summary>
+        public ContinueAndWaitResult ContinueAndWaitForBreak(List<string> expressions = null, bool expandChildren = false, int maxDepth = 2, int outputTailLines = 80, int timeoutMs = 120000, int pollIntervalMs = 200)
+        {
+            int normalizedTimeoutMs = Math.Max(1000, Math.Min(timeoutMs, 30 * 60 * 1000));
+            int normalizedPollIntervalMs = Math.Max(50, Math.Min(pollIntervalMs, 1000));
+            var initialStatus = GetDebugStatus();
+            var result = new ContinueAndWaitResult
+            {
+                Action = "ContinueAndWaitForBreak",
+                WaitTimeoutMs = normalizedTimeoutMs,
+                PollIntervalMs = normalizedPollIntervalMs,
+                Status = initialStatus,
+                StopReason = initialStatus?.StopReason ?? "not_paused"
+            };
+
+            if (initialStatus == null || !initialStatus.IsDebugging)
+            {
+                result.Success = false;
+                result.Message = "No active debug session";
+                return result;
+            }
+
+            if (initialStatus.IsPaused)
+            {
+                var continueResult = Continue();
+                result.IssuedContinue = continueResult.Success;
+                if (!continueResult.Success)
+                {
+                    result.Success = false;
+                    result.Message = continueResult.Message;
+                    result.Status = GetDebugStatus();
+                    result.StopReason = result.Status?.StopReason ?? "not_paused";
+                    return result;
+                }
+            }
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < normalizedTimeoutMs)
+            {
+                var status = GetDebugStatus();
+                result.Status = status;
+                result.StopReason = status?.StopReason ?? "not_paused";
+                result.WaitedMs = (int)Math.Min(sw.ElapsedMilliseconds, int.MaxValue);
+
+                if (status == null || !status.IsDebugging)
+                {
+                    result.Success = false;
+                    result.Message = "Debug session ended before hitting a breakpoint";
+                    return result;
+                }
+
+                if (status.IsPaused)
+                {
+                    var bundle = CaptureDebugBundle(expressions, expandChildren, maxDepth, outputTailLines);
+                    result.Success = true;
+                    result.BreakDetected = true;
+                    result.TimedOut = false;
+                    result.Bundle = bundle;
+                    result.Status = bundle?.Status ?? status;
+                    result.StopReason = bundle?.StopReason ?? result.Status?.StopReason ?? "not_paused";
+                    result.Message = "Debug stop detected and bundle captured";
+                    result.WaitedMs = (int)Math.Min(sw.ElapsedMilliseconds, int.MaxValue);
+                    return result;
+                }
+
+                System.Threading.Thread.Sleep(normalizedPollIntervalMs);
+            }
+
+            result.Status = GetDebugStatus();
+            result.StopReason = result.Status?.StopReason ?? "not_paused";
+            result.WaitedMs = normalizedTimeoutMs;
+            result.Success = false;
+            result.TimedOut = true;
+            result.Message = "Timed out waiting for debugger to enter break mode";
+            return result;
+        }
+
+        /// <summary>
         /// Step into (F11).
         /// </summary>
         public DebugControlResult StepInto()

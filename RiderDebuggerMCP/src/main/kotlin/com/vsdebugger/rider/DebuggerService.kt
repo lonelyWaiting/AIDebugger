@@ -118,6 +118,15 @@ class DebuggerService {
             "ping" -> PingResult(status = "ok", timestamp = Instant.now().toString())
             "get_instance_info" -> getInstanceInfo(getParam(request.params, "pipeName", ""))
             "continue" -> debugContinue()
+            "continue_and_wait_for_break" -> {
+                val expressions = getStringListParam(request.params, "expressions")
+                val expand = getParam(request.params, "expandChildren", false)
+                val maxDepth = getParam(request.params, "maxDepth", 2)
+                val outputTailLines = getParam(request.params, "outputTailLines", 80)
+                val timeoutMs = getParam(request.params, "timeoutMs", 120000)
+                val pollIntervalMs = getParam(request.params, "pollIntervalMs", 200)
+                continueAndWaitForBreak(expressions, expand, maxDepth, outputTailLines, timeoutMs, pollIntervalMs)
+            }
             "step_into" -> debugStepInto()
             "step_over" -> debugStepOver()
             "step_out" -> debugStepOut()
@@ -1076,6 +1085,86 @@ class DebuggerService {
         session.resume()
     }
 
+    private fun continueAndWaitForBreak(
+        expressions: List<String>,
+        expandChildren: Boolean,
+        maxDepth: Int,
+        outputTailLines: Int,
+        timeoutMs: Int,
+        pollIntervalMs: Int
+    ): ContinueAndWaitResult {
+        val normalizedTimeoutMs = timeoutMs.coerceIn(1000, 30 * 60 * 1000)
+        val normalizedPollIntervalMs = pollIntervalMs.coerceIn(50, 1000)
+        val initialStatus = getDebugStatus()
+        var result = ContinueAndWaitResult(
+            action = "ContinueAndWaitForBreak",
+            waitTimeoutMs = normalizedTimeoutMs,
+            pollIntervalMs = normalizedPollIntervalMs,
+            status = initialStatus,
+            stopReason = initialStatus.stopReason
+        )
+
+        if (!initialStatus.isDebugging) {
+            return result.copy(success = false, message = "No debug session")
+        }
+
+        if (initialStatus.isPaused) {
+            val continueResult = debugContinue()
+            result = result.copy(issuedContinue = continueResult.success)
+            if (!continueResult.success) {
+                val status = getDebugStatus()
+                return result.copy(
+                    success = false,
+                    message = continueResult.message,
+                    status = status,
+                    stopReason = status.stopReason
+                )
+            }
+        }
+
+        val startedAt = System.nanoTime()
+        while (elapsedMillis(startedAt) < normalizedTimeoutMs) {
+            val status = getDebugStatus()
+            val waitedMs = elapsedMillis(startedAt)
+            result = result.copy(
+                status = status,
+                stopReason = status.stopReason,
+                waitedMs = waitedMs
+            )
+
+            if (!status.isDebugging) {
+                return result.copy(success = false, message = "Debug session ended before hitting a breakpoint")
+            }
+
+            if (status.isPaused) {
+                val bundle = captureDebugBundle(expressions, expandChildren, maxDepth, outputTailLines)
+                val bundleStatus = bundle.status ?: status
+                return result.copy(
+                    success = true,
+                    message = "Debug stop detected and bundle captured",
+                    waitedMs = elapsedMillis(startedAt),
+                    breakDetected = true,
+                    timedOut = false,
+                    stopReason = bundle.stopReason.ifBlank { bundleStatus.stopReason },
+                    status = bundleStatus,
+                    bundle = bundle
+                )
+            }
+
+            Thread.sleep(normalizedPollIntervalMs.toLong())
+        }
+
+        val finalStatus = getDebugStatus()
+        return result.copy(
+            success = false,
+            message = "Timed out waiting for debugger to enter break mode",
+            waitedMs = normalizedTimeoutMs,
+            timedOut = true,
+            stopReason = finalStatus.stopReason,
+            status = finalStatus
+        )
+    }
+
     private fun debugStepInto(): DebugControlResult = executeDebugAction("StepInto") { session ->
         session.stepInto()
     }
@@ -1619,7 +1708,10 @@ class DebuggerService {
             truncated = matches.size >= maxMatches
         )
     }
-
+    private fun elapsedMillis(startedAtNanos: Long): Int {
+        val elapsed = (System.nanoTime() - startedAtNanos) / 1_000_000L
+        return elapsed.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+    }
 
     private fun executeDebugAction(action: String, operation: (XDebugSession) -> Unit): DebugControlResult {
         val session = currentSession() ?: return DebugControlResult(action = action, success = false, message = "No debug session")

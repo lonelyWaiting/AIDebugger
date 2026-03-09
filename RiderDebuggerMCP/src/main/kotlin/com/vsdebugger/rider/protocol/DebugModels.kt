@@ -273,6 +273,21 @@ data class DebugControlResult(
     @SerializedName("newLocation") val newLocation: LocationInfo? = null
 )
 
+data class ContinueAndWaitResult(
+    @SerializedName("action") val action: String = "",
+    @SerializedName("success") val success: Boolean = false,
+    @SerializedName("message") val message: String? = null,
+    @SerializedName("waitTimeoutMs") val waitTimeoutMs: Int = 0,
+    @SerializedName("pollIntervalMs") val pollIntervalMs: Int = 0,
+    @SerializedName("waitedMs") val waitedMs: Int = 0,
+    @SerializedName("issuedContinue") val issuedContinue: Boolean = false,
+    @SerializedName("timedOut") val timedOut: Boolean = false,
+    @SerializedName("breakDetected") val breakDetected: Boolean = false,
+    @SerializedName("stopReason") val stopReason: String = "not_paused",
+    @SerializedName("status") val status: DebugStatusResult? = null,
+    @SerializedName("bundle") val bundle: DebugBundleResult? = null
+)
+
 // Breakpoints
 
 data class BreakpointsResult(

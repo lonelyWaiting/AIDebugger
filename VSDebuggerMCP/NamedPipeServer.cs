@@ -444,6 +444,17 @@ namespace VSDebuggerMCP
                 case "continue":
                     return _debuggerService.Continue();
 
+                case "continue_and_wait_for_break":
+                    {
+                        var expressions = GetStringListParam(request.Params, "expressions");
+                        bool expandChildren = GetParam<bool>(request.Params, "expandChildren", false);
+                        int maxDepth = GetParam<int>(request.Params, "maxDepth", 2);
+                        int outputTailLines = GetParam<int>(request.Params, "outputTailLines", 80);
+                        int timeoutMs = GetParam<int>(request.Params, "timeoutMs", 120000);
+                        int pollIntervalMs = GetParam<int>(request.Params, "pollIntervalMs", 200);
+                        return _debuggerService.ContinueAndWaitForBreak(expressions, expandChildren, maxDepth, outputTailLines, timeoutMs, pollIntervalMs);
+                    }
+
                 case "step_into":
                     return _debuggerService.StepInto();
 

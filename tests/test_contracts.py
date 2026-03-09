@@ -57,6 +57,23 @@ class ContractTests(unittest.TestCase):
             self.assertIn(field, vs_models)
             self.assertIn(field, rider_models)
 
+    def test_continue_and_wait_contract_fields_present(self) -> None:
+        vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+        rider_models = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/protocol/DebugModels.kt")
+
+        for field in (
+            "ContinueAndWaitResult",
+            "waitTimeoutMs",
+            "pollIntervalMs",
+            "waitedMs",
+            "issuedContinue",
+            "timedOut",
+            "breakDetected",
+            "bundle",
+        ):
+            self.assertIn(field, vs_models)
+            self.assertIn(field, rider_models)
+
     def test_named_pipe_bridge_uses_io_timeout(self) -> None:
         vs_bridge = read("mcp_server/vs_bridge.py")
         rider_bridge = read("mcp_server/rider_bridge.py")
@@ -87,6 +104,7 @@ class ContractTests(unittest.TestCase):
         self.assertIn("evaluate_expressions_batch", vs_registration)
         self.assertIn("stopReason", vs_registration)
         self.assertIn("cursor_allowlist_sync.py", vs_registration)
+        self.assertIn("continue_and_wait_for_break", vs_registration)
 
     def test_named_pipe_strict_mode_toggle_present(self) -> None:
         vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
@@ -100,6 +118,7 @@ class ContractTests(unittest.TestCase):
         server_py = read("mcp_server/server.py")
         self.assertIn("capture_debug_bundle", server_py)
         self.assertIn("evaluate_expressions_batch", server_py)
+        self.assertIn("continue_and_wait_for_break", server_py)
 
     def test_cursor_allowlist_helper_is_bundled(self) -> None:
         helper_py = read("mcp_server/cursor_allowlist_sync.py")

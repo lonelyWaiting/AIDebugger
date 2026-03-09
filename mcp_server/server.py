@@ -82,6 +82,7 @@ evaluate_expression(expression="obj.Property", expand_children=True)
 | 场景 | 推荐工具 |
 |------|----------|
 | 分析崩溃/异常 | capture_debug_bundle() 或 get_exception() |
+| 等待复现并自动抓现场 | continue_and_wait_for_break() |
 | 查看变量值 | get_locals() 或 evaluate_expression(expression="xxx") |
 | 查看调用链 | get_callstack() |
 | 设置断点 | set_breakpoint(file_path="...", line_number=42) |
@@ -839,6 +840,44 @@ async def debug_continue() -> str:
 
 
 @mcp.tool()
+async def continue_and_wait_for_break(
+    timeout_seconds: int = 120,
+    poll_interval_ms: int = 200,
+    expressions: Optional[List[str]] = None,
+    expand_children: bool = False,
+    max_depth: int = 2,
+    output_tail_lines: int = 80
+) -> str:
+    """
+    继续运行（或在已经运行时直接等待），直到调试器再次进入暂停状态，然后自动抓取一个 debug bundle。
+    适合“先放行让我复现，命中后再自动分析”的工作流。
+
+    Args:
+        timeout_seconds: 最长等待秒数，默认120，最大1800
+        poll_interval_ms: IDE 侧轮询间隔毫秒，默认200，范围50-1000
+        expressions: 命中后在同一快照中批量求值的表达式列表
+        expand_children: 是否展开表达式子成员，默认False
+        max_depth: 表达式展开深度，默认2
+        output_tail_lines: Debug Output 末尾行数，默认80
+    """
+    timeout_seconds = max(1, min(timeout_seconds, 1800))
+    poll_interval_ms = max(50, min(poll_interval_ms, 1000))
+
+    try:
+        result = await ide_bridge.call("continue_and_wait_for_break", {
+            "timeoutMs": timeout_seconds * 1000,
+            "pollIntervalMs": poll_interval_ms,
+            "expressions": expressions or [],
+            "expandChildren": expand_children,
+            "maxDepth": max_depth,
+            "outputTailLines": output_tail_lines,
+        }, timeout=float(timeout_seconds + 15))
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "continue_and_wait_for_break")
+
+
+@mcp.tool()
 async def debug_step_over() -> str:
     """
     单步跳过当前行 (F10)，不进入函数内部。
@@ -1184,7 +1223,3 @@ async def search_memory(
 if __name__ == "__main__":
     # Run the server using stdio transport
     mcp.run(transport="stdio")
-
-
-
-

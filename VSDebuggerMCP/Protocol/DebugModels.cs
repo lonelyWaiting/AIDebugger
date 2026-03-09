@@ -693,6 +693,46 @@ namespace VSDebuggerMCP.Protocol
         public LocationInfo NewLocation { get; set; }
     }
 
+    [DataContract]
+    public class ContinueAndWaitResult
+    {
+        [DataMember(Name = "action")]
+        public string Action { get; set; }
+
+        [DataMember(Name = "success")]
+        public bool Success { get; set; }
+
+        [DataMember(Name = "message")]
+        public string Message { get; set; }
+
+        [DataMember(Name = "waitTimeoutMs")]
+        public int WaitTimeoutMs { get; set; }
+
+        [DataMember(Name = "pollIntervalMs")]
+        public int PollIntervalMs { get; set; }
+
+        [DataMember(Name = "waitedMs")]
+        public int WaitedMs { get; set; }
+
+        [DataMember(Name = "issuedContinue")]
+        public bool IssuedContinue { get; set; }
+
+        [DataMember(Name = "timedOut")]
+        public bool TimedOut { get; set; }
+
+        [DataMember(Name = "breakDetected")]
+        public bool BreakDetected { get; set; }
+
+        [DataMember(Name = "stopReason")]
+        public string StopReason { get; set; } = "not_paused";
+
+        [DataMember(Name = "status")]
+        public DebugStatusResult Status { get; set; }
+
+        [DataMember(Name = "bundle")]
+        public DebugBundleResult Bundle { get; set; }
+    }
+
     #endregion
 
     #region Breakpoints
