@@ -21,6 +21,7 @@ namespace VSDebuggerMCP
         private const string ClientNameCursor = "Cursor";
         private const string ClientNameClaudeDesktop = "Claude Desktop";
         private const string ClientNameOpenCode = "OpenCode";
+        private const string CursorAllowListSyncScript = "cursor_allowlist_sync.py";
 
         /// <summary>
         /// Server use instructions that help Cursor AI understand when and how to use this MCP.
@@ -294,6 +295,127 @@ namespace VSDebuggerMCP
             return Path.GetDirectoryName(typeof(McpClientRegistration).Assembly.Location);
         }
 
+        private static string GetBundledMcpServerFilePath(string relativePath)
+        {
+            var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var stablePath = Path.Combine(userProfile, ".ai-debugger", "mcp_server", relativePath);
+            var normalizedStablePath = Path.GetFullPath(stablePath);
+            if (File.Exists(normalizedStablePath))
+            {
+                return normalizedStablePath;
+            }
+
+            var extensionDir = GetExtensionDirectory();
+            var candidatePaths = new[]
+            {
+                Path.Combine(extensionDir, "mcp_server", relativePath),
+                Path.GetFullPath(Path.Combine(extensionDir, "..", "..", "..", "mcp_server", relativePath)),
+            };
+
+            foreach (var candidatePath in candidatePaths)
+            {
+                if (File.Exists(candidatePath))
+                {
+                    return Path.GetFullPath(candidatePath);
+                }
+            }
+
+            return normalizedStablePath;
+        }
+
+        private static string QuoteProcessArgument(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return "\"\"";
+            }
+
+            if (value.IndexOfAny(new[] { ' ', '\t', '"' }) < 0)
+            {
+                return value;
+            }
+
+            return "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+        }
+
+        private static void TrySyncCursorAllowList(string serverName, Action<string> log)
+        {
+            log = log ?? ((s) => { });
+
+            try
+            {
+                if (!TryResolvePythonRuntime(log, out var pythonRuntime))
+                {
+                    log("[Cursor] Skipping MCP allow list sync because no compatible Python runtime was found.");
+                    return;
+                }
+
+                var scriptPath = GetBundledMcpServerFilePath(CursorAllowListSyncScript);
+                if (!File.Exists(scriptPath))
+                {
+                    log($"[Cursor] Skipping MCP allow list sync because '{CursorAllowListSyncScript}' was not found at {scriptPath}");
+                    return;
+                }
+
+                var argsBuilder = new StringBuilder();
+                foreach (var prefixArg in pythonRuntime.PrefixArgs)
+                {
+                    if (argsBuilder.Length > 0)
+                    {
+                        argsBuilder.Append(' ');
+                    }
+                    argsBuilder.Append(QuoteProcessArgument(prefixArg));
+                }
+                if (argsBuilder.Length > 0)
+                {
+                    argsBuilder.Append(' ');
+                }
+                argsBuilder.Append(QuoteProcessArgument(scriptPath));
+                argsBuilder.Append(" --server ");
+                argsBuilder.Append(QuoteProcessArgument(serverName));
+
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = pythonRuntime.Command,
+                    Arguments = argsBuilder.ToString(),
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using (var process = Process.Start(startInfo))
+                {
+                    if (process == null)
+                    {
+                        log("[Cursor] Failed to start MCP allow list sync helper.");
+                        return;
+                    }
+
+                    var output = process.StandardOutput.ReadToEnd().Trim();
+                    var error = process.StandardError.ReadToEnd().Trim();
+                    process.WaitForExit(15000);
+
+                    if (process.ExitCode == 0)
+                    {
+                        log(string.IsNullOrEmpty(output)
+                            ? "[Cursor] MCP allow list sync completed."
+                            : $"[Cursor] MCP allow list sync completed: {output}");
+                    }
+                    else
+                    {
+                        log(string.IsNullOrEmpty(error)
+                            ? $"[Cursor] MCP allow list sync failed with exit code {process.ExitCode}."
+                            : $"[Cursor] MCP allow list sync failed: {error}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                log($"[Cursor] MCP allow list sync failed: {ex.Message}");
+            }
+        }
+
         /// <summary>
         /// Gets the path to Cursor's mcp.json configuration file.
         /// </summary>
@@ -328,8 +450,14 @@ namespace VSDebuggerMCP
         /// <returns>True if registration was successful or already registered, false on error.</returns>
         public static RegistrationResult RegisterWithCursor(Action<string> log = null)
         {
+            log = log ?? ((s) => { });
             var configPath = GetCursorMcpConfigPath();
-            return RegisterToConfig(configPath, ClientNameCursor, log, createDirIfMissing: true);
+            var result = RegisterToConfig(configPath, ClientNameCursor, log, createDirIfMissing: true);
+            if (result.Success)
+            {
+                TrySyncCursorAllowList(McpServerNameVs, log);
+            }
+            return result;
         }
 
         /// <summary>

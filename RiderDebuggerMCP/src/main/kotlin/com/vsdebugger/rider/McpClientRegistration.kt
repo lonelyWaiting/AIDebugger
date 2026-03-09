@@ -19,6 +19,7 @@ object McpClientRegistration {
     private const val ClientNameCursor = "Cursor"
     private const val ClientNameClaudeDesktop = "Claude Desktop"
     private const val ClientNameOpenCode = "OpenCode"
+    private const val CursorAllowListSyncScript = "cursor_allowlist_sync.py"
 
     private val baseFiles = listOf(
         "server.py",
@@ -26,6 +27,7 @@ object McpClientRegistration {
         "vs_bridge.py",
         "rider_bridge.py",
         "bootstrap.py",
+        "cursor_allowlist_sync.py",
         "requirements.txt"
     )
 
@@ -39,7 +41,8 @@ object McpClientRegistration {
 
     fun registerWithCursor() {
         try {
-            if (!isPythonAvailable()) {
+            val pythonCommand = resolvePythonCommand()
+            if (pythonCommand == null) {
                 log.warn("Python 3.10+ is required for MCP server registration. Skipping Cursor registration.")
                 return
             }
@@ -47,6 +50,7 @@ object McpClientRegistration {
             val serverPath = ensureServerFiles() ?: return
             val configPath = getCursorMcpConfigPath()
             registerToConfig(configPath, serverPath, ClientNameCursor, createDirIfMissing = true)
+            syncCursorAllowList(serverPath, pythonCommand)
         } catch (ex: Exception) {
             log.warn("Failed to register MCP server with Cursor: ${ex.message}", ex)
         }
@@ -355,8 +359,58 @@ object McpClientRegistration {
         return preferred.equals(PreferredIde, ignoreCase = true)
     }
 
+    private fun syncCursorAllowList(serverPath: String, pythonCommand: String) {
+        try {
+            val scriptPath = File(File(serverPath).parentFile, CursorAllowListSyncScript)
+            if (!scriptPath.exists()) {
+                log.warn("[$ClientNameCursor] Skipping MCP allow list sync because ${scriptPath.absolutePath} does not exist.")
+                return
+            }
+
+            val process = ProcessBuilder(
+                pythonCommand,
+                scriptPath.absolutePath,
+                "--server",
+                McpServerName,
+            )
+                .redirectErrorStream(true)
+                .start()
+
+            if (!process.waitFor(15, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                log.warn("[$ClientNameCursor] MCP allow list sync timed out.")
+                return
+            }
+
+            val output = process.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }.trim()
+            if (process.exitValue() == 0) {
+                if (output.isBlank()) {
+                    log.info("[$ClientNameCursor] MCP allow list sync completed.")
+                } else {
+                    log.info("[$ClientNameCursor] MCP allow list sync completed: $output")
+                }
+            } else {
+                if (output.isBlank()) {
+                    log.warn("[$ClientNameCursor] MCP allow list sync failed with exit code ${process.exitValue()}.")
+                } else {
+                    log.warn("[$ClientNameCursor] MCP allow list sync failed: $output")
+                }
+            }
+        } catch (ex: Exception) {
+            log.warn("[$ClientNameCursor] MCP allow list sync failed: ${ex.message}", ex)
+        }
+    }
+
     private fun isPythonAvailable(): Boolean {
-        return checkPythonCommand("python") || checkPythonCommand("python3")
+        return resolvePythonCommand() != null
+    }
+
+    private fun resolvePythonCommand(): String? {
+        return when {
+            checkPythonCommand("python") -> "python"
+            checkPythonCommand("python3") -> "python3"
+            else -> null
+        }
     }
 
     private fun checkPythonCommand(command: String): Boolean {

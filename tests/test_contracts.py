@@ -79,12 +79,14 @@ class ContractTests(unittest.TestCase):
         self.assertIn(".bundle-signature", rider_registration)
         self.assertIn("capture_debug_bundle", rider_registration)
         self.assertIn("evaluate_expressions_batch", rider_registration)
+        self.assertIn("cursor_allowlist_sync.py", rider_registration)
 
     def test_vs_registration_instructions_include_snapshot_workflow(self) -> None:
         vs_registration = read("VSDebuggerMCP/McpClientRegistration.cs")
         self.assertIn("capture_debug_bundle", vs_registration)
         self.assertIn("evaluate_expressions_batch", vs_registration)
         self.assertIn("stopReason", vs_registration)
+        self.assertIn("cursor_allowlist_sync.py", vs_registration)
 
     def test_named_pipe_strict_mode_toggle_present(self) -> None:
         vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
@@ -98,6 +100,16 @@ class ContractTests(unittest.TestCase):
         server_py = read("mcp_server/server.py")
         self.assertIn("capture_debug_bundle", server_py)
         self.assertIn("evaluate_expressions_batch", server_py)
+
+    def test_cursor_allowlist_helper_is_bundled(self) -> None:
+        helper_py = read("mcp_server/cursor_allowlist_sync.py")
+        vs_project = read("VSDebuggerMCP/VSDebuggerMCP.csproj")
+        rider_registration = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/McpClientRegistration.kt")
+
+        self.assertIn("mcpAllowedTools", helper_py)
+        self.assertIn("state.vscdb", helper_py)
+        self.assertIn("cursor_allowlist_sync.py", vs_project)
+        self.assertIn("cursor_allowlist_sync.py", rider_registration)
 
 
 if __name__ == "__main__":
