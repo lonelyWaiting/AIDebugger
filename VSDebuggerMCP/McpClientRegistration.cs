@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -24,6 +25,8 @@ namespace VSDebuggerMCP
         private const string ClientNameClaudeCode = "Claude Code";
         private const string ClientNameOpenCode = "OpenCode";
         private const string CursorAllowListSyncScript = "cursor_allowlist_sync.py";
+        private const string BundleSignatureFileName = ".bundle-signature";
+        private static readonly int[] DefaultSupportedPythonMinorVersions = { 14, 13, 12, 11, 10 };
 
         /// <summary>
         /// Server use instructions that help Cursor AI understand when and how to use this MCP.
@@ -89,40 +92,77 @@ namespace VSDebuggerMCP
             public string VersionText { get; set; }
         }
 
-        private static bool IsSupportedPythonVersion(int major, int minor)
+        private class PythonRuntimeCandidate
         {
-            return major == 3 && minor >= 10;
+            public string Command { get; set; }
+            public string[] PrefixArgs { get; set; }
+        }
+
+        private class WheelsManifest
+        {
+            public string[] python { get; set; }
+        }
+
+        private static bool IsSupportedPythonVersion(int major, int minor, IList<int> supportedMinorVersions)
+        {
+            return major == 3 && supportedMinorVersions != null && supportedMinorVersions.Contains(minor);
+        }
+
+        public static string GetSupportedPythonVersionRequirement(Action<string> log = null)
+        {
+            return DescribeSupportedPythonVersions(GetSupportedPythonMinorVersions(log));
         }
 
         private static bool TryResolvePythonRuntime(Action<string> log, out PythonRuntimeInfo runtime)
         {
             runtime = null;
             log = log ?? ((s) => { });
-
-            // Use "py -3" to automatically select the latest Python 3.x on Windows.
-            // This avoids hardcoding version-specific candidates (py -3.14, py -3.13, etc.)
-            // and automatically adapts when new Python versions are installed.
-            // Fallback to "python" / "python3" for non-Windows or environments without the py launcher.
-            var candidates = new[]
-            {
-                new { Command = "py", Args = new[] { "-3" } },
-                new { Command = "python3", Args = new string[0] },
-                new { Command = "python", Args = new string[0] }
-            };
+            var supportedMinorVersions = GetSupportedPythonMinorVersions(log);
+            var candidates = BuildPythonRuntimeCandidates(supportedMinorVersions);
 
             foreach (var candidate in candidates)
             {
-                if (TryProbePythonRuntime(candidate.Command, candidate.Args, log, out runtime))
+                if (TryProbePythonRuntime(candidate.Command, candidate.PrefixArgs, supportedMinorVersions, log, out runtime))
                 {
                     return true;
                 }
             }
 
-            log("No compatible Python runtime found. Please install Python 3.10+ x64.");
+            log($"No compatible Python runtime found. Please install {DescribeSupportedPythonVersions(supportedMinorVersions)}.");
             return false;
         }
 
-        private static bool TryProbePythonRuntime(string command, string[] prefixArgs, Action<string> log, out PythonRuntimeInfo runtime)
+        private static List<PythonRuntimeCandidate> BuildPythonRuntimeCandidates(IList<int> supportedMinorVersions)
+        {
+            var candidates = new List<PythonRuntimeCandidate>();
+
+            if (supportedMinorVersions != null)
+            {
+                foreach (var minor in supportedMinorVersions)
+                {
+                    candidates.Add(new PythonRuntimeCandidate
+                    {
+                        Command = "py",
+                        PrefixArgs = new[] { $"-3.{minor}" }
+                    });
+                }
+            }
+
+            candidates.Add(new PythonRuntimeCandidate
+            {
+                Command = "python3",
+                PrefixArgs = new string[0]
+            });
+            candidates.Add(new PythonRuntimeCandidate
+            {
+                Command = "python",
+                PrefixArgs = new string[0]
+            });
+
+            return candidates;
+        }
+
+        private static bool TryProbePythonRuntime(string command, string[] prefixArgs, IList<int> supportedMinorVersions, Action<string> log, out PythonRuntimeInfo runtime)
         {
             runtime = null;
             log = log ?? ((s) => { });
@@ -174,9 +214,9 @@ namespace VSDebuggerMCP
 
                     var major = int.Parse(match.Groups[1].Value);
                     var minor = int.Parse(match.Groups[2].Value);
-                    if (!IsSupportedPythonVersion(major, minor))
+                    if (!IsSupportedPythonVersion(major, minor, supportedMinorVersions))
                     {
-                        log($"Ignoring unsupported Python runtime: {trimmed} (requires 3.10+)");
+                        log($"Ignoring unsupported Python runtime: {trimmed} (requires {DescribeSupportedPythonVersions(supportedMinorVersions)})");
                         return false;
                     }
 
@@ -195,50 +235,121 @@ namespace VSDebuggerMCP
                 return false;
             }
         }
-        
+
+        private static List<int> GetSupportedPythonMinorVersions(Action<string> log)
+        {
+            log = log ?? ((s) => { });
+            var manifestPath = GetBundledMcpServerFilePath(Path.Combine("vendor", "wheels", "manifest.json"));
+            if (!File.Exists(manifestPath))
+            {
+                return new List<int>(DefaultSupportedPythonMinorVersions);
+            }
+
+            try
+            {
+                var serializer = new JavaScriptSerializer();
+                var manifest = serializer.Deserialize<WheelsManifest>(File.ReadAllText(manifestPath, Encoding.UTF8));
+                if (manifest?.python == null || manifest.python.Length == 0)
+                {
+                    return new List<int>(DefaultSupportedPythonMinorVersions);
+                }
+
+                var versions = new List<int>();
+                foreach (var pyTag in manifest.python)
+                {
+                    if (string.IsNullOrWhiteSpace(pyTag))
+                    {
+                        continue;
+                    }
+
+                    var match = Regex.Match(pyTag.Trim(), @"^cp3(\d{2})$");
+                    if (!match.Success)
+                    {
+                        continue;
+                    }
+
+                    var minor = int.Parse(match.Groups[1].Value);
+                    if (!versions.Contains(minor))
+                    {
+                        versions.Add(minor);
+                    }
+                }
+
+                if (versions.Count == 0)
+                {
+                    return new List<int>(DefaultSupportedPythonMinorVersions);
+                }
+
+                versions.Sort();
+                versions.Reverse();
+                return versions;
+            }
+            catch (Exception ex)
+            {
+                log($"Failed to parse bundled wheel manifest '{manifestPath}': {ex.Message}");
+                return new List<int>(DefaultSupportedPythonMinorVersions);
+            }
+        }
+
+        private static string DescribeSupportedPythonVersions(IList<int> supportedMinorVersions)
+        {
+            if (supportedMinorVersions == null || supportedMinorVersions.Count == 0)
+            {
+                return "Python 3.10+ x64";
+            }
+
+            var ordered = new List<int>(supportedMinorVersions);
+            ordered.Sort();
+
+            var isContiguousRange = true;
+            for (int i = 1; i < ordered.Count; i++)
+            {
+                if (ordered[i] != ordered[i - 1] + 1)
+                {
+                    isContiguousRange = false;
+                    break;
+                }
+            }
+
+            if (isContiguousRange)
+            {
+                return $"Python 3.{ordered[0]}-3.{ordered[ordered.Count - 1]} x64";
+            }
+
+            var parts = new List<string>();
+            foreach (var minor in ordered)
+            {
+                parts.Add($"3.{minor}");
+            }
+
+            return $"Python {string.Join(", ", parts.ToArray())} x64";
+        }
         /// <summary>
         /// Gets the path to the MCP server Python script.
         /// Primary location is ~/.ai-debugger/mcp_server (stable path).
-        /// If the stable path doesn't exist, attempts to seed from the VSIX extension directory.
+        /// If the stable path bundle is stale, refresh it from the VSIX extension directory.
         /// </summary>
         public static string GetMcpServerPath()
         {
             var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            
-            // Primary location: ~/.ai-debugger/mcp_server (stable path)
             var stablePath = Path.Combine(userProfile, ".ai-debugger", "mcp_server", "server.py");
             var normalizedStablePath = Path.GetFullPath(stablePath);
-            
+
+            if (TryEnsureBundledServerFiles(null, out var syncedServerPath))
+            {
+                return syncedServerPath;
+            }
+
             if (File.Exists(normalizedStablePath))
             {
                 return normalizedStablePath;
             }
 
-            // Stable path doesn't exist – try to seed from the VSIX extension directory or dev layout
-            var extensionDir = GetExtensionDirectory();
-            var sourceDirectories = new[]
+            if (TryFindBundledMcpServerSourceDirectory(out var sourceDir))
             {
-                // Extension directory (bundled with VSIX)
-                Path.Combine(extensionDir, "mcp_server"),
-                // Development layout: running from VSDebuggerMCP/bin/Debug
-                Path.GetFullPath(Path.Combine(extensionDir, "..", "..", "..", "mcp_server")),
-            };
-
-            foreach (var sourceDir in sourceDirectories)
-            {
-                var sourceServer = Path.Combine(sourceDir, "server.py");
-                if (File.Exists(sourceServer))
-                {
-                    if (TrySeedServerFiles(sourceDir, Path.GetDirectoryName(normalizedStablePath)))
-                    {
-                        return normalizedStablePath;
-                    }
-                    // Seeding failed, fall back to using source directly
-                    return Path.GetFullPath(sourceServer);
-                }
+                return Path.GetFullPath(Path.Combine(sourceDir, "server.py"));
             }
 
-            // Legacy user profile location
             var legacyPath = Path.Combine(userProfile, ".vs-debugger-mcp", "mcp_server", "server.py");
             var normalizedLegacy = Path.GetFullPath(legacyPath);
             if (File.Exists(normalizedLegacy))
@@ -246,28 +357,142 @@ namespace VSDebuggerMCP
                 return normalizedLegacy;
             }
 
-            // Return the stable path even if it doesn't exist (will show meaningful error)
             return normalizedStablePath;
         }
 
-        /// <summary>
-        /// Copies all MCP server files from a source directory to the stable target directory.
-        /// </summary>
-        private static bool TrySeedServerFiles(string sourceDir, string targetDir)
+        private static bool TryEnsureBundledServerFiles(Action<string> log, out string serverPath)
         {
+            log = log ?? ((s) => { });
+            var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var targetDir = Path.Combine(userProfile, ".ai-debugger", "mcp_server");
+            serverPath = Path.GetFullPath(Path.Combine(targetDir, "server.py"));
+
+            if (!TryFindBundledMcpServerSourceDirectory(out var sourceDir))
+            {
+                return File.Exists(serverPath);
+            }
+
             try
             {
+                Directory.CreateDirectory(targetDir);
+
+                var expectedSignature = ComputeDirectorySignature(sourceDir);
+                var signaturePath = Path.Combine(targetDir, BundleSignatureFileName);
+                var serverFilesInSync =
+                    Directory.Exists(targetDir) &&
+                    File.Exists(serverPath) &&
+                    AllBundledServerFilesExist(sourceDir, targetDir) &&
+                    !string.IsNullOrEmpty(expectedSignature) &&
+                    File.Exists(signaturePath) &&
+                    string.Equals(File.ReadAllText(signaturePath, Encoding.UTF8).Trim(), expectedSignature, StringComparison.OrdinalIgnoreCase);
+
+                if (serverFilesInSync)
+                {
+                    return true;
+                }
+
                 if (Directory.Exists(targetDir))
                 {
                     Directory.Delete(targetDir, true);
                 }
+
                 CopyDirectoryRecursive(sourceDir, targetDir);
-                return File.Exists(Path.Combine(targetDir, "server.py"));
+                if (!string.IsNullOrEmpty(expectedSignature))
+                {
+                    File.WriteAllText(signaturePath, expectedSignature, Encoding.UTF8);
+                }
+
+                return File.Exists(serverPath);
             }
-            catch
+            catch (Exception ex)
             {
-                return false;
+                log($"Failed to refresh bundled MCP server files: {ex.Message}");
+                return File.Exists(serverPath);
             }
+        }
+
+        private static bool TryFindBundledMcpServerSourceDirectory(out string sourceDir)
+        {
+            var extensionDir = GetExtensionDirectory();
+            var sourceDirectories = new[]
+            {
+                Path.Combine(extensionDir, "mcp_server"),
+                Path.GetFullPath(Path.Combine(extensionDir, "..", "..", "..", "mcp_server")),
+            };
+
+            foreach (var candidate in sourceDirectories)
+            {
+                if (File.Exists(Path.Combine(candidate, "server.py")))
+                {
+                    sourceDir = Path.GetFullPath(candidate);
+                    return true;
+                }
+            }
+
+            sourceDir = null;
+            return false;
+        }
+
+        private static bool AllBundledServerFilesExist(string sourceDir, string targetDir)
+        {
+            var sourceFiles = Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories);
+            foreach (var sourceFile in sourceFiles)
+            {
+                var relativePath = GetRelativePath(sourceDir, sourceFile);
+                if (!File.Exists(Path.Combine(targetDir, relativePath)))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static string ComputeDirectorySignature(string sourceDir)
+        {
+            var files = Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories);
+            Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+
+            using (var sha = SHA256.Create())
+            {
+                foreach (var file in files)
+                {
+                    AppendHashBytes(sha, Encoding.UTF8.GetBytes(GetRelativePath(sourceDir, file).Replace("\\", "/")));
+                    AppendHashBytes(sha, new byte[] { (byte)'\n' });
+
+                    using (var stream = File.OpenRead(file))
+                    {
+                        var buffer = new byte[81920];
+                        int read;
+                        while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+                        {
+                            sha.TransformBlock(buffer, 0, read, null, 0);
+                        }
+                    }
+
+                    AppendHashBytes(sha, new byte[] { (byte)'\n' });
+                }
+
+                sha.TransformFinalBlock(new byte[0], 0, 0);
+                return BitConverter.ToString(sha.Hash).Replace("-", "").ToLowerInvariant();
+            }
+        }
+
+        private static void AppendHashBytes(HashAlgorithm hash, byte[] bytes)
+        {
+            hash.TransformBlock(bytes, 0, bytes.Length, null, 0);
+        }
+
+        private static string GetRelativePath(string rootPath, string fullPath)
+        {
+            var root = Path.GetFullPath(rootPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var full = Path.GetFullPath(fullPath);
+            if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            {
+                return Path.GetFileName(full);
+            }
+
+            return full.Substring(root.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         }
 
         /// <summary>
@@ -303,29 +528,32 @@ namespace VSDebuggerMCP
             var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             var stablePath = Path.Combine(userProfile, ".ai-debugger", "mcp_server", relativePath);
             var normalizedStablePath = Path.GetFullPath(stablePath);
+
+            if (TryEnsureBundledServerFiles(null, out var stableServerPath))
+            {
+                var syncedPath = Path.Combine(Path.GetDirectoryName(stableServerPath), relativePath);
+                if (File.Exists(syncedPath))
+                {
+                    return Path.GetFullPath(syncedPath);
+                }
+            }
+
             if (File.Exists(normalizedStablePath))
             {
                 return normalizedStablePath;
             }
 
-            var extensionDir = GetExtensionDirectory();
-            var candidatePaths = new[]
+            if (TryFindBundledMcpServerSourceDirectory(out var sourceDir))
             {
-                Path.Combine(extensionDir, "mcp_server", relativePath),
-                Path.GetFullPath(Path.Combine(extensionDir, "..", "..", "..", "mcp_server", relativePath)),
-            };
-
-            foreach (var candidatePath in candidatePaths)
-            {
-                if (File.Exists(candidatePath))
+                var bundledPath = Path.GetFullPath(Path.Combine(sourceDir, relativePath));
+                if (File.Exists(bundledPath))
                 {
-                    return Path.GetFullPath(candidatePath);
+                    return bundledPath;
                 }
             }
 
             return normalizedStablePath;
         }
-
         private static string QuoteProcessArgument(string value)
         {
             if (string.IsNullOrEmpty(value))
@@ -522,7 +750,7 @@ namespace VSDebuggerMCP
                 if (!TryResolvePythonRuntime(log, out var pythonRuntime))
                 {
                     result.Success = false;
-                    result.Message = "No compatible Python runtime found. Please install Python 3.10-3.13 x64.";
+                    result.Message = "No compatible Python runtime found. Please install " + GetSupportedPythonVersionRequirement(log) + ".";
                     return result;
                 }
 
@@ -650,7 +878,7 @@ namespace VSDebuggerMCP
                 if (!TryResolvePythonRuntime(log, out var pythonRuntime))
                 {
                     result.Success = false;
-                    result.Message = "No compatible Python runtime found. Please install Python 3.10-3.13 x64.";
+                    result.Message = "No compatible Python runtime found. Please install " + GetSupportedPythonVersionRequirement(log) + ".";
                     return result;
                 }
 
@@ -887,7 +1115,7 @@ namespace VSDebuggerMCP
                 if (!TryResolvePythonRuntime(log, out var pythonRuntime))
                 {
                     result.Success = false;
-                    result.Message = "No compatible Python runtime found. Please install Python 3.10-3.13 x64.";
+                    result.Message = "No compatible Python runtime found. Please install " + GetSupportedPythonVersionRequirement(log) + ".";
                     return result;
                 }
                 

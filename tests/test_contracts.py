@@ -106,6 +106,14 @@ class ContractTests(unittest.TestCase):
         self.assertIn("cursor_allowlist_sync.py", vs_registration)
         self.assertIn("continue_and_wait_for_break", vs_registration)
 
+    def test_vs_registration_refreshes_seeded_bundle_and_pins_python_versions(self) -> None:
+        vs_registration = read("VSDebuggerMCP/McpClientRegistration.cs")
+        self.assertIn(".bundle-signature", vs_registration)
+        self.assertIn("TryEnsureBundledServerFiles", vs_registration)
+        self.assertIn("ComputeDirectorySignature", vs_registration)
+        self.assertIn('manifest.json', vs_registration)
+        self.assertIn('PrefixArgs = new[] { $"-3.{minor}" }', vs_registration)
+
     def test_named_pipe_strict_mode_toggle_present(self) -> None:
         vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
         rider_pipe = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/NamedPipeServer.kt")

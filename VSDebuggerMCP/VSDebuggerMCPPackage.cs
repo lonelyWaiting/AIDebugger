@@ -112,7 +112,7 @@ namespace VSDebuggerMCP
                 LogMessage("Checking Python installation...");
                 if (!McpClientRegistration.IsPythonAvailable(LogMessage))
                 {
-                    LogError("Python is not installed or not in PATH. Please install Python 3.10+ and add it to PATH.");
+                    LogError("Python is not installed or not in PATH. Please install " + McpClientRegistration.GetSupportedPythonVersionRequirement(LogMessage) + " and add it to PATH.");
                     return;
                 }
 
