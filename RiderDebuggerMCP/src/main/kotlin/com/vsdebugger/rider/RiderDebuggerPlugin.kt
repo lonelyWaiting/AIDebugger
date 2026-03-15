@@ -7,6 +7,7 @@ class RiderDebuggerPlugin : StartupActivity {
     override fun runActivity(project: Project) {
         RiderDebuggerServerService.getInstance().ensureStarted()
         McpClientRegistration.registerWithCursor()
+        McpClientRegistration.registerWithCodex()
         McpClientRegistration.registerWithClaudeDesktop()
         McpClientRegistration.registerWithClaudeCode()
         McpClientRegistration.registerWithOpenCode()

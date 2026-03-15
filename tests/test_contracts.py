@@ -138,6 +138,23 @@ class ContractTests(unittest.TestCase):
         self.assertIn("cursor_allowlist_sync.py", vs_project)
         self.assertIn("cursor_allowlist_sync.py", rider_registration)
 
+    def test_codex_registration_is_wired_for_vs_and_rider(self) -> None:
+        vs_package = read("VSDebuggerMCP/VSDebuggerMCPPackage.cs")
+        vs_registration = read("VSDebuggerMCP/McpClientRegistration.cs")
+        rider_plugin = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/RiderDebuggerPlugin.kt")
+        rider_registration = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/McpClientRegistration.kt")
+
+        self.assertIn("RegisterWithCodex", vs_package)
+        self.assertIn("GetCodexConfigPath", vs_registration)
+        self.assertIn("RegisterWithCodex", vs_registration)
+        self.assertIn("config.toml", vs_registration)
+        self.assertIn("CODEX_HOME", vs_registration)
+        self.assertIn("registerWithCodex()", rider_plugin)
+        self.assertIn("getCodexConfigPath", rider_registration)
+        self.assertIn("registerWithCodex", rider_registration)
+        self.assertIn("config.toml", rider_registration)
+        self.assertIn("CODEX_HOME", rider_registration)
+
 
 if __name__ == "__main__":
     unittest.main()

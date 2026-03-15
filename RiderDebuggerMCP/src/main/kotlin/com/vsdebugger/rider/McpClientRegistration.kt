@@ -11,12 +11,14 @@ import java.util.concurrent.TimeUnit
 
 object McpClientRegistration {
     private const val McpServerName = "AIDebuggerRider"
+    private const val LegacyMcpServerName = "AIDebugger"
     private const val PreferredIde = "rider"
     private val log = Logger.getInstance(McpClientRegistration::class.java)
     private val gson = GsonBuilder().setPrettyPrinting().create()
     
     // Client display names for logging
     private const val ClientNameCursor = "Cursor"
+    private const val ClientNameCodex = "Codex"
     private const val ClientNameClaudeDesktop = "Claude Desktop"
     private const val ClientNameClaudeCode = "Claude Code"
     private const val ClientNameOpenCode = "OpenCode"
@@ -72,6 +74,23 @@ object McpClientRegistration {
             log.warn("Failed to register MCP server with Claude Desktop: ${ex.message}", ex)
         }
     }
+
+    fun registerWithCodex() {
+        try {
+            val pythonCommand = resolvePythonCommand()
+            if (pythonCommand == null) {
+                log.warn("Python 3.10+ is required for MCP server registration. Skipping Codex registration.")
+                return
+            }
+
+            val serverPath = ensureServerFiles() ?: return
+            val configPath = getCodexConfigPath()
+            registerToCodexConfig(configPath, serverPath, pythonCommand, ClientNameCodex, createDirIfMissing = true)
+        } catch (ex: Exception) {
+            log.warn("Failed to register MCP server with Codex: ${ex.message}", ex)
+        }
+    }
+
     fun registerWithClaudeCode() {
         try {
             if (!isPythonAvailable()) {
@@ -245,6 +264,48 @@ object McpClientRegistration {
         log.info("[$clientName] Registered MCP server '$McpServerName'.")
     }
 
+    private fun registerToCodexConfig(
+        configPath: String,
+        serverPath: String,
+        pythonCommand: String,
+        clientName: String,
+        createDirIfMissing: Boolean
+    ) {
+        val configFile = File(configPath)
+        val configDir = configFile.parentFile
+
+        if (configDir != null && !configDir.exists()) {
+            if (createDirIfMissing) {
+                configDir.mkdirs()
+                log.info("[$clientName] Created directory: ${configDir.absolutePath}")
+            } else {
+                log.debug("[$clientName] Directory does not exist, skipping.")
+                return
+            }
+        }
+
+        val normalizedPath = serverPath.replace("\\", "/")
+        val expectedBlock = buildCodexTomlEntry(McpServerName, pythonCommand, normalizedPath)
+        val existingToml = if (configFile.exists()) {
+            configFile.readText(StandardCharsets.UTF_8)
+        } else {
+            ""
+        }
+
+        val hasLegacySections =
+            hasTomlSection(existingToml, "mcp_servers.$LegacyMcpServerName") ||
+                hasTomlSection(existingToml, "mcp_servers.$LegacyMcpServerName.env")
+
+        if (!hasLegacySections && containsNormalizedTomlBlock(existingToml, expectedBlock)) {
+            log.debug("[$clientName] MCP server '$McpServerName' already registered.")
+            return
+        }
+
+        val updatedToml = upsertCodexTomlEntry(existingToml, expectedBlock)
+        configFile.writeText(updatedToml, StandardCharsets.UTF_8)
+        log.info("[$clientName] Registered MCP server '$McpServerName'.")
+    }
+
     private fun ensureServerFiles(): String? {
         val targetDir = File(System.getProperty("user.home"), ".ai-debugger/mcp_server")
         if (!targetDir.exists() && !targetDir.mkdirs()) {
@@ -353,6 +414,13 @@ object McpClientRegistration {
         return File(File(userHome, ".cursor"), "mcp.json").absolutePath
     }
 
+    private fun getCodexConfigPath(): String {
+        val codexHome = System.getenv("CODEX_HOME")
+            ?.takeIf { it.isNotBlank() }
+            ?: File(System.getProperty("user.home"), ".codex").absolutePath
+        return File(codexHome, "config.toml").absolutePath
+    }
+
     private fun getClaudeDesktopConfigPath(): String {
         val appData = System.getenv("APPDATA")
             ?: File(System.getProperty("user.home"), "AppData/Roaming").absolutePath
@@ -393,6 +461,71 @@ object McpClientRegistration {
         val created = mutableMapOf<String, Any>()
         config[key] = created
         return created
+    }
+
+    private fun buildCodexTomlEntry(serverName: String, pythonCommand: String, normalizedPath: String): String {
+        return buildString {
+            appendLine("[mcp_servers.$serverName]")
+            appendLine("command = \"${escapeTomlString(pythonCommand)}\"")
+            appendLine("args = [")
+            appendLine("  \"${escapeTomlString(normalizedPath)}\"")
+            appendLine("]")
+            appendLine()
+            appendLine("[mcp_servers.$serverName.env]")
+            appendLine("AIDB_PREFERRED_IDE = \"$PreferredIde\"")
+            appendLine("PYTHONIOENCODING = \"utf-8\"")
+        }.trimEnd()
+    }
+
+    private fun upsertCodexTomlEntry(existingToml: String, expectedBlock: String): String {
+        var updatedToml = existingToml
+        updatedToml = removeTomlSection(updatedToml, "mcp_servers.$McpServerName.env")
+        updatedToml = removeTomlSection(updatedToml, "mcp_servers.$McpServerName")
+        updatedToml = removeTomlSection(updatedToml, "mcp_servers.$LegacyMcpServerName.env")
+        updatedToml = removeTomlSection(updatedToml, "mcp_servers.$LegacyMcpServerName")
+        updatedToml = updatedToml.trimEnd()
+
+        return if (updatedToml.isEmpty()) {
+            expectedBlock + System.lineSeparator()
+        } else {
+            updatedToml + System.lineSeparator() + System.lineSeparator() + expectedBlock + System.lineSeparator()
+        }
+    }
+
+    private fun containsNormalizedTomlBlock(existingToml: String, expectedBlock: String): Boolean {
+        if (existingToml.isBlank() || expectedBlock.isBlank()) {
+            return false
+        }
+
+        return normalizeLineEndings(existingToml).contains(normalizeLineEndings(expectedBlock).trim())
+    }
+
+    private fun hasTomlSection(content: String, sectionName: String): Boolean {
+        if (content.isEmpty()) {
+            return false
+        }
+
+        val pattern = Regex("(?m)^[ \\t]*\\[${Regex.escape(sectionName)}\\][^\\r\\n]*$")
+        return pattern.containsMatchIn(content)
+    }
+
+    private fun removeTomlSection(content: String, sectionName: String): String {
+        if (content.isEmpty()) {
+            return content
+        }
+
+        val pattern = Regex(
+            "(?ms)^[ \\t]*\\[${Regex.escape(sectionName)}\\][^\\r\\n]*\\r?\\n(?:^(?![ \\t]*\\[).*\\r?\\n?)*"
+        )
+        return pattern.replace(content, "")
+    }
+
+    private fun normalizeLineEndings(value: String): String {
+        return value.replace("\r\n", "\n").replace('\r', '\n')
+    }
+
+    private fun escapeTomlString(value: String): String {
+        return value.replace("\\", "\\\\").replace("\"", "\\\"")
     }
 
     private fun isCorrectConfig(existing: Map<*, *>?, normalizedPath: String): Boolean {

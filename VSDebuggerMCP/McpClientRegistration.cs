@@ -12,7 +12,7 @@ namespace VSDebuggerMCP
 {
     /// <summary>
     /// Handles automatic registration of the MCP server in MCP client configurations
-    /// (Cursor, Claude Desktop, Claude Code, OpenCode).
+    /// (Cursor, Codex, Claude Desktop, Claude Code, OpenCode).
     /// </summary>
     public static class McpClientRegistration
     {
@@ -21,6 +21,7 @@ namespace VSDebuggerMCP
         
         // Client display names for logging
         private const string ClientNameCursor = "Cursor";
+        private const string ClientNameCodex = "Codex";
         private const string ClientNameClaudeDesktop = "Claude Desktop";
         private const string ClientNameClaudeCode = "Claude Code";
         private const string ClientNameOpenCode = "OpenCode";
@@ -657,6 +658,23 @@ namespace VSDebuggerMCP
         }
 
         /// <summary>
+        /// Gets the path to Codex's configuration file.
+        /// Windows default: %USERPROFILE%\.codex\config.toml
+        /// Respects CODEX_HOME when defined.
+        /// </summary>
+        public static string GetCodexConfigPath()
+        {
+            var codexHome = Environment.GetEnvironmentVariable("CODEX_HOME");
+            if (string.IsNullOrWhiteSpace(codexHome))
+            {
+                var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                codexHome = Path.Combine(userProfile, ".codex");
+            }
+
+            return Path.Combine(codexHome, "config.toml");
+        }
+
+        /// <summary>
         /// Gets the path to Claude Desktop's configuration file (Windows only).
         /// </summary>
         public static string GetClaudeDesktopConfigPath()
@@ -699,6 +717,16 @@ namespace VSDebuggerMCP
                 TrySyncCursorAllowList(McpServerNameVs, log);
             }
             return result;
+        }
+
+        /// <summary>
+        /// Registers the AIDebugger server in Codex's TOML configuration.
+        /// Creates the config directory and file if they don't exist.
+        /// </summary>
+        public static RegistrationResult RegisterWithCodex(Action<string> log = null)
+        {
+            var configPath = GetCodexConfigPath();
+            return RegisterToCodexConfig(configPath, ClientNameCodex, log, createDirIfMissing: true);
         }
 
         /// <summary>
@@ -1012,6 +1040,91 @@ namespace VSDebuggerMCP
         }
 
         /// <summary>
+        /// Registers the AIDebugger server in Codex's TOML configuration file.
+        /// Codex uses nested TOML tables under [mcp_servers.&lt;name&gt;].
+        /// </summary>
+        private static RegistrationResult RegisterToCodexConfig(string configPath, string clientName, Action<string> log, bool createDirIfMissing)
+        {
+            log = log ?? ((s) => { });
+            var result = new RegistrationResult();
+
+            try
+            {
+                var serverPath = GetMcpServerPath();
+
+                if (!TryResolvePythonRuntime(log, out var pythonRuntime))
+                {
+                    result.Success = false;
+                    result.Message = "No compatible Python runtime found. Please install " + GetSupportedPythonVersionRequirement(log) + ".";
+                    return result;
+                }
+
+                log($"Config path: {configPath}");
+                log($"MCP server path: {serverPath}");
+                log($"Python runtime: {pythonRuntime.VersionText} via '{pythonRuntime.Command}'");
+
+                var configDir = Path.GetDirectoryName(configPath);
+                if (!string.IsNullOrEmpty(configDir) && !Directory.Exists(configDir))
+                {
+                    if (createDirIfMissing)
+                    {
+                        Directory.CreateDirectory(configDir);
+                        log($"Created directory: {configDir}");
+                    }
+                    else
+                    {
+                        result.Success = true;
+                        result.Skipped = true;
+                        result.Message = $"{clientName} directory does not exist";
+                        return result;
+                    }
+                }
+
+                WithConfigFileLock(configPath, log, () =>
+                {
+                    var existingToml = File.Exists(configPath)
+                        ? File.ReadAllText(configPath, Encoding.UTF8)
+                        : string.Empty;
+                    var normalizedPath = serverPath.Replace("\\", "/");
+                    var expectedBlock = BuildCodexTomlEntry(McpServerNameVs, pythonRuntime, normalizedPath, "vs");
+
+                    var hasLegacySections =
+                        HasTomlSection(existingToml, $"mcp_servers.{LegacyMcpServerName}") ||
+                        HasTomlSection(existingToml, $"mcp_servers.{LegacyMcpServerName}.env");
+
+                    if (!hasLegacySections && ContainsNormalizedTomlBlock(existingToml, expectedBlock))
+                    {
+                        log("MCP server already correctly registered");
+                        result.Success = true;
+                        result.AlreadyRegistered = true;
+                        result.Message = "Already registered";
+                        return;
+                    }
+
+                    var updatedToml = UpsertCodexTomlEntry(existingToml, McpServerNameVs, expectedBlock);
+                    File.WriteAllText(configPath, updatedToml, new UTF8Encoding(false));
+
+                    log($"Successfully registered '{McpServerNameVs}'");
+
+                    result.Success = true;
+                    result.AlreadyRegistered = false;
+                    result.Message = $"Successfully registered. Please restart {clientName} to use the AIDebugger tools.";
+                    result.ConfigPath = configPath;
+                    result.ServerPath = serverPath;
+                });
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                log($"Error registering with {clientName}: {ex.Message}");
+                result.Success = false;
+                result.Message = $"Failed to register: {ex.Message}";
+                return result;
+            }
+        }
+
+        /// <summary>
         /// Checks if the existing OpenCode config is correct.
         /// OpenCode uses "command" as array and "environment" instead of "env".
         /// </summary>
@@ -1301,6 +1414,49 @@ namespace VSDebuggerMCP
         }
 
         /// <summary>
+        /// Unregisters the AIDebugger server from Codex's configuration.
+        /// </summary>
+        public static bool UnregisterFromCodex(Action<string> log = null)
+        {
+            log = log ?? ((s) => { });
+            var configPath = GetCodexConfigPath();
+
+            try
+            {
+                if (!File.Exists(configPath))
+                {
+                    log($"{ClientNameCodex} config does not exist, nothing to unregister");
+                    return true;
+                }
+
+                WithConfigFileLock(configPath, log, () =>
+                {
+                    var existingToml = File.ReadAllText(configPath, Encoding.UTF8);
+                    var updatedToml = RemoveTomlSection(existingToml, $"mcp_servers.{McpServerNameVs}.env");
+                    updatedToml = RemoveTomlSection(updatedToml, $"mcp_servers.{McpServerNameVs}");
+                    updatedToml = RemoveTomlSection(updatedToml, $"mcp_servers.{LegacyMcpServerName}.env");
+                    updatedToml = RemoveTomlSection(updatedToml, $"mcp_servers.{LegacyMcpServerName}");
+
+                    if (NormalizeLineEndings(existingToml).Trim() == NormalizeLineEndings(updatedToml).Trim())
+                    {
+                        log("No AIDebugger MCP servers found in config, nothing to unregister");
+                        return;
+                    }
+
+                    File.WriteAllText(configPath, updatedToml.TrimEnd() + Environment.NewLine, new UTF8Encoding(false));
+                    log($"Successfully unregistered AIDebugger from {ClientNameCodex}");
+                });
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                log($"Error unregistering from {ClientNameCodex}: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
         /// Unregisters the AIDebugger server from OpenCode's configuration.
         /// </summary>
         public static bool UnregisterFromOpenCode(Action<string> log = null)
@@ -1504,6 +1660,90 @@ namespace VSDebuggerMCP
             }
 
             return sb.ToString();
+        }
+
+        private static string BuildCodexTomlEntry(string entryName, PythonRuntimeInfo runtime, string normalizedPath, string preferredIde)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine($"[mcp_servers.{entryName}]");
+            sb.AppendLine($"command = \"{EscapeTomlString(runtime.Command)}\"");
+            sb.AppendLine("args = [");
+
+            foreach (var prefixArg in runtime.PrefixArgs ?? new string[0])
+            {
+                sb.AppendLine($"  \"{EscapeTomlString(prefixArg)}\",");
+            }
+
+            sb.AppendLine($"  \"{EscapeTomlString(normalizedPath)}\"");
+            sb.AppendLine("]");
+            sb.AppendLine();
+            sb.AppendLine($"[mcp_servers.{entryName}.env]");
+            sb.AppendLine($"AIDB_PREFERRED_IDE = \"{EscapeTomlString(preferredIde)}\"");
+            sb.AppendLine("PYTHONIOENCODING = \"utf-8\"");
+            return sb.ToString().TrimEnd();
+        }
+
+        private static string UpsertCodexTomlEntry(string existingToml, string entryName, string expectedBlock)
+        {
+            var updatedToml = existingToml ?? string.Empty;
+            updatedToml = RemoveTomlSection(updatedToml, $"mcp_servers.{entryName}.env");
+            updatedToml = RemoveTomlSection(updatedToml, $"mcp_servers.{entryName}");
+            updatedToml = RemoveTomlSection(updatedToml, $"mcp_servers.{LegacyMcpServerName}.env");
+            updatedToml = RemoveTomlSection(updatedToml, $"mcp_servers.{LegacyMcpServerName}");
+            updatedToml = updatedToml.TrimEnd();
+
+            if (!string.IsNullOrEmpty(updatedToml))
+            {
+                updatedToml += Environment.NewLine + Environment.NewLine;
+            }
+
+            updatedToml += expectedBlock + Environment.NewLine;
+            return updatedToml;
+        }
+
+        private static bool ContainsNormalizedTomlBlock(string existingToml, string expectedBlock)
+        {
+            if (string.IsNullOrWhiteSpace(existingToml) || string.IsNullOrWhiteSpace(expectedBlock))
+            {
+                return false;
+            }
+
+            var normalizedExisting = NormalizeLineEndings(existingToml);
+            var normalizedExpected = NormalizeLineEndings(expectedBlock).Trim();
+            return normalizedExisting.IndexOf(normalizedExpected, StringComparison.Ordinal) >= 0;
+        }
+
+        private static bool HasTomlSection(string content, string sectionName)
+        {
+            if (string.IsNullOrEmpty(content))
+            {
+                return false;
+            }
+
+            return Regex.IsMatch(
+                content,
+                @"(?m)^[ \t]*\[" + Regex.Escape(sectionName) + @"\][^\r\n]*$");
+        }
+
+        private static string RemoveTomlSection(string content, string sectionName)
+        {
+            if (string.IsNullOrEmpty(content))
+            {
+                return string.Empty;
+            }
+
+            var pattern = @"(?ms)^[ \t]*\[" + Regex.Escape(sectionName) + @"\][^\r\n]*\r?\n(?:^(?![ \t]*\[).*\r?\n?)*";
+            return Regex.Replace(content, pattern, string.Empty);
+        }
+
+        private static string NormalizeLineEndings(string value)
+        {
+            return (value ?? string.Empty).Replace("\r\n", "\n").Replace('\r', '\n');
+        }
+
+        private static string EscapeTomlString(string value)
+        {
+            return (value ?? string.Empty).Replace("\\", "\\\\").Replace("\"", "\\\"");
         }
 
         private static bool IsCorrectServerConfig(Dictionary<string, object> existingConfig, PythonRuntimeInfo runtime, string normalizedPath, string preferredIde)

@@ -57,7 +57,7 @@ namespace VSDebuggerMCP
 
                 LogMessage("AIDebugger initialized successfully. Named Pipe server is running.");
 
-                // Auto-register with MCP clients (Cursor, Claude Desktop, Claude Code, OpenCode)
+                // Auto-register with MCP clients (Cursor, Codex, Claude Desktop, Claude Code, OpenCode)
                 await Task.Run(() => AutoRegisterMcpClients());
             }
             catch (Exception ex)
@@ -102,7 +102,7 @@ namespace VSDebuggerMCP
 
         /// <summary>
         /// Automatically registers this extension with MCP clients
-        /// (Cursor, Claude Desktop, Claude Code, OpenCode).
+        /// (Cursor, Codex, Claude Desktop, Claude Code, OpenCode).
         /// </summary>
         private void AutoRegisterMcpClients()
         {
@@ -124,17 +124,22 @@ namespace VSDebuggerMCP
                 var cursorResult = McpClientRegistration.RegisterWithCursor(msg => LogMessage($"[Cursor] {msg}"));
                 HandleRegistrationResult(cursorResult, "Cursor");
 
-                // Step 4: Register with Claude Desktop
+                // Step 4: Register with Codex
+                LogMessage("[Codex] Checking MCP registration...");
+                var codexResult = McpClientRegistration.RegisterWithCodex(msg => LogMessage($"[Codex] {msg}"));
+                HandleRegistrationResult(codexResult, "Codex");
+
+                // Step 5: Register with Claude Desktop
                 LogMessage("[Claude Desktop] Checking MCP registration...");
                 var claudeResult = McpClientRegistration.RegisterWithClaudeDesktop(msg => LogMessage($"[Claude Desktop] {msg}"));
                 HandleRegistrationResult(claudeResult, "Claude Desktop");
 
-                // Step 5: Register with Claude Code
+                // Step 6: Register with Claude Code
                 LogMessage("[Claude Code] Checking MCP registration...");
                 var claudeCodeResult = McpClientRegistration.RegisterWithClaudeCode(msg => LogMessage($"[Claude Code] {msg}"));
                 HandleRegistrationResult(claudeCodeResult, "Claude Code");
 
-                // Step 6: Register with OpenCode
+                // Step 7: Register with OpenCode
                 LogMessage("[OpenCode] Checking MCP registration...");
                 var openCodeResult = McpClientRegistration.RegisterWithOpenCode(msg => LogMessage(msg));
                 HandleRegistrationResult(openCodeResult, "OpenCode");
