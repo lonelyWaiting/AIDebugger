@@ -29,6 +29,7 @@ namespace VSDebuggerMCP.Protocol
     [KnownType(typeof(SearchOutputResult))]
     [KnownType(typeof(BatchEvaluateResult))]
     [KnownType(typeof(DebugBundleResult))]
+    [KnownType(typeof(ContinueAndWaitResult))]
     public class DebugResponse
     {
         [DataMember(Name = "id")]

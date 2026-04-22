@@ -26,6 +26,9 @@ namespace VSDebuggerMCP
         private const int SnapshotMaxAttempts = 2;
         private const int SnapshotRetryDelayMs = 40;
         private const int SourceLookupCacheMaxEntries = 1024;
+        private const int BreakpointBindWaitMs = 250;
+        private const int BreakpointBindPollMs = 25;
+        private const int BreakpointProbeMaxDistance = 25;
         private static readonly TimeSpan SourceLookupMissCacheTtl = TimeSpan.FromSeconds(30);
 
         private const uint PROCESS_VM_READ = 0x0010;
@@ -3551,22 +3554,7 @@ namespace VSDebuggerMCP
                 {
                     foreach (EnvDTE.Breakpoint bp in debugger.Breakpoints)
                     {
-                        result.Breakpoints.Add(new BreakpointInfo
-                        {
-                            Name = bp.Name,
-                            FilePath = bp.File,
-                            LineNumber = bp.FileLine,
-                            Column = bp.FileColumn,
-                            FunctionName = bp.FunctionName,
-                            Enabled = bp.Enabled,
-                            Condition = bp.Condition,
-                            ConditionType = bp.ConditionType.ToString(),
-                            HitCount = bp.CurrentHits,
-                            HitCountTarget = bp.HitCountTarget,
-                            HitCountType = bp.HitCountType.ToString(),
-                            BreakpointType = GetBreakpointTypeString(bp.LocationType),
-                            Tag = bp.Tag
-                        });
+                        result.Breakpoints.Add(BuildBreakpointInfo(bp, debugger));
                     }
                     result.TotalCount = result.Breakpoints.Count;
                 }
@@ -3589,38 +3577,58 @@ namespace VSDebuggerMCP
                 ThreadHelper.ThrowIfNotOnUIThread();
                 var debugger = Debugger;
                 var result = new BreakpointOperationResult { Operation = "Set" };
+                string normalizedCondition = NormalizeBreakpointCondition(condition);
+                string breakpointLanguage = GetBreakpointLanguage(filePath);
 
                 try
                 {
-                    EnvDTE.Breakpoints bps;
-                    if (!string.IsNullOrEmpty(condition))
+                    var locationValidation = ValidateBreakpointLocation(filePath, lineNumber);
+                    if (!locationValidation.IsValid)
                     {
-                        bps = debugger.Breakpoints.Add("", filePath, lineNumber, 1, condition, 
-                            dbgBreakpointConditionType.dbgBreakpointConditionTypeWhenTrue);
-                    }
-                    else
-                    {
-                        bps = debugger.Breakpoints.Add("", filePath, lineNumber);
+                        result.Success = false;
+                        result.Message = locationValidation.ErrorMessage;
+                        return result;
                     }
 
-                    if (bps != null && bps.Count > 0)
-                    {
-                        var bp = bps.Item(1);
-                        result.Success = true;
-                        result.Message = $"Breakpoint set at {filePath}:{lineNumber}";
-                        result.BreakpointInfo = new BreakpointInfo
-                        {
-                            Name = bp.Name,
-                            FilePath = bp.File,
-                            LineNumber = bp.FileLine,
-                            Enabled = bp.Enabled
-                        };
-                    }
-                    else
+                    var breakpoint = AddFileBreakpoint(debugger, filePath, lineNumber, normalizedCondition, breakpointLanguage);
+                    if (breakpoint == null)
                     {
                         result.Success = false;
                         result.Message = "Failed to set breakpoint";
+                        return result;
                     }
+
+                    WaitForBreakpointBinding(debugger, breakpoint);
+                    var breakpointInfo = BuildBreakpointInfo(breakpoint, debugger, filePath, lineNumber, normalizedCondition);
+
+                    if (!breakpointInfo.ConditionApplied)
+                    {
+                        SafeDeleteBreakpoint(breakpoint);
+                        result.Success = false;
+                        result.Message = $"Breakpoint condition was not applied at {filePath}:{lineNumber}";
+                        return result;
+                    }
+
+                    if (ShouldSearchNearbyBindableLine(debugger, breakpointInfo))
+                    {
+                        var reboundBreakpoint = TryFindNearbyBoundBreakpoint(debugger, filePath, lineNumber, normalizedCondition, breakpointLanguage);
+                        if (reboundBreakpoint == null)
+                        {
+                            result.Success = false;
+                            result.BreakpointInfo = breakpointInfo;
+                            result.Message = $"Breakpoint at {filePath}:{lineNumber} is still pending because no nearby executable code is bound in the current session";
+                            return result;
+                        }
+
+                        SafeDeleteBreakpoint(breakpoint);
+                        breakpoint = reboundBreakpoint;
+                        WaitForBreakpointBinding(debugger, breakpoint);
+                        breakpointInfo = BuildBreakpointInfo(breakpoint, debugger, filePath, lineNumber, normalizedCondition);
+                    }
+
+                    result.Success = true;
+                    result.BreakpointInfo = breakpointInfo;
+                    result.Message = BuildSetBreakpointMessage(breakpointInfo, filePath, lineNumber);
                 }
                 catch (Exception ex)
                 {
@@ -3642,13 +3650,14 @@ namespace VSDebuggerMCP
                 ThreadHelper.ThrowIfNotOnUIThread();
                 var debugger = Debugger;
                 var result = new BreakpointOperationResult { Operation = "SetFunction" };
+                string normalizedCondition = NormalizeBreakpointCondition(condition);
 
                 try
                 {
                     EnvDTE.Breakpoints bps;
-                    if (!string.IsNullOrEmpty(condition))
+                    if (!string.IsNullOrEmpty(normalizedCondition))
                     {
-                        bps = debugger.Breakpoints.Add(functionName, "", 0, 0, condition,
+                        bps = debugger.Breakpoints.Add(functionName, "", 0, 0, normalizedCondition,
                             dbgBreakpointConditionType.dbgBreakpointConditionTypeWhenTrue);
                     }
                     else
@@ -3659,14 +3668,18 @@ namespace VSDebuggerMCP
                     if (bps != null && bps.Count > 0)
                     {
                         var bp = bps.Item(1);
+                        var breakpointInfo = BuildBreakpointInfo(bp, debugger, null, 0, normalizedCondition);
+                        if (!breakpointInfo.ConditionApplied)
+                        {
+                            SafeDeleteBreakpoint(bp);
+                            result.Success = false;
+                            result.Message = $"Function breakpoint condition was not applied on {functionName}";
+                            return result;
+                        }
+
                         result.Success = true;
                         result.Message = $"Function breakpoint set on {functionName}";
-                        result.BreakpointInfo = new BreakpointInfo
-                        {
-                            Name = bp.Name,
-                            FunctionName = bp.FunctionName,
-                            Enabled = bp.Enabled
-                        };
+                        result.BreakpointInfo = breakpointInfo;
                     }
                     else
                     {
@@ -3796,6 +3809,469 @@ namespace VSDebuggerMCP
 
                 return result;
             });
+        }
+
+        private BreakpointInfo BuildBreakpointInfo(EnvDTE.Breakpoint breakpoint, Debugger5 debugger, string requestedFilePath = null, int requestedLineNumber = 0, string requestedCondition = null)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var boundChildren = GetBreakpointChildren(breakpoint);
+            var resolvedBreakpoint = GetResolvedBreakpoint(breakpoint, boundChildren);
+
+            return new BreakpointInfo
+            {
+                Name = breakpoint.Name,
+                FilePath = breakpoint.File,
+                LineNumber = breakpoint.FileLine,
+                Column = breakpoint.FileColumn,
+                FunctionName = breakpoint.FunctionName,
+                Enabled = breakpoint.Enabled,
+                Condition = breakpoint.Condition,
+                ConditionType = GetConditionTypeString(breakpoint),
+                HitCount = breakpoint.CurrentHits,
+                HitCountTarget = breakpoint.HitCountTarget,
+                HitCountType = GetHitCountTypeString(breakpoint),
+                BreakpointType = GetBreakpointTypeString(breakpoint.LocationType),
+                Tag = breakpoint.Tag,
+                RequestedFilePath = string.IsNullOrEmpty(requestedFilePath) ? null : requestedFilePath,
+                RequestedLineNumber = requestedLineNumber,
+                RequestedCondition = requestedCondition,
+                ResolvedFilePath = resolvedBreakpoint?.File,
+                ResolvedLineNumber = resolvedBreakpoint?.FileLine ?? 0,
+                ResolvedColumn = resolvedBreakpoint?.FileColumn ?? 0,
+                ResolvedFunctionName = resolvedBreakpoint?.FunctionName,
+                BindingStatus = GetBreakpointBindingStatus(debugger, boundChildren.Count),
+                BoundChildrenCount = boundChildren.Count,
+                IsBound = boundChildren.Count > 0,
+                ConditionApplied = IsConditionApplied(requestedCondition, breakpoint.Condition)
+            };
+        }
+
+        private List<EnvDTE.Breakpoint> GetBreakpointChildren(EnvDTE.Breakpoint breakpoint)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var children = new List<EnvDTE.Breakpoint>();
+            if (breakpoint == null)
+            {
+                return children;
+            }
+
+            EnvDTE.Breakpoints breakpointChildren = null;
+            try
+            {
+                breakpointChildren = breakpoint.Children;
+            }
+            catch
+            {
+                return children;
+            }
+
+            if (breakpointChildren == null)
+            {
+                return children;
+            }
+
+            try
+            {
+                for (int i = 1; i <= breakpointChildren.Count; i++)
+                {
+                    var child = breakpointChildren.Item(i);
+                    if (child != null)
+                    {
+                        children.Add(child);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log($"[GetBreakpointChildren] Error enumerating children: {ex.Message}");
+            }
+
+            return children;
+        }
+
+        private EnvDTE.Breakpoint GetResolvedBreakpoint(EnvDTE.Breakpoint breakpoint, List<EnvDTE.Breakpoint> children)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (children != null && children.Count > 0)
+            {
+                return children[0];
+            }
+
+            return breakpoint;
+        }
+
+        private string GetBreakpointBindingStatus(Debugger5 debugger, int boundChildrenCount)
+        {
+            if (boundChildrenCount > 0)
+            {
+                return boundChildrenCount > 1 ? "bound_multiple" : "bound";
+            }
+
+            if (debugger == null)
+            {
+                return "unknown";
+            }
+
+            try
+            {
+                return debugger.CurrentMode == dbgDebugMode.dbgDesignMode ? "pending" : "unbound";
+            }
+            catch
+            {
+                return "unknown";
+            }
+        }
+
+        private bool IsConditionApplied(string requestedCondition, string actualCondition)
+        {
+            string normalizedRequested = NormalizeBreakpointCondition(requestedCondition);
+            if (string.IsNullOrEmpty(normalizedRequested))
+            {
+                return true;
+            }
+
+            string normalizedActual = NormalizeBreakpointCondition(actualCondition);
+            return string.Equals(normalizedRequested, normalizedActual, StringComparison.Ordinal);
+        }
+
+        private string NormalizeBreakpointCondition(string condition)
+        {
+            return string.IsNullOrWhiteSpace(condition) ? null : condition.Trim();
+        }
+
+        private string GetConditionTypeString(EnvDTE.Breakpoint breakpoint)
+        {
+            try
+            {
+                return breakpoint.ConditionType.ToString();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private string GetHitCountTypeString(EnvDTE.Breakpoint breakpoint)
+        {
+            try
+            {
+                return breakpoint.HitCountType.ToString();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private EnvDTE.Breakpoint AddFileBreakpoint(Debugger5 debugger, string filePath, int lineNumber, string condition, string language)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            EnvDTE.Breakpoints breakpoints;
+            if (!string.IsNullOrEmpty(condition))
+            {
+                if (string.IsNullOrEmpty(language))
+                {
+                    breakpoints = debugger.Breakpoints.Add("", filePath, lineNumber, 1, condition,
+                        dbgBreakpointConditionType.dbgBreakpointConditionTypeWhenTrue);
+                }
+                else
+                {
+                    breakpoints = debugger.Breakpoints.Add("", filePath, lineNumber, 1, condition,
+                        dbgBreakpointConditionType.dbgBreakpointConditionTypeWhenTrue, language);
+                }
+            }
+            else
+            {
+                breakpoints = debugger.Breakpoints.Add("", filePath, lineNumber);
+            }
+
+            return breakpoints != null && breakpoints.Count > 0 ? breakpoints.Item(1) : null;
+        }
+
+        private string GetBreakpointLanguage(string filePath)
+        {
+            string extension = System.IO.Path.GetExtension(filePath)?.ToLowerInvariant();
+            switch (extension)
+            {
+                case ".cs":
+                case ".csx":
+                    return "C#";
+                case ".vb":
+                    return "Basic";
+                case ".fs":
+                    return "F#";
+                case ".c":
+                case ".cc":
+                case ".cpp":
+                case ".cxx":
+                case ".h":
+                case ".hpp":
+                case ".hxx":
+                case ".inl":
+                    return "C++";
+                default:
+                    return null;
+            }
+        }
+
+        private bool WaitForBreakpointBinding(Debugger5 debugger, EnvDTE.Breakpoint breakpoint)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (breakpoint == null || debugger == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                if (debugger.CurrentMode == dbgDebugMode.dbgDesignMode)
+                {
+                    return false;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < BreakpointBindWaitMs)
+            {
+                if (GetBreakpointChildren(breakpoint).Count > 0)
+                {
+                    return true;
+                }
+
+                System.Threading.Thread.Sleep(BreakpointBindPollMs);
+            }
+
+            return false;
+        }
+
+        private bool ShouldSearchNearbyBindableLine(Debugger5 debugger, BreakpointInfo breakpointInfo)
+        {
+            if (breakpointInfo == null || breakpointInfo.IsBound || debugger == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                return debugger.CurrentMode != dbgDebugMode.dbgDesignMode &&
+                       !string.IsNullOrEmpty(breakpointInfo.FilePath) &&
+                       breakpointInfo.LineNumber > 0 &&
+                       IsLikelyNonBindableBreakpointLine(breakpointInfo.RequestedFilePath ?? breakpointInfo.FilePath,
+                           breakpointInfo.RequestedLineNumber > 0 ? breakpointInfo.RequestedLineNumber : breakpointInfo.LineNumber);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private EnvDTE.Breakpoint TryFindNearbyBoundBreakpoint(Debugger5 debugger, string filePath, int requestedLineNumber, string condition, string language)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            int lineCount = GetFileLineCount(filePath);
+            if (lineCount <= 0)
+            {
+                return null;
+            }
+
+            foreach (int candidateLine in EnumerateNearbyBreakpointLines(requestedLineNumber, lineCount))
+            {
+                var candidateBreakpoint = AddFileBreakpoint(debugger, filePath, candidateLine, condition, language);
+                if (candidateBreakpoint == null)
+                {
+                    continue;
+                }
+
+                WaitForBreakpointBinding(debugger, candidateBreakpoint);
+                if (GetBreakpointChildren(candidateBreakpoint).Count > 0)
+                {
+                    return candidateBreakpoint;
+                }
+
+                SafeDeleteBreakpoint(candidateBreakpoint);
+            }
+
+            return null;
+        }
+
+        private IEnumerable<int> EnumerateNearbyBreakpointLines(int requestedLineNumber, int lineCount)
+        {
+            if (requestedLineNumber < 1 || lineCount < 1)
+            {
+                yield break;
+            }
+
+            for (int distance = 1; distance <= BreakpointProbeMaxDistance; distance++)
+            {
+                int forwardLine = requestedLineNumber + distance;
+                if (forwardLine >= 1 && forwardLine <= lineCount)
+                {
+                    yield return forwardLine;
+                }
+
+                int backwardLine = requestedLineNumber - distance;
+                if (backwardLine >= 1 && backwardLine <= lineCount)
+                {
+                    yield return backwardLine;
+                }
+            }
+        }
+
+        private int GetFileLineCount(string filePath)
+        {
+            try
+            {
+                return System.IO.File.ReadAllLines(filePath).Length;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        private bool IsLikelyNonBindableBreakpointLine(string filePath, int lineNumber)
+        {
+            try
+            {
+                var lines = System.IO.File.ReadAllLines(filePath);
+                if (lineNumber < 1 || lineNumber > lines.Length)
+                {
+                    return false;
+                }
+
+                string trimmedLine = (lines[lineNumber - 1] ?? string.Empty).Trim();
+                if (string.IsNullOrEmpty(trimmedLine))
+                {
+                    return true;
+                }
+
+                if (trimmedLine.StartsWith("//", StringComparison.Ordinal) ||
+                    trimmedLine.StartsWith("/*", StringComparison.Ordinal) ||
+                    trimmedLine.StartsWith("*", StringComparison.Ordinal) ||
+                    trimmedLine.StartsWith("*/", StringComparison.Ordinal) ||
+                    trimmedLine.StartsWith("#", StringComparison.Ordinal))
+                {
+                    return true;
+                }
+
+                if (trimmedLine == "{" || trimmedLine == "}" || trimmedLine == "{}" || trimmedLine == "};")
+                {
+                    return true;
+                }
+
+                string extension = System.IO.Path.GetExtension(filePath)?.ToLowerInvariant();
+                if (extension == ".cs")
+                {
+                    if (trimmedLine.StartsWith("using ", StringComparison.Ordinal) &&
+                        trimmedLine.EndsWith(";", StringComparison.Ordinal) &&
+                        !trimmedLine.Contains("=") &&
+                        !trimmedLine.Contains("("))
+                    {
+                        return true;
+                    }
+
+                    if (trimmedLine.StartsWith("namespace ", StringComparison.Ordinal))
+                    {
+                        return true;
+                    }
+                }
+
+                if ((extension == ".c" || extension == ".cc" || extension == ".cpp" || extension == ".cxx" ||
+                     extension == ".h" || extension == ".hpp" || extension == ".hxx") &&
+                    trimmedLine.StartsWith("using namespace ", StringComparison.Ordinal))
+                {
+                    return true;
+                }
+
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private (bool IsValid, string ErrorMessage) ValidateBreakpointLocation(string filePath, int lineNumber)
+        {
+            if (string.IsNullOrWhiteSpace(filePath))
+            {
+                return (false, "File path is required");
+            }
+
+            if (!System.IO.File.Exists(filePath))
+            {
+                return (false, $"File not found: {filePath}");
+            }
+
+            int lineCount = GetFileLineCount(filePath);
+            if (lineCount <= 0)
+            {
+                return (false, $"Cannot read file: {filePath}");
+            }
+
+            if (lineNumber < 1)
+            {
+                return (false, "Line number must be >= 1");
+            }
+
+            if (lineNumber > lineCount)
+            {
+                return (false, $"Line {lineNumber} is beyond end of file (file has {lineCount} lines)");
+            }
+
+            return (true, null);
+        }
+
+        private void SafeDeleteBreakpoint(EnvDTE.Breakpoint breakpoint)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (breakpoint == null)
+            {
+                return;
+            }
+
+            try
+            {
+                breakpoint.Delete();
+            }
+            catch (Exception ex)
+            {
+                _log($"[SafeDeleteBreakpoint] Failed to delete breakpoint: {ex.Message}");
+            }
+        }
+
+        private string BuildSetBreakpointMessage(BreakpointInfo breakpointInfo, string requestedFilePath, int requestedLineNumber)
+        {
+            if (breakpointInfo == null)
+            {
+                return $"Breakpoint set at {requestedFilePath}:{requestedLineNumber}";
+            }
+
+            if (breakpointInfo.BindingStatus == "pending")
+            {
+                return $"Breakpoint created at {breakpointInfo.FilePath}:{breakpointInfo.LineNumber} and is pending binding";
+            }
+
+            if (breakpointInfo.IsBound &&
+                !string.IsNullOrEmpty(breakpointInfo.ResolvedFilePath) &&
+                breakpointInfo.ResolvedLineNumber > 0 &&
+                (breakpointInfo.ResolvedLineNumber != requestedLineNumber ||
+                 !string.Equals(breakpointInfo.ResolvedFilePath, requestedFilePath, StringComparison.OrdinalIgnoreCase)))
+            {
+                return $"Breakpoint requested at {requestedFilePath}:{requestedLineNumber} and bound to {breakpointInfo.ResolvedFilePath}:{breakpointInfo.ResolvedLineNumber}";
+            }
+
+            if (breakpointInfo.LineNumber != requestedLineNumber)
+            {
+                return $"Breakpoint moved from {requestedFilePath}:{requestedLineNumber} to {breakpointInfo.FilePath}:{breakpointInfo.LineNumber}";
+            }
+
+            return $"Breakpoint set at {breakpointInfo.FilePath}:{breakpointInfo.LineNumber}";
         }
 
         private string GetBreakpointTypeString(dbgBreakpointLocationType type)

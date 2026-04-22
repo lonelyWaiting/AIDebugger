@@ -791,6 +791,39 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "tag")]
         public string Tag { get; set; }
+
+        [DataMember(Name = "requestedFilePath")]
+        public string RequestedFilePath { get; set; }
+
+        [DataMember(Name = "requestedLineNumber")]
+        public int RequestedLineNumber { get; set; }
+
+        [DataMember(Name = "requestedCondition")]
+        public string RequestedCondition { get; set; }
+
+        [DataMember(Name = "resolvedFilePath")]
+        public string ResolvedFilePath { get; set; }
+
+        [DataMember(Name = "resolvedLineNumber")]
+        public int ResolvedLineNumber { get; set; }
+
+        [DataMember(Name = "resolvedColumn")]
+        public int ResolvedColumn { get; set; }
+
+        [DataMember(Name = "resolvedFunctionName")]
+        public string ResolvedFunctionName { get; set; }
+
+        [DataMember(Name = "bindingStatus")]
+        public string BindingStatus { get; set; }
+
+        [DataMember(Name = "boundChildrenCount")]
+        public int BoundChildrenCount { get; set; }
+
+        [DataMember(Name = "isBound")]
+        public bool IsBound { get; set; }
+
+        [DataMember(Name = "conditionApplied")]
+        public bool ConditionApplied { get; set; }
     }
 
     [DataContract]

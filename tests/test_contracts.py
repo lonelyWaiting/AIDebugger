@@ -74,6 +74,10 @@ class ContractTests(unittest.TestCase):
             self.assertIn(field, vs_models)
             self.assertIn(field, rider_models)
 
+    def test_debug_response_knows_continue_and_wait_result(self) -> None:
+        vs_response = read("VSDebuggerMCP/Protocol/DebugResponse.cs")
+        self.assertIn("KnownType(typeof(ContinueAndWaitResult))", vs_response)
+
     def test_named_pipe_bridge_uses_io_timeout(self) -> None:
         vs_bridge = read("mcp_server/vs_bridge.py")
         rider_bridge = read("mcp_server/rider_bridge.py")
