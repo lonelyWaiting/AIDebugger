@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -25,6 +26,8 @@ namespace VSDebuggerMCP
         private string _sourceLookupSolutionKey = string.Empty;
         private const int SnapshotMaxAttempts = 2;
         private const int SnapshotRetryDelayMs = 40;
+        private const int ExpressionEvaluationTimeoutMs = 1500;
+        private const int ExpressionBatchBudgetMs = 30000;
         private const int SourceLookupCacheMaxEntries = 1024;
         private const int BreakpointBindWaitMs = 250;
         private const int BreakpointBindPollMs = 25;
@@ -1446,9 +1449,24 @@ namespace VSDebuggerMCP
                 CapturedAt = capturedAt,
                 RequestedCount = expressions.Count
             };
+            var stopwatch = Stopwatch.StartNew();
+            bool budgetExceeded = false;
+            string budgetExceededMessage = $"Skipped because expression batch budget exceeded {ExpressionBatchBudgetMs}ms";
 
             foreach (var expression in expressions)
             {
+                if (stopwatch.ElapsedMilliseconds >= ExpressionBatchBudgetMs)
+                {
+                    budgetExceeded = true;
+                    result.Results.Add(new EvaluateResult
+                    {
+                        Expression = expression,
+                        IsValid = false,
+                        ErrorMessage = budgetExceededMessage
+                    });
+                    continue;
+                }
+
                 var evalResult = EvaluateExpressionCore(debugger, expression, expandChildren, maxDepth);
                 result.Results.Add(evalResult);
             }
@@ -1456,6 +1474,10 @@ namespace VSDebuggerMCP
             result.SuccessCount = result.Results.Count(r => r.IsValid);
             result.FailedCount = result.Results.Count - result.SuccessCount;
             result.Partial = result.FailedCount > 0;
+            if (budgetExceeded)
+            {
+                result.Error = $"Expression batch budget exceeded {ExpressionBatchBudgetMs}ms";
+            }
             return result;
         }
 
@@ -1473,11 +1495,10 @@ namespace VSDebuggerMCP
 
             try
             {
-                var expr = debugger.GetExpression(expression);
+                var expr = debugger.GetExpression(expression, false, ExpressionEvaluationTimeoutMs);
                 result.IsValid = expr.IsValidValue;
                 result.Value = expr.Value;
                 result.Type = expr.Type;
-                result.HasChildren = expr.DataMembers?.Count > 0;
 
                 if (!result.IsValid)
                 {
@@ -1488,7 +1509,7 @@ namespace VSDebuggerMCP
                 {
                     try
                     {
-                        var hexExpr = debugger.GetExpression($"(void*){expression}");
+                        var hexExpr = debugger.GetExpression($"(void*){expression}", false, ExpressionEvaluationTimeoutMs);
                         if (hexExpr.IsValidValue)
                         {
                             result.HexValue = hexExpr.Value;
@@ -1500,12 +1521,16 @@ namespace VSDebuggerMCP
                     }
                 }
 
-                if (expandChildren && result.HasChildren)
+                if (expandChildren)
                 {
-                    result.Children = new List<VariableInfo>();
-                    foreach (EnvDTE.Expression child in expr.DataMembers)
+                    result.HasChildren = expr.DataMembers?.Count > 0;
+                    if (result.HasChildren)
                     {
-                        result.Children.Add(CreateVariableInfo(child, 0, maxDepth));
+                        result.Children = new List<VariableInfo>();
+                        foreach (EnvDTE.Expression child in expr.DataMembers)
+                        {
+                            result.Children.Add(CreateVariableInfo(child, 0, maxDepth));
+                        }
                     }
                 }
             }

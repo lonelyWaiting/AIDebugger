@@ -132,6 +132,17 @@ class ContractTests(unittest.TestCase):
         self.assertIn("evaluate_expressions_batch", server_py)
         self.assertIn("continue_and_wait_for_break", server_py)
 
+    def test_heavy_debug_tools_have_explicit_timeouts(self) -> None:
+        server_py = read("mcp_server/server.py")
+        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+
+        self.assertIn("BATCH_EVALUATION_TIMEOUT_SECONDS", server_py)
+        self.assertIn("DEBUG_BUNDLE_TIMEOUT_SECONDS", server_py)
+        self.assertIn("timeout_seconds", server_py)
+        self.assertIn("ExpressionEvaluationTimeoutMs", vs_service)
+        self.assertIn("ExpressionBatchBudgetMs", vs_service)
+        self.assertIn("GetExpression(expression, false, ExpressionEvaluationTimeoutMs)", vs_service)
+
     def test_cursor_allowlist_helper_is_bundled(self) -> None:
         helper_py = read("mcp_server/cursor_allowlist_sync.py")
         vs_project = read("VSDebuggerMCP/VSDebuggerMCP.csproj")

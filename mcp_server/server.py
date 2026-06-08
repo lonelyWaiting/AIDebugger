@@ -37,6 +37,19 @@ import ide_bridge
 # Create MCP server instance using FastMCP
 mcp = FastMCP("AIDebugger")
 
+BATCH_EVALUATION_TIMEOUT_SECONDS = 45.0
+DEBUG_BUNDLE_TIMEOUT_SECONDS = 60.0
+MAX_TOOL_TIMEOUT_SECONDS = 300.0
+
+
+def clamp_tool_timeout(timeout_seconds: Optional[float], default_seconds: float) -> float:
+    if timeout_seconds is None:
+        return default_seconds
+    try:
+        return max(1.0, min(float(timeout_seconds), MAX_TOOL_TIMEOUT_SECONDS))
+    except (TypeError, ValueError):
+        return default_seconds
+
 
 # ============== MCP Prompt: Tool Usage Guide ==============
 @mcp.prompt()
@@ -512,7 +525,8 @@ async def evaluate_expression(
 async def evaluate_expressions_batch(
     expressions: List[str],
     expand_children: bool = False,
-    max_depth: int = 2
+    max_depth: int = 2,
+    timeout_seconds: Optional[float] = None
 ) -> str:
     """
     在同一调试快照中批量求值多个表达式，减少逐条请求导致的上下文漂移。
@@ -521,13 +535,14 @@ async def evaluate_expressions_batch(
         expressions: 表达式列表（最多100条）
         expand_children: 是否展开对象子成员，默认False
         max_depth: 子成员展开深度，默认2
+        timeout_seconds: 等待 IDE 响应的最长秒数，默认45，最大300
     """
     try:
         result = await ide_bridge.call("evaluate_expressions_batch", {
             "expressions": expressions,
             "expandChildren": expand_children,
             "maxDepth": max_depth
-        })
+        }, timeout=clamp_tool_timeout(timeout_seconds, BATCH_EVALUATION_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "evaluate_expressions_batch")
@@ -784,7 +799,8 @@ async def capture_debug_bundle(
     expressions: Optional[List[str]] = None,
     expand_children: bool = False,
     max_depth: int = 2,
-    output_tail_lines: int = 80
+    output_tail_lines: int = 80,
+    timeout_seconds: Optional[float] = None
 ) -> str:
     """
     一次性抓取"可分析快照包"（status/callstack/locals/exception/threads/modules/registers/output + 可选批量表达式）。
@@ -797,6 +813,7 @@ async def capture_debug_bundle(
         expand_children: 表达式是否展开子成员，默认False
         max_depth: 表达式子成员展开深度，默认2
         output_tail_lines: Debug Output 末尾行数，默认80
+        timeout_seconds: 等待 IDE 响应的最长秒数，默认60，最大300
     
     调用示例:
     ```
@@ -816,7 +833,7 @@ async def capture_debug_bundle(
             "expandChildren": expand_children,
             "maxDepth": max_depth,
             "outputTailLines": output_tail_lines
-        })
+        }, timeout=clamp_tool_timeout(timeout_seconds, DEBUG_BUNDLE_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "capture_debug_bundle")
