@@ -694,6 +694,37 @@ namespace VSDebuggerMCP.Protocol
     }
 
     [DataContract]
+    public class ProcessDebugResult
+    {
+        [DataMember(Name = "action")]
+        public string Action { get; set; }
+
+        [DataMember(Name = "success")]
+        public bool Success { get; set; }
+
+        [DataMember(Name = "message")]
+        public string Message { get; set; }
+
+        [DataMember(Name = "processId")]
+        public int ProcessId { get; set; }
+
+        [DataMember(Name = "processName")]
+        public string ProcessName { get; set; }
+
+        [DataMember(Name = "executablePath")]
+        public string ExecutablePath { get; set; }
+
+        [DataMember(Name = "workingDirectory")]
+        public string WorkingDirectory { get; set; }
+
+        [DataMember(Name = "arguments")]
+        public string Arguments { get; set; }
+
+        [DataMember(Name = "status")]
+        public DebugStatusResult Status { get; set; }
+    }
+
+    [DataContract]
     public class ContinueAndWaitResult
     {
         [DataMember(Name = "action")]

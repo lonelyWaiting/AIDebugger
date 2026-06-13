@@ -441,6 +441,22 @@ namespace VSDebuggerMCP
                     return _debuggerService.GetInstanceInfo(_pipeName);
 
                 // Debug Control
+                case "attach_process":
+                    {
+                        int processId = GetParam<int>(request.Params, "processId", 0);
+                        string processName = GetParam<string>(request.Params, "processName", null);
+                        return _debuggerService.AttachProcess(processId, processName);
+                    }
+
+                case "start_debugging":
+                    {
+                        string executablePath = GetParam<string>(request.Params, "executablePath", null);
+                        string workingDirectory = GetParam<string>(request.Params, "workingDirectory", null);
+                        string arguments = GetParam<string>(request.Params, "arguments", null);
+                        bool attach = GetParam<bool>(request.Params, "attach", true);
+                        return _debuggerService.StartDebugging(executablePath, workingDirectory, arguments, attach);
+                    }
+
                 case "continue":
                     return _debuggerService.Continue();
 
@@ -493,17 +509,36 @@ namespace VSDebuggerMCP
                         string filePath = GetParam<string>(request.Params, "filePath", "");
                         int lineNumber = GetParam<int>(request.Params, "lineNumber", 0);
                         string condition = GetParam<string>(request.Params, "condition", null);
-                        return _debuggerService.SetBreakpoint(filePath, lineNumber, condition);
+                        int hitCount = GetParam<int>(request.Params, "hitCount", 0);
+                        string hitCountType = GetParam<string>(request.Params, "hitCountType", null);
+                        string conditionType = GetParam<string>(request.Params, "conditionType", null);
+                        return _debuggerService.SetBreakpoint(filePath, lineNumber, condition, hitCount, hitCountType, conditionType);
                     }
 
                 case "set_function_breakpoint":
                     {
                         string functionName = GetParam<string>(request.Params, "functionName", "");
                         string condition = GetParam<string>(request.Params, "condition", null);
-                        return _debuggerService.SetFunctionBreakpoint(functionName, condition);
+                        int hitCount = GetParam<int>(request.Params, "hitCount", 0);
+                        string hitCountType = GetParam<string>(request.Params, "hitCountType", null);
+                        string conditionType = GetParam<string>(request.Params, "conditionType", null);
+                        return _debuggerService.SetFunctionBreakpoint(functionName, condition, hitCount, hitCountType, conditionType);
+                    }
+
+                case "set_data_breakpoint":
+                case "set_watchpoint":
+                    {
+                        string dataExpression = GetParam<string>(request.Params, "dataExpression", "");
+                        int byteCount = GetParam<int>(request.Params, "byteCount", 1);
+                        string condition = GetParam<string>(request.Params, "condition", null);
+                        int hitCount = GetParam<int>(request.Params, "hitCount", 0);
+                        string hitCountType = GetParam<string>(request.Params, "hitCountType", null);
+                        string conditionType = GetParam<string>(request.Params, "conditionType", null);
+                        return _debuggerService.SetDataBreakpoint(dataExpression, byteCount, condition, hitCount, hitCountType, conditionType);
                     }
 
                 case "delete_breakpoint":
+                case "clear_breakpoint":
                     {
                         string filePath = GetParam<string>(request.Params, "filePath", "");
                         int lineNumber = GetParam<int>(request.Params, "lineNumber", 0);

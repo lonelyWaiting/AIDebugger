@@ -20,6 +20,7 @@ namespace VSDebuggerMCP.Protocol
     [KnownType(typeof(PingResult))]
     [KnownType(typeof(InstanceInfoResult))]
     [KnownType(typeof(DebugControlResult))]
+    [KnownType(typeof(ProcessDebugResult))]
     [KnownType(typeof(BreakpointsResult))]
     [KnownType(typeof(BreakpointOperationResult))]
     [KnownType(typeof(RegistersResult))]

@@ -3059,6 +3059,265 @@ namespace VSDebuggerMCP
         #region Debug Control
 
         /// <summary>
+        /// Attach the Visual Studio debugger to a local process by PID or executable name.
+        /// </summary>
+        public ProcessDebugResult AttachProcess(int processId = 0, string processName = null)
+        {
+            return ExecuteOnMainThread(() =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                var debugger = Debugger;
+                var result = new ProcessDebugResult
+                {
+                    Action = "AttachProcess",
+                    ProcessId = processId,
+                    ProcessName = processName
+                };
+
+                try
+                {
+                    var target = FindLocalProcess(debugger, processId, processName);
+                    if (target == null)
+                    {
+                        result.Success = false;
+                        result.Message = BuildAttachProcessNotFoundMessage(debugger, processId, processName);
+                        return result;
+                    }
+
+                    target.Attach();
+                    result.Success = true;
+                    result.ProcessId = target.ProcessID;
+                    result.ProcessName = target.Name;
+                    result.Message = $"Attached to process {target.Name} ({target.ProcessID})";
+                    result.Status = BuildDebugStatus(debugger);
+                }
+                catch (Exception ex)
+                {
+                    result.Success = false;
+                    result.Message = ex.Message;
+                    result.Status = BuildDebugStatus(debugger);
+                }
+
+                return result;
+            });
+        }
+
+        /// <summary>
+        /// Start debugging with the current VS debug profile, or launch an executable and attach to it.
+        /// </summary>
+        public ProcessDebugResult StartDebugging(string executablePath = null, string workingDirectory = null, string arguments = null, bool attach = true)
+        {
+            return ExecuteOnMainThread(() =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                var debugger = Debugger;
+                var result = new ProcessDebugResult
+                {
+                    Action = "StartDebugging",
+                    ExecutablePath = executablePath,
+                    WorkingDirectory = workingDirectory,
+                    Arguments = arguments
+                };
+
+                try
+                {
+                    if (string.IsNullOrWhiteSpace(executablePath))
+                    {
+                        if (debugger.CurrentMode != dbgDebugMode.dbgDesignMode)
+                        {
+                            result.Success = false;
+                            result.Message = "A debug session is already active";
+                            result.Status = BuildDebugStatus(debugger);
+                            return result;
+                        }
+
+                        debugger.Go(false);
+                        result.Success = true;
+                        result.Message = "Started debugging using the current Visual Studio startup configuration";
+                        result.Status = BuildDebugStatus(debugger);
+                        return result;
+                    }
+
+                    string normalizedExe = System.IO.Path.GetFullPath(executablePath);
+                    if (!System.IO.File.Exists(normalizedExe))
+                    {
+                        result.Success = false;
+                        result.Message = $"Executable not found: {normalizedExe}";
+                        result.Status = BuildDebugStatus(debugger);
+                        return result;
+                    }
+
+                    string normalizedWorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory)
+                        ? System.IO.Path.GetDirectoryName(normalizedExe)
+                        : System.IO.Path.GetFullPath(workingDirectory);
+
+                    if (!string.IsNullOrWhiteSpace(normalizedWorkingDirectory) &&
+                        !System.IO.Directory.Exists(normalizedWorkingDirectory))
+                    {
+                        result.Success = false;
+                        result.Message = $"Working directory not found: {normalizedWorkingDirectory}";
+                        result.Status = BuildDebugStatus(debugger);
+                        return result;
+                    }
+
+                    var startInfo = new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = normalizedExe,
+                        Arguments = arguments ?? string.Empty,
+                        WorkingDirectory = normalizedWorkingDirectory ?? string.Empty,
+                        UseShellExecute = false
+                    };
+
+                    var process = System.Diagnostics.Process.Start(startInfo);
+                    if (process == null)
+                    {
+                        result.Success = false;
+                        result.Message = "Failed to start process";
+                        result.Status = BuildDebugStatus(debugger);
+                        return result;
+                    }
+
+                    result.ProcessId = process.Id;
+                    result.ProcessName = process.ProcessName;
+                    result.ExecutablePath = normalizedExe;
+                    result.WorkingDirectory = normalizedWorkingDirectory;
+
+                    if (!attach)
+                    {
+                        result.Success = true;
+                        result.Message = $"Started process {process.ProcessName} ({process.Id}) without attaching";
+                        result.Status = BuildDebugStatus(debugger);
+                        return result;
+                    }
+
+                    var target = WaitForLocalProcess(debugger, process.Id, 5000);
+                    if (target == null)
+                    {
+                        result.Success = false;
+                        result.Message = $"Started process {process.ProcessName} ({process.Id}) but Visual Studio did not expose it for attach";
+                        result.Status = BuildDebugStatus(debugger);
+                        return result;
+                    }
+
+                    target.Attach();
+                    result.Success = true;
+                    result.ProcessName = target.Name;
+                    result.Message = $"Started and attached to process {target.Name} ({target.ProcessID})";
+                    result.Status = BuildDebugStatus(debugger);
+                }
+                catch (Exception ex)
+                {
+                    result.Success = false;
+                    result.Message = ex.Message;
+                    result.Status = BuildDebugStatus(debugger);
+                }
+
+                return result;
+            });
+        }
+
+        private EnvDTE.Process FindLocalProcess(Debugger5 debugger, int processId, string processName)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (debugger == null)
+            {
+                return null;
+            }
+
+            if (processId <= 0 && string.IsNullOrWhiteSpace(processName))
+            {
+                return null;
+            }
+
+            var nameMatches = new List<EnvDTE.Process>();
+            foreach (EnvDTE.Process process in debugger.LocalProcesses)
+            {
+                if (processId > 0 && process.ProcessID == processId)
+                {
+                    return process;
+                }
+
+                if (processId <= 0 && ProcessNameMatches(process.Name, processName))
+                {
+                    nameMatches.Add(process);
+                }
+            }
+
+            return nameMatches.Count == 1 ? nameMatches[0] : null;
+        }
+
+        private EnvDTE.Process WaitForLocalProcess(Debugger5 debugger, int processId, int timeoutMs)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                var process = FindLocalProcess(debugger, processId, null);
+                if (process != null)
+                {
+                    return process;
+                }
+
+                System.Threading.Thread.Sleep(100);
+            }
+
+            return null;
+        }
+
+        private string BuildAttachProcessNotFoundMessage(Debugger5 debugger, int processId, string processName)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (processId > 0)
+            {
+                return $"Process with PID {processId} was not found in Visual Studio local processes";
+            }
+
+            if (string.IsNullOrWhiteSpace(processName))
+            {
+                return "Either process_id or process_name is required";
+            }
+
+            var matches = new List<string>();
+            try
+            {
+                foreach (EnvDTE.Process process in debugger.LocalProcesses)
+                {
+                    if (ProcessNameMatches(process.Name, processName))
+                    {
+                        matches.Add($"{process.Name} ({process.ProcessID})");
+                    }
+                }
+            }
+            catch
+            {
+                // Best-effort diagnostic only.
+            }
+
+            if (matches.Count > 1)
+            {
+                return $"Multiple processes named '{processName}' found. Retry with process_id. Matches: {string.Join(", ", matches.ToArray())}";
+            }
+
+            return $"Process named '{processName}' was not found in Visual Studio local processes";
+        }
+
+        private static bool ProcessNameMatches(string candidateName, string requestedName)
+        {
+            if (string.IsNullOrWhiteSpace(candidateName) || string.IsNullOrWhiteSpace(requestedName))
+            {
+                return false;
+            }
+
+            string candidateFileName = System.IO.Path.GetFileName(candidateName);
+            string requestedFileName = System.IO.Path.GetFileName(requestedName);
+            string candidateWithoutExtension = System.IO.Path.GetFileNameWithoutExtension(candidateFileName);
+            string requestedWithoutExtension = System.IO.Path.GetFileNameWithoutExtension(requestedFileName);
+
+            return string.Equals(candidateFileName, requestedFileName, StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(candidateWithoutExtension, requestedWithoutExtension, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
         /// Continue execution (F5).
         /// </summary>
         public DebugControlResult Continue()
@@ -3595,7 +3854,13 @@ namespace VSDebuggerMCP
         /// <summary>
         /// Set a breakpoint at a file location.
         /// </summary>
-        public BreakpointOperationResult SetBreakpoint(string filePath, int lineNumber, string condition = null)
+        public BreakpointOperationResult SetBreakpoint(
+            string filePath,
+            int lineNumber,
+            string condition = null,
+            int hitCount = 0,
+            string hitCountType = null,
+            string conditionType = null)
         {
             return ExecuteOnMainThread(() =>
             {
@@ -3604,6 +3869,9 @@ namespace VSDebuggerMCP
                 var result = new BreakpointOperationResult { Operation = "Set" };
                 string normalizedCondition = NormalizeBreakpointCondition(condition);
                 string breakpointLanguage = GetBreakpointLanguage(filePath);
+                var breakpointConditionType = ParseBreakpointConditionType(conditionType);
+                var breakpointHitCountType = ParseHitCountType(hitCountType, hitCount);
+                int normalizedHitCount = Math.Max(0, hitCount);
 
                 try
                 {
@@ -3615,7 +3883,15 @@ namespace VSDebuggerMCP
                         return result;
                     }
 
-                    var breakpoint = AddFileBreakpoint(debugger, filePath, lineNumber, normalizedCondition, breakpointLanguage);
+                    var breakpoint = AddFileBreakpoint(
+                        debugger,
+                        filePath,
+                        lineNumber,
+                        normalizedCondition,
+                        breakpointLanguage,
+                        breakpointConditionType,
+                        normalizedHitCount,
+                        breakpointHitCountType);
                     if (breakpoint == null)
                     {
                         result.Success = false;
@@ -3636,7 +3912,15 @@ namespace VSDebuggerMCP
 
                     if (ShouldSearchNearbyBindableLine(debugger, breakpointInfo))
                     {
-                        var reboundBreakpoint = TryFindNearbyBoundBreakpoint(debugger, filePath, lineNumber, normalizedCondition, breakpointLanguage);
+                        var reboundBreakpoint = TryFindNearbyBoundBreakpoint(
+                            debugger,
+                            filePath,
+                            lineNumber,
+                            normalizedCondition,
+                            breakpointLanguage,
+                            breakpointConditionType,
+                            normalizedHitCount,
+                            breakpointHitCountType);
                         if (reboundBreakpoint == null)
                         {
                             result.Success = false;
@@ -3668,7 +3952,12 @@ namespace VSDebuggerMCP
         /// <summary>
         /// Set a breakpoint at a function.
         /// </summary>
-        public BreakpointOperationResult SetFunctionBreakpoint(string functionName, string condition = null)
+        public BreakpointOperationResult SetFunctionBreakpoint(
+            string functionName,
+            string condition = null,
+            int hitCount = 0,
+            string hitCountType = null,
+            string conditionType = null)
         {
             return ExecuteOnMainThread(() =>
             {
@@ -3676,19 +3965,25 @@ namespace VSDebuggerMCP
                 var debugger = Debugger;
                 var result = new BreakpointOperationResult { Operation = "SetFunction" };
                 string normalizedCondition = NormalizeBreakpointCondition(condition);
+                var breakpointConditionType = ParseBreakpointConditionType(conditionType);
+                var breakpointHitCountType = ParseHitCountType(hitCountType, hitCount);
+                int normalizedHitCount = Math.Max(0, hitCount);
 
                 try
                 {
-                    EnvDTE.Breakpoints bps;
-                    if (!string.IsNullOrEmpty(normalizedCondition))
-                    {
-                        bps = debugger.Breakpoints.Add(functionName, "", 0, 0, normalizedCondition,
-                            dbgBreakpointConditionType.dbgBreakpointConditionTypeWhenTrue);
-                    }
-                    else
-                    {
-                        bps = debugger.Breakpoints.Add(functionName);
-                    }
+                    EnvDTE.Breakpoints bps = debugger.Breakpoints.Add(
+                        functionName,
+                        "",
+                        0,
+                        0,
+                        normalizedCondition ?? string.Empty,
+                        breakpointConditionType,
+                        string.Empty,
+                        string.Empty,
+                        1,
+                        string.Empty,
+                        normalizedHitCount,
+                        breakpointHitCountType);
 
                     if (bps != null && bps.Count > 0)
                     {
@@ -3711,6 +4006,83 @@ namespace VSDebuggerMCP
                         result.Success = false;
                         result.Message = "Failed to set function breakpoint";
                     }
+                }
+                catch (Exception ex)
+                {
+                    result.Success = false;
+                    result.Message = ex.Message;
+                }
+
+                return result;
+            });
+        }
+
+        /// <summary>
+        /// Set a native data breakpoint/watchpoint for an expression or address.
+        /// </summary>
+        public BreakpointOperationResult SetDataBreakpoint(
+            string dataExpression,
+            int byteCount = 1,
+            string condition = null,
+            int hitCount = 0,
+            string hitCountType = null,
+            string conditionType = null)
+        {
+            return ExecuteOnMainThread(() =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                var debugger = Debugger;
+                var result = new BreakpointOperationResult { Operation = "SetData" };
+                string normalizedExpression = string.IsNullOrWhiteSpace(dataExpression) ? null : dataExpression.Trim();
+                string normalizedCondition = NormalizeBreakpointCondition(condition);
+                int normalizedByteCount = Math.Max(1, Math.Min(byteCount, 1024));
+                int normalizedHitCount = Math.Max(0, hitCount);
+                var breakpointConditionType = ParseBreakpointConditionType(conditionType);
+                var breakpointHitCountType = ParseHitCountType(hitCountType, hitCount);
+
+                if (string.IsNullOrEmpty(normalizedExpression))
+                {
+                    result.Success = false;
+                    result.Message = "data_expression is required";
+                    return result;
+                }
+
+                try
+                {
+                    EnvDTE.Breakpoints bps = debugger.Breakpoints.Add(
+                        string.Empty,
+                        string.Empty,
+                        0,
+                        0,
+                        normalizedCondition ?? string.Empty,
+                        breakpointConditionType,
+                        string.Empty,
+                        normalizedExpression,
+                        normalizedByteCount,
+                        string.Empty,
+                        normalizedHitCount,
+                        breakpointHitCountType);
+
+                    if (bps == null || bps.Count == 0)
+                    {
+                        result.Success = false;
+                        result.Message = "Failed to set data breakpoint";
+                        return result;
+                    }
+
+                    var breakpoint = bps.Item(1);
+                    var breakpointInfo = BuildBreakpointInfo(breakpoint, debugger, null, 0, normalizedCondition);
+                    if (!breakpointInfo.ConditionApplied)
+                    {
+                        SafeDeleteBreakpoint(breakpoint);
+                        result.Success = false;
+                        result.Message = $"Data breakpoint condition was not applied for {normalizedExpression}";
+                        return result;
+                    }
+
+                    result.Success = true;
+                    result.Message = $"Data breakpoint set for {normalizedExpression} ({normalizedByteCount} byte(s))";
+                    result.BreakpointInfo = breakpointInfo;
                 }
                 catch (Exception ex)
                 {
@@ -3964,6 +4336,59 @@ namespace VSDebuggerMCP
             return string.IsNullOrWhiteSpace(condition) ? null : condition.Trim();
         }
 
+        private dbgBreakpointConditionType ParseBreakpointConditionType(string conditionType)
+        {
+            if (string.IsNullOrWhiteSpace(conditionType))
+            {
+                return dbgBreakpointConditionType.dbgBreakpointConditionTypeWhenTrue;
+            }
+
+            string normalized = conditionType.Trim().Replace("-", "_").ToLowerInvariant();
+            switch (normalized)
+            {
+                case "changed":
+                case "when_changed":
+                case "whenchanged":
+                    return dbgBreakpointConditionType.dbgBreakpointConditionTypeWhenChanged;
+                case "true":
+                case "when_true":
+                case "whentrue":
+                default:
+                    return dbgBreakpointConditionType.dbgBreakpointConditionTypeWhenTrue;
+            }
+        }
+
+        private dbgHitCountType ParseHitCountType(string hitCountType, int hitCount)
+        {
+            if (hitCount <= 0)
+            {
+                return dbgHitCountType.dbgHitCountTypeNone;
+            }
+
+            if (string.IsNullOrWhiteSpace(hitCountType))
+            {
+                return dbgHitCountType.dbgHitCountTypeEqual;
+            }
+
+            string normalized = hitCountType.Trim().Replace("-", "_").ToLowerInvariant();
+            switch (normalized)
+            {
+                case "greater_or_equal":
+                case "greater_than_or_equal":
+                case "greater_equal":
+                case ">=":
+                    return dbgHitCountType.dbgHitCountTypeGreaterOrEqual;
+                case "multiple":
+                case "multiple_of":
+                    return dbgHitCountType.dbgHitCountTypeMultiple;
+                case "equal":
+                case "equals":
+                case "==":
+                default:
+                    return dbgHitCountType.dbgHitCountTypeEqual;
+            }
+        }
+
         private string GetConditionTypeString(EnvDTE.Breakpoint breakpoint)
         {
             try
@@ -3988,28 +4413,31 @@ namespace VSDebuggerMCP
             }
         }
 
-        private EnvDTE.Breakpoint AddFileBreakpoint(Debugger5 debugger, string filePath, int lineNumber, string condition, string language)
+        private EnvDTE.Breakpoint AddFileBreakpoint(
+            Debugger5 debugger,
+            string filePath,
+            int lineNumber,
+            string condition,
+            string language,
+            dbgBreakpointConditionType conditionType,
+            int hitCount,
+            dbgHitCountType hitCountType)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
 
-            EnvDTE.Breakpoints breakpoints;
-            if (!string.IsNullOrEmpty(condition))
-            {
-                if (string.IsNullOrEmpty(language))
-                {
-                    breakpoints = debugger.Breakpoints.Add("", filePath, lineNumber, 1, condition,
-                        dbgBreakpointConditionType.dbgBreakpointConditionTypeWhenTrue);
-                }
-                else
-                {
-                    breakpoints = debugger.Breakpoints.Add("", filePath, lineNumber, 1, condition,
-                        dbgBreakpointConditionType.dbgBreakpointConditionTypeWhenTrue, language);
-                }
-            }
-            else
-            {
-                breakpoints = debugger.Breakpoints.Add("", filePath, lineNumber);
-            }
+            EnvDTE.Breakpoints breakpoints = debugger.Breakpoints.Add(
+                string.Empty,
+                filePath,
+                lineNumber,
+                1,
+                condition ?? string.Empty,
+                conditionType,
+                language ?? string.Empty,
+                string.Empty,
+                1,
+                string.Empty,
+                Math.Max(0, hitCount),
+                hitCountType);
 
             return breakpoints != null && breakpoints.Count > 0 ? breakpoints.Item(1) : null;
         }
@@ -4095,7 +4523,15 @@ namespace VSDebuggerMCP
             }
         }
 
-        private EnvDTE.Breakpoint TryFindNearbyBoundBreakpoint(Debugger5 debugger, string filePath, int requestedLineNumber, string condition, string language)
+        private EnvDTE.Breakpoint TryFindNearbyBoundBreakpoint(
+            Debugger5 debugger,
+            string filePath,
+            int requestedLineNumber,
+            string condition,
+            string language,
+            dbgBreakpointConditionType conditionType,
+            int hitCount,
+            dbgHitCountType hitCountType)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             int lineCount = GetFileLineCount(filePath);
@@ -4106,7 +4542,15 @@ namespace VSDebuggerMCP
 
             foreach (int candidateLine in EnumerateNearbyBreakpointLines(requestedLineNumber, lineCount))
             {
-                var candidateBreakpoint = AddFileBreakpoint(debugger, filePath, candidateLine, condition, language);
+                var candidateBreakpoint = AddFileBreakpoint(
+                    debugger,
+                    filePath,
+                    candidateLine,
+                    condition,
+                    language,
+                    conditionType,
+                    hitCount,
+                    hitCountType);
                 if (candidateBreakpoint == null)
                 {
                     continue;

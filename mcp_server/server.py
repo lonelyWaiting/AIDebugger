@@ -139,6 +139,92 @@ def handle_ide_error(e: Exception, operation: str) -> str:
             f"错误详情: {error_msg}"
         )
     return f"执行 {operation} 时出错: {error_msg}"
+
+
+@mcp.tool()
+async def debug_capabilities() -> str:
+    """
+    Return a categorized index of AIDebugger tools. Use this first when unsure which
+    debugger tool to call, especially for active debugging workflows such as attach,
+    start, breakpoints, stepping, stack/thread selection, expression evaluation,
+    memory inspection, or data breakpoints.
+    """
+    return format_result({
+        "recommendedWorkflow": [
+            "detect_debug_sessions(prefer_ide='vs') or list_vs_instances()",
+            "attach_process(...) or start_debugging(...) if no debug session is active",
+            "set_breakpoint(...) / set_function_breakpoint(...) / set_data_breakpoint(...)",
+            "continue_and_wait_for_break(...) or continue()",
+            "get_callstack() + get_threads(), then select_stack_frame(...) / select_thread(...)",
+            "evaluate_expressions_batch(...) for multiple values, evaluate_expression(...) for one value",
+        ],
+        "categories": {
+            "session": [
+                "detect_debug_sessions",
+                "list_vs_instances",
+                "select_vs_instance",
+                "attach_process",
+                "start_debugging",
+                "get_debug_status",
+            ],
+            "breakpoints": [
+                "set_breakpoint",
+                "set_function_breakpoint",
+                "clear_breakpoint",
+                "delete_breakpoint",
+                "get_breakpoints",
+                "enable_breakpoint",
+                "delete_all_breakpoints",
+            ],
+            "executionControl": [
+                "continue",
+                "debug_continue",
+                "pause",
+                "debug_break",
+                "step_over",
+                "step_into",
+                "step_out",
+                "debug_run_to_cursor",
+                "debug_set_next_statement",
+                "debug_stop",
+            ],
+            "inspection": [
+                "capture_debug_bundle",
+                "get_callstack",
+                "get_call_stack",
+                "get_locals",
+                "evaluate_expression",
+                "evaluate_expressions_batch",
+                "get_exception",
+                "get_modules",
+                "get_registers",
+                "get_disassembly",
+                "get_disassembly_at",
+            ],
+            "navigation": [
+                "get_threads",
+                "list_threads",
+                "switch_thread",
+                "select_thread",
+                "switch_stack_frame",
+                "select_stack_frame",
+            ],
+            "advanced": [
+                "read_memory",
+                "search_memory",
+                "set_data_breakpoint",
+                "set_watchpoint",
+                "add_watch",
+                "get_debug_output",
+                "search_output",
+            ],
+        },
+        "capabilityNotes": {
+            "set_data_breakpoint": "Uses Visual Studio native data breakpoints/watchpoints where supported by the active debug engine.",
+            "logpoints": "Non-breaking Visual Studio tracepoint/logpoint actions are not exposed as a tool because EnvDTE has no reliable public action/message API.",
+            "aliases": "Short aliases are exposed for common LLM names, but existing debug_* and switch_* names remain supported.",
+        },
+    })
 # ============== Instance Management Tools ==============
 
 @mcp.tool()
@@ -457,6 +543,14 @@ async def get_callstack() -> str:
         return handle_ide_error(e, "get_callstack")
 
 
+@mcp.tool()
+async def get_call_stack() -> str:
+    """
+    Alias for get_callstack.
+    """
+    return await get_callstack()
+
+
 # ============== Variables Tools ==============
 
 @mcp.tool()
@@ -562,6 +656,14 @@ async def get_threads() -> str:
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_threads")
+
+
+@mcp.tool()
+async def list_threads() -> str:
+    """
+    Alias for get_threads.
+    """
+    return await get_threads()
 
 
 # ============== Module Tools ==============
@@ -842,6 +944,52 @@ async def capture_debug_bundle(
 # ============== Debug Control Tools ==============
 
 @mcp.tool()
+async def attach_process(
+    process_id: Optional[int] = None,
+    process_name: Optional[str] = None
+) -> str:
+    """
+    Attach Visual Studio to a local process by PID or executable name.
+
+    Examples:
+    attach_process(process_name="UnrealEditor.exe")
+    attach_process(process_id=12345)
+    """
+    try:
+        result = await ide_bridge.call("attach_process", {
+            "processId": process_id or 0,
+            "processName": process_name
+        })
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "attach_process")
+
+
+@mcp.tool()
+async def start_debugging(
+    executable_path: Optional[str] = None,
+    working_dir: Optional[str] = None,
+    args: Optional[str] = None,
+    attach: bool = True
+) -> str:
+    """
+    Start debugging. With no executable_path, uses the current Visual Studio
+    startup/debug configuration. With executable_path, launches that process and
+    attaches the VS debugger by default.
+    """
+    try:
+        result = await ide_bridge.call("start_debugging", {
+            "executablePath": executable_path,
+            "workingDirectory": working_dir,
+            "arguments": args,
+            "attach": attach
+        })
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "start_debugging")
+
+
+@mcp.tool()
 async def debug_continue() -> str:
     """
     继续执行程序直到下一个断点或程序结束 (F5)。
@@ -854,6 +1002,15 @@ async def debug_continue() -> str:
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "continue")
+
+
+@mcp.tool(name="continue")
+async def continue_alias() -> str:
+    """
+    Alias for debug_continue. Continue execution until the next breakpoint,
+    exception, user break, or process exit.
+    """
+    return await debug_continue()
 
 
 @mcp.tool()
@@ -909,6 +1066,12 @@ async def debug_step_over() -> str:
         return handle_ide_error(e, "step_over")
 
 
+@mcp.tool(name="step_over")
+async def step_over_alias() -> str:
+    """Alias for debug_step_over."""
+    return await debug_step_over()
+
+
 @mcp.tool()
 async def debug_step_into() -> str:
     """
@@ -922,6 +1085,12 @@ async def debug_step_into() -> str:
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "step_into")
+
+
+@mcp.tool(name="step_into")
+async def step_into_alias() -> str:
+    """Alias for debug_step_into."""
+    return await debug_step_into()
 
 
 @mcp.tool()
@@ -939,6 +1108,12 @@ async def debug_step_out() -> str:
         return handle_ide_error(e, "step_out")
 
 
+@mcp.tool(name="step_out")
+async def step_out_alias() -> str:
+    """Alias for debug_step_out."""
+    return await debug_step_out()
+
+
 @mcp.tool()
 async def debug_break() -> str:
     """
@@ -950,6 +1125,14 @@ async def debug_break() -> str:
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "break")
+
+
+@mcp.tool()
+async def pause() -> str:
+    """
+    Alias for debug_break. Pause/break a running debuggee.
+    """
+    return await debug_break()
 
 
 @mcp.tool()
@@ -1024,7 +1207,10 @@ async def get_breakpoints() -> str:
 async def set_breakpoint(
     file_path: str,
     line_number: int,
-    condition: str = None
+    condition: str = None,
+    hit_count: int = 0,
+    hit_count_type: Optional[str] = None,
+    condition_type: Optional[str] = None
 ) -> str:
     """
     在指定文件的指定行设置断点。
@@ -1035,14 +1221,22 @@ async def set_breakpoint(
         file_path: 源文件的完整路径
         line_number: 要设置断点的行号
         condition: 可选的条件表达式，当条件为true时才触发断点
+        hit_count: 可选命中次数，0 表示不限制
+        hit_count_type: equal / greater_or_equal / multiple
+        condition_type: when_true / when_changed
     """
     try:
         params = {
             "filePath": file_path,
-            "lineNumber": line_number
+            "lineNumber": line_number,
+            "hitCount": max(0, hit_count),
         }
         if condition:
             params["condition"] = condition
+        if hit_count_type:
+            params["hitCountType"] = hit_count_type
+        if condition_type:
+            params["conditionType"] = condition_type
         result = await ide_bridge.call("set_breakpoint", params)
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
@@ -1052,7 +1246,10 @@ async def set_breakpoint(
 @mcp.tool()
 async def set_function_breakpoint(
     function_name: str,
-    condition: str = None
+    condition: str = None,
+    hit_count: int = 0,
+    hit_count_type: Optional[str] = None,
+    condition_type: Optional[str] = None
 ) -> str:
     """
     在指定函数入口设置断点。适用于不知道确切文件位置的情况。
@@ -1062,13 +1259,71 @@ async def set_function_breakpoint(
         condition: 可选的条件表达式
     """
     try:
-        params = {"functionName": function_name}
+        params = {
+            "functionName": function_name,
+            "hitCount": max(0, hit_count),
+        }
         if condition:
             params["condition"] = condition
+        if hit_count_type:
+            params["hitCountType"] = hit_count_type
+        if condition_type:
+            params["conditionType"] = condition_type
         result = await ide_bridge.call("set_function_breakpoint", params)
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "set_function_breakpoint")
+
+
+@mcp.tool()
+async def set_data_breakpoint(
+    data_expression: str,
+    byte_count: int = 1,
+    condition: Optional[str] = None,
+    hit_count: int = 0,
+    hit_count_type: Optional[str] = None,
+    condition_type: Optional[str] = None
+) -> str:
+    """
+    Set a Visual Studio native data breakpoint/watchpoint for an expression or
+    address expression. Example: set_data_breakpoint(data_expression="*(int*)0x12345678", byte_count=4)
+    """
+    try:
+        params = {
+            "dataExpression": data_expression,
+            "byteCount": max(1, min(byte_count, 1024)),
+            "hitCount": max(0, hit_count),
+        }
+        if condition:
+            params["condition"] = condition
+        if hit_count_type:
+            params["hitCountType"] = hit_count_type
+        if condition_type:
+            params["conditionType"] = condition_type
+        result = await ide_bridge.call("set_data_breakpoint", params)
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "set_data_breakpoint")
+
+
+@mcp.tool(name="set_watchpoint")
+async def set_watchpoint_alias(
+    data_expression: str,
+    byte_count: int = 1,
+    condition: Optional[str] = None,
+    hit_count: int = 0,
+    hit_count_type: Optional[str] = None,
+    condition_type: Optional[str] = None
+) -> str:
+    """Alias for set_data_breakpoint."""
+    return await set_data_breakpoint(
+        data_expression=data_expression,
+        byte_count=byte_count,
+        condition=condition,
+        hit_count=hit_count,
+        hit_count_type=hit_count_type,
+        condition_type=condition_type,
+    )
 
 
 @mcp.tool()
@@ -1088,6 +1343,21 @@ async def delete_breakpoint(file_path: str, line_number: int) -> str:
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "delete_breakpoint")
+
+
+@mcp.tool()
+async def clear_breakpoint(file_path: str, line_number: int) -> str:
+    """
+    Alias for delete_breakpoint.
+    """
+    try:
+        result = await ide_bridge.call("clear_breakpoint", {
+            "filePath": file_path,
+            "lineNumber": line_number
+        })
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "clear_breakpoint")
 
 
 @mcp.tool()
@@ -1148,6 +1418,14 @@ async def switch_stack_frame(frame_index: int) -> str:
 
 
 @mcp.tool()
+async def select_stack_frame(frame_index: int) -> str:
+    """
+    Alias for switch_stack_frame.
+    """
+    return await switch_stack_frame(frame_index)
+
+
+@mcp.tool()
 async def switch_thread(thread_id: int) -> str:
     """
     切换到指定线程以查看其调用堆栈和变量。
@@ -1163,6 +1441,14 @@ async def switch_thread(thread_id: int) -> str:
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "switch_thread")
+
+
+@mcp.tool()
+async def select_thread(thread_id: int) -> str:
+    """
+    Alias for switch_thread.
+    """
+    return await switch_thread(thread_id)
 
 
 # ============== Register Tools ==============

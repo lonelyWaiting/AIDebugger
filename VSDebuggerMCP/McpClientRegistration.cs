@@ -46,10 +46,18 @@ namespace VSDebuggerMCP
 ### 调试分析
 - 关键词：调试、debug、断点、breakpoint、单步、step、堆栈、stack、变量、variable
 - 推荐操作：先 get_debug_status 判断 stopReason，再按需 get_callstack/get_locals；多表达式分析优先 evaluate_expressions_batch
+- 如果不确定该用哪个工具，先调用 debug_capabilities 查看按场景分类的工具索引
 
 ### 主动检测调试现场（推荐）
 - 在调用任何调试工具前，先调用 detect_debug_sessions(prefer_ide=""{1}"") 检测是否有 VS/Rider 调试现场
 - 若自动选择失败，使用 list_ide_instances + select_ide_instance 手动选择
+
+### 主动断点式定位
+- 关键词：attach、附加进程、启动调试、start debugging、设置断点、清除断点、watchpoint、数据断点
+- 推荐操作：无会话时先 attach_process(process_name=""UnrealEditor.exe"") 或 start_debugging；按位置用 set_breakpoint(file_path,line_number)，按函数用 set_function_breakpoint；需要线程/栈帧切换时用 get_threads/list_threads + select_thread、get_callstack/get_call_stack + select_stack_frame
+- 调试控制短名可用：continue、pause、step_over、step_into、step_out；兼容旧名 debug_continue、debug_break、debug_step_over、debug_step_into、debug_step_out
+- set_breakpoint/set_function_breakpoint 支持 condition、condition_type、hit_count、hit_count_type；clear_breakpoint 是 delete_breakpoint 的别名
+- 当前不暴露 logpoint 工具：VS EnvDTE 没有可靠公开的非中断 tracepoint action/message API；需要时改用源码 UE_LOG/OutputDebugString 或条件断点+手动求值
 
 ### 编译问题
 - 关键词：编译错误、build error、编译失败、无法编译、syntax error、链接错误
@@ -68,11 +76,12 @@ namespace VSDebuggerMCP
 4. 如需更多信息，优先 evaluate_expressions_batch；仅单条场景再用 evaluate_expression
 
 ### 断点调试流程：
-1. get_debug_status 确认调试状态
-2. 若需要放行复现，优先 continue_and_wait_for_break 自动等待并抓取 bundle
-3. get_callstack 查看调用链
-4. get_locals 查看当前变量
-5. evaluate_expression 求值特定表达式
+1. detect_debug_sessions(prefer_ide=""{1}"") 或 list_vs_instances/select_vs_instance 确认 VS 实例
+2. 若没有调试会话，attach_process 或 start_debugging
+3. set_breakpoint / set_function_breakpoint / set_data_breakpoint 设置断点或 watchpoint
+4. continue_and_wait_for_break 或 continue 放行复现
+5. get_callstack/get_threads 后按需 select_stack_frame/select_thread
+6. evaluate_expressions_batch 或 evaluate_expression 求值特定表达式
 
 ## 重要注意事项
 

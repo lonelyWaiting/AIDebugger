@@ -67,10 +67,13 @@ A Python-based MCP server that connects to the VS extension and Rider plugin and
 
 ## Available Tools
 
+The MCP keeps the low-level tools exposed for client compatibility, but AI agents should use `debug_capabilities` as the progressive-discovery entry point when they are unsure which tool to call. This avoids relying on one large flat tool list while still keeping direct calls available for precise workflows.
+
 ### Instance Management
 
 | Tool | Description |
 |------|-------------|
+| `debug_capabilities` | Categorized tool index for progressive discovery |
 | `detect_debug_sessions` | Detect available VS/Rider debug sessions and auto-select one |
 | `list_ide_instances` | List all IDE instances (VS + Rider) with their status |
 | `select_ide_instance` | Select a specific IDE instance by IDE + process ID |
@@ -106,12 +109,19 @@ A Python-based MCP server that connects to the VS extension and Rider plugin and
 
 | Tool | Description |
 |------|-------------|
+| `attach_process` | Attach Visual Studio to a process by PID or executable name |
+| `start_debugging` | Start the current VS debug profile, or launch an exe and attach |
 | `debug_continue` | Continue execution (F5) |
+| `continue` | Alias for `debug_continue` |
 | `continue_and_wait_for_break` | Continue or wait for the next debug stop, then auto-capture a debug bundle |
 | `debug_step_over` | Step over current line (F10) |
+| `step_over` | Alias for `debug_step_over` |
 | `debug_step_into` | Step into function (F11) |
+| `step_into` | Alias for `debug_step_into` |
 | `debug_step_out` | Step out of function (Shift+F11) |
+| `step_out` | Alias for `debug_step_out` |
 | `debug_break` | Break/pause execution |
+| `pause` | Alias for `debug_break` |
 | `debug_stop` | Stop debugging session (Shift+F5) |
 | `debug_run_to_cursor` | Run to specified file and line |
 | `debug_set_next_statement` | Set next statement to execute (move IP) |
@@ -121,18 +131,27 @@ A Python-based MCP server that connects to the VS extension and Rider plugin and
 | Tool | Description |
 |------|-------------|
 | `get_breakpoints` | Get all breakpoints with conditions and hit counts |
-| `set_breakpoint` | Set breakpoint at file:line (supports conditions) |
-| `set_function_breakpoint` | Set breakpoint on function entry |
+| `set_breakpoint` | Set breakpoint at file:line (supports conditions and hit counts) |
+| `set_function_breakpoint` | Set breakpoint on function entry (supports conditions and hit counts) |
+| `set_data_breakpoint` | Set a Visual Studio native data breakpoint/watchpoint where supported |
+| `set_watchpoint` | Alias for `set_data_breakpoint` |
 | `delete_breakpoint` | Delete breakpoint at file:line |
+| `clear_breakpoint` | Alias for `delete_breakpoint` |
 | `delete_all_breakpoints` | Delete all breakpoints |
 | `enable_breakpoint` | Enable or disable a breakpoint |
+
+Non-breaking Visual Studio tracepoint/logpoint actions are not exposed as MCP tools because EnvDTE has no reliable public action/message API for them.
 
 ### Navigation
 
 | Tool | Description |
 |------|-------------|
 | `switch_stack_frame` | Switch to different stack frame |
+| `select_stack_frame` | Alias for `switch_stack_frame` |
 | `switch_thread` | Switch to different thread |
+| `select_thread` | Alias for `switch_thread` |
+| `get_call_stack` | Alias for `get_callstack` |
+| `list_threads` | Alias for `get_threads` |
 
 ### Advanced
 

@@ -132,6 +132,78 @@ class ContractTests(unittest.TestCase):
         self.assertIn("evaluate_expressions_batch", server_py)
         self.assertIn("continue_and_wait_for_break", server_py)
 
+    def test_server_exposes_active_debugging_tools_and_aliases(self) -> None:
+        server_py = read("mcp_server/server.py")
+
+        for tool_name in (
+            "debug_capabilities",
+            "attach_process",
+            "start_debugging",
+            'name="continue"',
+            "pause",
+            'name="step_over"',
+            'name="step_into"',
+            'name="step_out"',
+            "get_call_stack",
+            "list_threads",
+            "select_stack_frame",
+            "select_thread",
+            "clear_breakpoint",
+            "set_data_breakpoint",
+            'name="set_watchpoint"',
+            "hit_count",
+            "condition_type",
+        ):
+            self.assertIn(tool_name, server_py)
+
+        self.assertNotIn("async def set_logpoint", server_py)
+
+    def test_vs_active_debugging_protocol_is_routed(self) -> None:
+        vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
+        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+        vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+        vs_response = read("VSDebuggerMCP/Protocol/DebugResponse.cs")
+
+        for method_name in (
+            '"attach_process"',
+            '"start_debugging"',
+            '"clear_breakpoint"',
+            '"set_data_breakpoint"',
+            '"set_watchpoint"',
+            '"hitCount"',
+            '"conditionType"',
+        ):
+            self.assertIn(method_name, vs_pipe)
+
+        self.assertNotIn('"set_logpoint"', vs_pipe)
+        for symbol in (
+            "AttachProcess",
+            "StartDebugging",
+            "SetDataBreakpoint",
+            "ParseHitCountType",
+            "ProcessNameMatches",
+        ):
+            self.assertIn(symbol, vs_service)
+
+        self.assertNotIn("SetLogpoint", vs_service)
+        self.assertIn("ProcessDebugResult", vs_models)
+        self.assertIn("KnownType(typeof(ProcessDebugResult))", vs_response)
+
+    def test_vs_registration_instructions_include_active_debugging_workflow(self) -> None:
+        vs_registration = read("VSDebuggerMCP/McpClientRegistration.cs")
+
+        for keyword in (
+            "debug_capabilities",
+            "主动断点式定位",
+            "attach_process",
+            "start_debugging",
+            "select_stack_frame",
+            "set_data_breakpoint",
+            "当前不暴露 logpoint 工具",
+            "continue、pause、step_over",
+        ):
+            self.assertIn(keyword, vs_registration)
+
     def test_heavy_debug_tools_have_explicit_timeouts(self) -> None:
         server_py = read("mcp_server/server.py")
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
