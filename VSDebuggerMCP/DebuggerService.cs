@@ -5,6 +5,7 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Runtime.InteropServices;
+using System.Windows.Automation;
 using EnvDTE;
 using EnvDTE80;
 using EnvDTE100;
@@ -24,10 +25,25 @@ namespace VSDebuggerMCP
         private readonly Dictionary<string, string> _sourceFileByClassCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> _sourceFileByClassMissCache = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         private string _sourceLookupSolutionKey = string.Empty;
+        private int _selectedStackFrameIndex;
+        private System.Threading.Tasks.Task _lastDumpDebugStartTask;
+        private string _activeDumpFilePath;
         private const int SnapshotMaxAttempts = 2;
         private const int SnapshotRetryDelayMs = 40;
         private const int ExpressionEvaluationTimeoutMs = 1500;
         private const int ExpressionBatchBudgetMs = 30000;
+        private const int ExpressionExpansionBudgetMs = 2500;
+        private const int ExpressionExpansionMaxNodes = 128;
+        private const int ExpressionExpansionMaxDepth = 4;
+        private const int LocalsExpansionBudgetMs = 1500;
+        private const int LocalsExpansionMaxNodes = 128;
+        private const int LocalsExpansionMaxDepth = 4;
+        private const int DefaultMainThreadTimeoutMs = 10000;
+        private const int HeavyMainThreadTimeoutMs = 60000;
+        private const int DebugBundleMainThreadTimeoutMs = 120000;
+        private const int ThreadEnumerationBudgetMs = 2500;
+        private const int ThreadFrameExpansionMaxNodes = 128;
+        private const int ThreadFramesMaxPerThread = 16;
         private const int SourceLookupCacheMaxEntries = 1024;
         private const int BreakpointBindWaitMs = 250;
         private const int BreakpointBindPollMs = 25;
@@ -103,11 +119,12 @@ namespace VSDebuggerMCP
             if (result.IsPaused && debugger.CurrentStackFrame != null)
             {
                 var frame = debugger.CurrentStackFrame;
+                var lineInfo = GetFrameLineNumberEx(frame);
                 result.CurrentLocation = new LocationInfo
                 {
                     FilePath = GetFrameFileName(frame),
                     FunctionName = frame.FunctionName,
-                    LineNumber = GetFrameLineNumber(frame),
+                    LineNumber = lineInfo.LineNumber,
                     ColumnNumber = 1
                 };
             }
@@ -225,7 +242,7 @@ namespace VSDebuggerMCP
             ThreadHelper.ThrowIfNotOnUIThread();
             try
             {
-                var exceptionExpr = debugger.GetExpression("$exception");
+                var exceptionExpr = debugger.GetExpression("$exception", false, ExpressionEvaluationTimeoutMs);
                 return exceptionExpr != null && exceptionExpr.IsValidValue;
             }
             catch
@@ -334,12 +351,12 @@ namespace VSDebuggerMCP
                 {
                     try
                     {
-                        var lineInfo = GetFrameLineNumberEx(frame);
+                        var lineInfo = GetFrameLineNumberEx(frame, index);
                         var frameInfo = new StackFrameInfo
                         {
                             Index = index,
                             FunctionName = frame.FunctionName,
-                            FilePath = GetFrameFileName(frame),
+                            FilePath = GetFrameFileName(frame, index),
                             LineNumber = lineInfo.LineNumber,
                             LineNumberReliable = lineInfo.IsReliable,
                             ColumnNumber = 1,
@@ -401,7 +418,7 @@ namespace VSDebuggerMCP
             return ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
-                return BuildLocalsResult(Debugger, Math.Max(0, Math.Min(maxDepth, 10)));
+                return BuildLocalsResult(Debugger, maxDepth);
             });
         }
 
@@ -409,6 +426,7 @@ namespace VSDebuggerMCP
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             var result = new LocalsResult();
+            result.FrameIndex = _selectedStackFrameIndex;
 
             if (debugger == null || debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
             {
@@ -421,18 +439,38 @@ namespace VSDebuggerMCP
                 return result;
             }
 
+            int normalizedMaxDepth = Math.Max(0, Math.Min(maxDepth, LocalsExpansionMaxDepth));
+            var budget = new VariableExpansionBudget(LocalsExpansionMaxNodes, LocalsExpansionBudgetMs);
+
             foreach (EnvDTE.Expression local in currentFrame.Locals)
             {
-                result.Variables.Add(CreateVariableInfo(local, 0, maxDepth));
+                if (!budget.CanContinue())
+                {
+                    break;
+                }
+
+                var localInfo = CreateVariableInfo(local, 0, normalizedMaxDepth, budget);
+                if (localInfo != null)
+                {
+                    result.Variables.Add(localInfo);
+                }
             }
 
             try
             {
                 foreach (EnvDTE.Expression arg in currentFrame.Arguments)
                 {
-                    var varInfo = CreateVariableInfo(arg, 0, maxDepth);
-                    varInfo.Name = $"[arg] {varInfo.Name}";
-                    result.Variables.Add(varInfo);
+                    if (!budget.CanContinue())
+                    {
+                        break;
+                    }
+
+                    var varInfo = CreateVariableInfo(arg, 0, normalizedMaxDepth, budget);
+                    if (varInfo != null)
+                    {
+                        varInfo.Name = $"[arg] {varInfo.Name}";
+                        result.Variables.Add(varInfo);
+                    }
                 }
             }
             catch
@@ -440,18 +478,110 @@ namespace VSDebuggerMCP
                 // Arguments may not be available
             }
 
+            if (budget.IsExceeded)
+            {
+                result.Partial = true;
+                result.Error = budget.Reason;
+            }
+
             return result;
         }
 
-        private VariableInfo CreateVariableInfo(EnvDTE.Expression expr, int currentDepth, int maxDepth)
+        private sealed class VariableExpansionBudget
+        {
+            private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
+            private readonly int _maxNodes;
+            private readonly int _maxElapsedMs;
+            private int _nodes;
+
+            public bool IsExceeded { get; private set; }
+            public string Reason { get; private set; }
+
+            public VariableExpansionBudget(int maxNodes, int maxElapsedMs)
+            {
+                _maxNodes = maxNodes;
+                _maxElapsedMs = maxElapsedMs;
+            }
+
+            public bool TryEnterNode()
+            {
+                if (IsExceeded)
+                {
+                    return false;
+                }
+
+                if (_nodes >= _maxNodes)
+                {
+                    MarkExceeded($"Expansion truncated after {_maxNodes} nodes");
+                    return false;
+                }
+
+                if (_stopwatch.ElapsedMilliseconds >= _maxElapsedMs)
+                {
+                    MarkExceeded($"Expansion truncated after {_maxElapsedMs}ms");
+                    return false;
+                }
+
+                _nodes++;
+                return true;
+            }
+
+            public bool CanContinue()
+            {
+                if (IsExceeded)
+                {
+                    return false;
+                }
+
+                if (_nodes >= _maxNodes)
+                {
+                    MarkExceeded($"Expansion truncated after {_maxNodes} nodes");
+                    return false;
+                }
+
+                if (_stopwatch.ElapsedMilliseconds >= _maxElapsedMs)
+                {
+                    MarkExceeded($"Expansion truncated after {_maxElapsedMs}ms");
+                    return false;
+                }
+
+                return true;
+            }
+
+            public void MarkExceeded(string reason)
+            {
+                IsExceeded = true;
+                Reason = reason;
+            }
+        }
+
+        private VariableInfo CreateVariableInfo(EnvDTE.Expression expr, int currentDepth, int maxDepth, VariableExpansionBudget budget = null)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
+            if (budget != null && !budget.TryEnterNode())
+            {
+                return null;
+            }
+
+            bool hasChildren = false;
+            if (currentDepth < maxDepth && (budget == null || budget.CanContinue()))
+            {
+                try
+                {
+                    hasChildren = expr.DataMembers?.Count > 0;
+                }
+                catch
+                {
+                    hasChildren = false;
+                }
+            }
+
             var info = new VariableInfo
             {
                 Name = expr.Name,
                 Type = expr.Type,
                 Value = expr.Value,
-                HasChildren = expr.DataMembers?.Count > 0,
+                HasChildren = hasChildren,
                 IsReadOnly = expr.IsValidValue == false
             };
 
@@ -462,7 +592,16 @@ namespace VSDebuggerMCP
                 {
                     foreach (EnvDTE.Expression child in expr.DataMembers)
                     {
-                        info.Children.Add(CreateVariableInfo(child, currentDepth + 1, maxDepth));
+                        if (budget != null && !budget.CanContinue())
+                        {
+                            break;
+                        }
+
+                        var childInfo = CreateVariableInfo(child, currentDepth + 1, maxDepth, budget);
+                        if (childInfo != null)
+                        {
+                            info.Children.Add(childInfo);
+                        }
                     }
                 }
                 catch
@@ -478,8 +617,13 @@ namespace VSDebuggerMCP
 
         #region Threads
 
-        public ThreadsResult GetThreads()
+        public ThreadsResult GetThreads(bool includeFrames = true, int maxFramesPerThread = -1, int maxNodes = -1, int budgetMs = -1)
         {
+            int normalizedMaxFramesPerThread = NormalizeThreadFrameLimit(maxFramesPerThread);
+            int normalizedMaxNodes = NormalizeThreadNodeLimit(maxNodes);
+            int normalizedBudgetMs = NormalizeThreadBudgetMs(budgetMs);
+            int mainThreadTimeoutMs = ComputeThreadMainThreadTimeoutMs(normalizedBudgetMs);
+
             return ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
@@ -502,15 +646,13 @@ namespace VSDebuggerMCP
                     try
                     {
                         string tokenBefore = CreateDebuggerSnapshotToken(debugger);
-                        var snapshot = BuildThreadsResult(debugger);
+                        var snapshot = BuildThreadsResult(debugger, includeFrames, normalizedMaxFramesPerThread, normalizedMaxNodes, normalizedBudgetMs);
                         string tokenAfter = CreateDebuggerSnapshotToken(debugger);
                         bool stable = !string.IsNullOrEmpty(tokenBefore) && tokenBefore == tokenAfter;
 
                         snapshot.SnapshotStable = stable;
                         snapshot.SnapshotAttempts = attempt;
-                        snapshot.SnapshotStatus = stable
-                            ? "ok"
-                            : (snapshot.Threads.Count > 0 ? "unstable" : "unavailable");
+                        snapshot.SnapshotStatus = DetermineThreadsSnapshotStatus(snapshot, stable);
 
                         bestEffort = snapshot;
                         if (stable)
@@ -535,10 +677,10 @@ namespace VSDebuggerMCP
                 }
 
                 return bestEffort;
-            });
+            }, mainThreadTimeoutMs);
         }
 
-        private ThreadsResult BuildThreadsResult(Debugger5 debugger)
+        private ThreadsResult BuildThreadsResult(Debugger5 debugger, bool includeFrames = true, int maxFramesPerThread = ThreadFramesMaxPerThread, int maxNodes = ThreadFrameExpansionMaxNodes, int budgetMs = ThreadEnumerationBudgetMs)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             var result = new ThreadsResult
@@ -547,19 +689,26 @@ namespace VSDebuggerMCP
             };
             var currentThread = debugger.CurrentThread;
             result.CurrentThreadId = currentThread?.ID ?? 0;
+            var budget = new VariableExpansionBudget(maxNodes, budgetMs);
+            var partialReasons = new List<string>();
+            bool truncated = false;
+            string truncatedReason = null;
 
             EnvDTE.Program currentProgram = null;
             try
             {
                 currentProgram = debugger.CurrentProgram;
             }
-            catch
+            catch (Exception ex)
             {
+                result.Partial = true;
+                result.Error = $"Current debug program unavailable: {ex.Message}";
                 return result;
             }
 
             if (currentProgram == null)
             {
+                result.Error = "Current debug program unavailable";
                 return result;
             }
 
@@ -567,6 +716,11 @@ namespace VSDebuggerMCP
             {
                 foreach (EnvDTE.Thread thread in currentProgram.Threads)
                 {
+                    if (!budget.CanContinue())
+                    {
+                        break;
+                    }
+
                     var threadInfo = new ThreadInfo
                     {
                         Id = thread.ID,
@@ -579,59 +733,207 @@ namespace VSDebuggerMCP
 
                     try
                     {
-                        if (thread.StackFrames.Count > 0)
+                        var stackFrames = thread.StackFrames;
+                        int stackFrameCount = stackFrames.Count;
+                        if (stackFrameCount > 0)
                         {
-                            var topFrame = thread.StackFrames.Item(1) as EnvDTE.StackFrame;
+                            EnvDTE.StackFrame topFrame = null;
+                            for (int i = 1; i <= stackFrameCount; i++)
+                            {
+                                try
+                                {
+                                    var candidateFrame = stackFrames.Item(i) as EnvDTE.StackFrame;
+                                    if (candidateFrame != null && !IsSyntheticExecutionPointFrame(candidateFrame))
+                                    {
+                                        topFrame = candidateFrame;
+                                        break;
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    AddPartialReason(partialReasons, $"thread {thread.ID} top frame {i}: {ex.Message}");
+                                }
+                            }
+
                             if (topFrame != null)
                             {
                                 var lineNum = GetFrameLineNumber(topFrame);
                                 threadInfo.Location = $"{topFrame.FunctionName} ({GetFrameFileName(topFrame)}:{lineNum})";
                             }
 
-                            var framesList = new List<StackFrameInfo>();
-                            int frameIndex = 0;
-                            foreach (EnvDTE.StackFrame frame in thread.StackFrames)
+                            if (includeFrames)
                             {
-                                try
+                                var framesList = new List<StackFrameInfo>();
+                                int frameIndex = 0;
+                                foreach (EnvDTE.StackFrame frame in stackFrames)
                                 {
-                                    var lineInfo = GetFrameLineNumberEx(frame);
-                                    framesList.Add(new StackFrameInfo
+                                    if (!budget.TryEnterNode())
                                     {
-                                        Index = frameIndex++,
-                                        FunctionName = frame.FunctionName,
-                                        FilePath = GetFrameFileName(frame),
-                                        LineNumber = lineInfo.LineNumber,
-                                        LineNumberReliable = lineInfo.IsReliable,
-                                        ColumnNumber = 1,
-                                        Module = frame.Module,
-                                        Language = frame.Language,
-                                        ReturnType = frame.ReturnType
-                                    });
+                                        break;
+                                    }
+
+                                    if (frameIndex >= maxFramesPerThread)
+                                    {
+                                        truncated = true;
+                                        truncatedReason = $"Thread frame enumeration truncated after {maxFramesPerThread} frames per thread";
+                                        break;
+                                    }
+
+                                    try
+                                    {
+                                        int currentFrameIndex = frameIndex++;
+                                        int sourceFallbackFrameIndex = threadInfo.IsCurrent ? currentFrameIndex : -1;
+                                        var lineInfo = GetFrameLineNumberEx(frame, sourceFallbackFrameIndex);
+                                        framesList.Add(new StackFrameInfo
+                                        {
+                                            Index = currentFrameIndex,
+                                            FunctionName = frame.FunctionName,
+                                            FilePath = GetFrameFileName(frame, sourceFallbackFrameIndex),
+                                            LineNumber = lineInfo.LineNumber,
+                                            LineNumberReliable = lineInfo.IsReliable,
+                                            ColumnNumber = 1,
+                                            Module = frame.Module,
+                                            Language = frame.Language,
+                                            ReturnType = frame.ReturnType
+                                        });
+                                    }
+                                    catch
+                                    {
+                                        AddPartialReason(partialReasons, $"thread {thread.ID} frame {frameIndex}: unavailable");
+                                    }
                                 }
-                                catch
+                                if (framesList.Count > 0)
                                 {
+                                    threadInfo.Frames = framesList;
                                 }
-                            }
-                            if (framesList.Count > 0)
-                            {
-                                threadInfo.Frames = framesList;
                             }
                         }
                     }
-                    catch
+                    catch (Exception ex)
                     {
                         threadInfo.Location = "Unknown";
+                        AddPartialReason(partialReasons, $"thread {thread.ID}: {ex.Message}");
                     }
 
                     result.Threads.Add(threadInfo);
+
+                    if (budget.IsExceeded)
+                    {
+                        break;
+                    }
                 }
             }
-            catch
+            catch (Exception ex)
             {
                 // Thread enumeration can fail transiently while engine updates.
+                result.Partial = true;
+                result.Error = ex.Message;
+            }
+
+            if (budget.IsExceeded)
+            {
+                result.Partial = true;
+                result.Error = budget.Reason;
+            }
+            else if (truncated)
+            {
+                result.Partial = true;
+                result.Error = truncatedReason;
+            }
+            else if (partialReasons.Count > 0)
+            {
+                result.Partial = true;
+                result.Error = string.Join("; ", partialReasons);
             }
 
             return result;
+        }
+
+        private void AddPartialReason(List<string> partialReasons, string reason)
+        {
+            if (partialReasons == null || string.IsNullOrWhiteSpace(reason))
+            {
+                return;
+            }
+
+            if (partialReasons.Count < 8)
+            {
+                partialReasons.Add(reason);
+            }
+            else if (partialReasons.Count == 8)
+            {
+                partialReasons.Add("additional thread/frame errors omitted");
+            }
+        }
+
+        private int ComputeThreadMainThreadTimeoutMs(int normalizedBudgetMs)
+        {
+            return Math.Max(HeavyMainThreadTimeoutMs, Math.Min(DebugBundleMainThreadTimeoutMs, normalizedBudgetMs + 5000));
+        }
+
+        private string DetermineThreadsSnapshotStatus(ThreadsResult threads, bool stable)
+        {
+            if (threads == null)
+            {
+                return "unavailable";
+            }
+
+            if (!stable)
+            {
+                return threads.Threads.Count > 0 ? "unstable" : "unavailable";
+            }
+
+            if (threads.Partial)
+            {
+                return "partial";
+            }
+
+            return threads.Threads.Count > 0 ? "ok" : "unavailable";
+        }
+
+        private int NormalizeThreadFrameLimit(int maxFramesPerThread)
+        {
+            if (maxFramesPerThread < 0)
+            {
+                return ThreadFramesMaxPerThread;
+            }
+
+            if (maxFramesPerThread == 0)
+            {
+                return int.MaxValue;
+            }
+
+            return Math.Min(maxFramesPerThread, 4096);
+        }
+
+        private int NormalizeThreadNodeLimit(int maxNodes)
+        {
+            if (maxNodes < 0)
+            {
+                return ThreadFrameExpansionMaxNodes;
+            }
+
+            if (maxNodes == 0)
+            {
+                return int.MaxValue;
+            }
+
+            return Math.Min(maxNodes, 100000);
+        }
+
+        private int NormalizeThreadBudgetMs(int budgetMs)
+        {
+            if (budgetMs < 0)
+            {
+                return ThreadEnumerationBudgetMs;
+            }
+
+            if (budgetMs == 0)
+            {
+                return DebugBundleMainThreadTimeoutMs - 5000;
+            }
+
+            return Math.Min(budgetMs, DebugBundleMainThreadTimeoutMs - 5000);
         }
 
         #endregion
@@ -644,7 +946,7 @@ namespace VSDebuggerMCP
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
                 return BuildModulesResult(Debugger);
-            });
+            }, HeavyMainThreadTimeoutMs);
         }
 
         private ModulesResult BuildModulesResult(Debugger5 debugger)
@@ -702,23 +1004,7 @@ namespace VSDebuggerMCP
                     var additionalModules = GetModulesFromPEB(debugger);
                     foreach (var mod in additionalModules)
                     {
-                        if (!moduleSet.Contains(mod.Path))
-                        {
-                            moduleSet.Add(mod.Path);
-                            moduleInfoDict[mod.Path] = mod;
-                        }
-                        else
-                        {
-                            var existing = moduleInfoDict[mod.Path];
-                            if (string.IsNullOrEmpty(existing.Address) && !string.IsNullOrEmpty(mod.Address))
-                            {
-                                existing.Address = mod.Address;
-                            }
-                            if (string.IsNullOrEmpty(existing.Size) && !string.IsNullOrEmpty(mod.Size))
-                            {
-                                existing.Size = mod.Size;
-                            }
-                        }
+                        MergeModuleInfo(moduleSet, moduleInfoDict, mod, addIfMissing: true);
                     }
                 }
                 catch (Exception ex)
@@ -726,7 +1012,25 @@ namespace VSDebuggerMCP
                     _log($"Error getting modules from PEB: {ex.Message}");
                 }
 
-                // Method 3: Try common system DLLs that are usually loaded
+                // Method 3: Active dump files carry an authoritative module list.
+                // EnvDTE often reports no module base addresses when VS symbol loading is disabled.
+                try
+                {
+                    if (TryGetActiveDumpFilePath(out string dumpPath))
+                    {
+                        bool is64Bit = Is64BitProcess(debugger);
+                        foreach (var mod in GetModulesFromMinidump(dumpPath, is64Bit))
+                        {
+                            MergeModuleInfo(moduleSet, moduleInfoDict, mod, addIfMissing: true);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log($"Error getting modules from minidump: {ex.Message}");
+                }
+
+                // Method 4: Try common system DLLs that are usually loaded
                 TryAddCommonSystemModules(debugger, moduleSet, moduleInfoDict);
 
                 int order = 0;
@@ -1221,6 +1525,23 @@ namespace VSDebuggerMCP
             return $"{bytes} bytes";
         }
 
+        private string FormatPeTimestamp(uint timeDateStamp)
+        {
+            if (timeDateStamp == 0)
+            {
+                return null;
+            }
+
+            try
+            {
+                return DateTimeOffset.FromUnixTimeSeconds(timeDateStamp).UtcDateTime.ToString("o");
+            }
+            catch
+            {
+                return $"0x{timeDateStamp:X8}";
+            }
+        }
+
         private string EscapeForExpression(string str)
         {
             return str.Replace("\\", "\\\\").Replace("\"", "\\\"");
@@ -1236,7 +1557,7 @@ namespace VSDebuggerMCP
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
                 return BuildExceptionResult(Debugger);
-            });
+            }, HeavyMainThreadTimeoutMs);
         }
 
         private ExceptionResult BuildExceptionResult(Debugger5 debugger)
@@ -1341,16 +1662,16 @@ namespace VSDebuggerMCP
 
         #region Expression Evaluation
 
-        public EvaluateResult EvaluateExpression(string expression, bool expandChildren = false, int maxDepth = 2)
+        public EvaluateResult EvaluateExpression(string expression, bool expandChildren = false, int maxDepth = 2, bool allowSideEffects = false)
         {
             return ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
-                return EvaluateExpressionCore(Debugger, expression, expandChildren, maxDepth);
+                return EvaluateExpressionCore(Debugger, expression, expandChildren, maxDepth, allowSideEffects);
             });
         }
 
-        public BatchEvaluateResult EvaluateExpressionsBatch(List<string> expressions, bool expandChildren = false, int maxDepth = 2)
+        public BatchEvaluateResult EvaluateExpressionsBatch(List<string> expressions, bool expandChildren = false, int maxDepth = 2, bool allowSideEffects = false)
         {
             return ExecuteOnMainThread(() =>
             {
@@ -1398,6 +1719,7 @@ namespace VSDebuggerMCP
                             normalizedExpressions,
                             expandChildren,
                             maxDepth,
+                            allowSideEffects,
                             snapshotId,
                             capturedAt);
                         string tokenAfter = CreateDebuggerSnapshotToken(debugger);
@@ -1431,7 +1753,7 @@ namespace VSDebuggerMCP
                 }
 
                 return bestEffort;
-            });
+            }, HeavyMainThreadTimeoutMs);
         }
 
         private BatchEvaluateResult BuildBatchEvaluateResult(
@@ -1439,6 +1761,7 @@ namespace VSDebuggerMCP
             IReadOnlyList<string> expressions,
             bool expandChildren,
             int maxDepth,
+            bool allowSideEffects,
             string snapshotId,
             string capturedAt)
         {
@@ -1467,13 +1790,13 @@ namespace VSDebuggerMCP
                     continue;
                 }
 
-                var evalResult = EvaluateExpressionCore(debugger, expression, expandChildren, maxDepth);
+                var evalResult = EvaluateExpressionCore(debugger, expression, expandChildren, maxDepth, allowSideEffects);
                 result.Results.Add(evalResult);
             }
 
             result.SuccessCount = result.Results.Count(r => r.IsValid);
             result.FailedCount = result.Results.Count - result.SuccessCount;
-            result.Partial = result.FailedCount > 0;
+            result.Partial = result.FailedCount > 0 || result.Results.Any(r => r.ErrorMessage != null && r.ErrorMessage.Contains("Expansion truncated"));
             if (budgetExceeded)
             {
                 result.Error = $"Expression batch budget exceeded {ExpressionBatchBudgetMs}ms";
@@ -1481,7 +1804,266 @@ namespace VSDebuggerMCP
             return result;
         }
 
-        private EvaluateResult EvaluateExpressionCore(Debugger5 debugger, string expression, bool expandChildren, int maxDepth)
+        private void MergeModuleInfo(
+            HashSet<string> moduleSet,
+            Dictionary<string, ModuleInfo> moduleInfoDict,
+            ModuleInfo moduleInfo,
+            bool addIfMissing)
+        {
+            if (moduleInfo == null || string.IsNullOrEmpty(moduleInfo.Path))
+            {
+                return;
+            }
+
+            if (!moduleSet.Contains(moduleInfo.Path))
+            {
+                if (!addIfMissing)
+                {
+                    return;
+                }
+
+                moduleSet.Add(moduleInfo.Path);
+                moduleInfoDict[moduleInfo.Path] = moduleInfo;
+                return;
+            }
+
+            var existing = moduleInfoDict[moduleInfo.Path];
+            if (string.IsNullOrEmpty(existing.Address) && !string.IsNullOrEmpty(moduleInfo.Address))
+            {
+                existing.Address = moduleInfo.Address;
+            }
+            if (string.IsNullOrEmpty(existing.Size) && !string.IsNullOrEmpty(moduleInfo.Size))
+            {
+                existing.Size = moduleInfo.Size;
+            }
+            if (string.IsNullOrEmpty(existing.SymbolPath) && !string.IsNullOrEmpty(moduleInfo.SymbolPath))
+            {
+                existing.SymbolPath = moduleInfo.SymbolPath;
+            }
+            if (string.IsNullOrEmpty(existing.Timestamp) && !string.IsNullOrEmpty(moduleInfo.Timestamp))
+            {
+                existing.Timestamp = moduleInfo.Timestamp;
+            }
+            if (string.IsNullOrEmpty(existing.Version) && !string.IsNullOrEmpty(moduleInfo.Version))
+            {
+                existing.Version = moduleInfo.Version;
+            }
+            existing.Is64Bit = existing.Is64Bit || moduleInfo.Is64Bit;
+        }
+
+        private bool TryGetActiveDumpFilePath(out string dumpPath)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            dumpPath = null;
+            try
+            {
+                var activePath = _dte?.ActiveDocument?.FullName;
+                if (IsDumpFilePath(activePath) && System.IO.File.Exists(activePath))
+                {
+                    dumpPath = System.IO.Path.GetFullPath(activePath);
+                    _activeDumpFilePath = dumpPath;
+                    return true;
+                }
+
+                if (IsDumpFilePath(_activeDumpFilePath) && System.IO.File.Exists(_activeDumpFilePath))
+                {
+                    dumpPath = _activeDumpFilePath;
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                _log($"[TryGetActiveDumpFilePath] Error reading active document: {ex.Message}");
+            }
+
+            return false;
+        }
+
+        private List<ModuleInfo> GetModulesFromMinidump(string dumpPath, bool is64Bit)
+        {
+            var modules = new List<ModuleInfo>();
+            if (string.IsNullOrWhiteSpace(dumpPath) || !System.IO.File.Exists(dumpPath))
+            {
+                return modules;
+            }
+
+            using (var stream = new System.IO.FileStream(dumpPath, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite))
+            using (var reader = new System.IO.BinaryReader(stream, Encoding.UTF8))
+            {
+                if (stream.Length < 32)
+                {
+                    return modules;
+                }
+
+                uint signature = reader.ReadUInt32();
+                if (signature != 0x504D444D) // "MDMP"
+                {
+                    return modules;
+                }
+
+                reader.ReadUInt32(); // version
+                uint streamCount = reader.ReadUInt32();
+                uint directoryRva = reader.ReadUInt32();
+                reader.ReadUInt32(); // checksum
+                reader.ReadUInt32(); // timestamp
+                reader.ReadUInt64(); // flags
+
+                if (streamCount > 4096 || directoryRva == 0 || directoryRva >= stream.Length)
+                {
+                    return modules;
+                }
+
+                uint moduleListRva = 0;
+                uint moduleListSize = 0;
+                stream.Position = directoryRva;
+                for (uint i = 0; i < streamCount; i++)
+                {
+                    if (stream.Position + 12 > stream.Length)
+                    {
+                        return modules;
+                    }
+
+                    uint streamType = reader.ReadUInt32();
+                    uint dataSize = reader.ReadUInt32();
+                    uint rva = reader.ReadUInt32();
+                    if (streamType == 4) // ModuleListStream
+                    {
+                        moduleListSize = dataSize;
+                        moduleListRva = rva;
+                    }
+                }
+
+                if (moduleListRva == 0 || moduleListRva >= stream.Length || moduleListSize < 4)
+                {
+                    return modules;
+                }
+
+                stream.Position = moduleListRva;
+                uint moduleCount = reader.ReadUInt32();
+                uint maxModulesBySize = (moduleListSize - 4) / 108;
+                moduleCount = Math.Min(moduleCount, maxModulesBySize);
+                moduleCount = Math.Min(moduleCount, 100000);
+
+                for (uint i = 0; i < moduleCount; i++)
+                {
+                    if (stream.Position + 108 > stream.Length)
+                    {
+                        break;
+                    }
+
+                    ulong baseOfImage = reader.ReadUInt64();
+                    uint sizeOfImage = reader.ReadUInt32();
+                    reader.ReadUInt32(); // checksum
+                    uint timeDateStamp = reader.ReadUInt32();
+                    uint moduleNameRva = reader.ReadUInt32();
+                    stream.Position += 52; // VS_FIXEDFILEINFO
+                    uint cvRecordSize = reader.ReadUInt32();
+                    uint cvRecordRva = reader.ReadUInt32();
+                    stream.Position += 8; // MiscRecord
+                    stream.Position += 16; // Reserved0/Reserved1
+
+                    string modulePath = ReadMinidumpString(reader, moduleNameRva);
+                    if (string.IsNullOrWhiteSpace(modulePath))
+                    {
+                        continue;
+                    }
+
+                    modules.Add(new ModuleInfo
+                    {
+                        Path = modulePath,
+                        Name = SafeGetFileName(modulePath),
+                        Address = $"0x{baseOfImage:X16}",
+                        Size = FormatSize(sizeOfImage),
+                        SymbolPath = ReadMinidumpCodeViewPdbPath(reader, cvRecordRva, cvRecordSize),
+                        SymbolsLoaded = false,
+                        IsSystemModule = IsSystemModule(modulePath),
+                        Is64Bit = is64Bit,
+                        Timestamp = FormatPeTimestamp(timeDateStamp),
+                        Version = GetModuleVersion(modulePath)
+                    });
+                }
+            }
+
+            return modules;
+        }
+
+        private string ReadMinidumpString(System.IO.BinaryReader reader, uint rva)
+        {
+            if (rva == 0 || rva >= reader.BaseStream.Length)
+            {
+                return null;
+            }
+
+            long previousPosition = reader.BaseStream.Position;
+            try
+            {
+                reader.BaseStream.Position = rva;
+                uint byteLength = reader.ReadUInt32();
+                if (byteLength == 0 || byteLength > 64 * 1024 || reader.BaseStream.Position + byteLength > reader.BaseStream.Length)
+                {
+                    return null;
+                }
+
+                return Encoding.Unicode.GetString(reader.ReadBytes((int)byteLength));
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                reader.BaseStream.Position = previousPosition;
+            }
+        }
+
+        private string ReadMinidumpCodeViewPdbPath(System.IO.BinaryReader reader, uint rva, uint size)
+        {
+            if (rva == 0 || size < 24 || size > 4096 || rva >= reader.BaseStream.Length || (ulong)rva + size > (ulong)reader.BaseStream.Length)
+            {
+                return null;
+            }
+
+            long previousPosition = reader.BaseStream.Position;
+            try
+            {
+                reader.BaseStream.Position = rva;
+                var bytes = reader.ReadBytes((int)size);
+                if (bytes.Length < 24 || bytes[0] != (byte)'R' || bytes[1] != (byte)'S' || bytes[2] != (byte)'D' || bytes[3] != (byte)'S')
+                {
+                    return null;
+                }
+
+                int end = Array.IndexOf(bytes, (byte)0, 24);
+                if (end < 0)
+                {
+                    end = bytes.Length;
+                }
+
+                return Encoding.UTF8.GetString(bytes, 24, end - 24);
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                reader.BaseStream.Position = previousPosition;
+            }
+        }
+
+        private string SafeGetFileName(string path)
+        {
+            try
+            {
+                return System.IO.Path.GetFileName(path);
+            }
+            catch
+            {
+                return path;
+            }
+        }
+
+        private EvaluateResult EvaluateExpressionCore(Debugger5 debugger, string expression, bool expandChildren, int maxDepth, bool allowSideEffects = false)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             var result = new EvaluateResult { Expression = expression };
@@ -1523,13 +2105,29 @@ namespace VSDebuggerMCP
 
                 if (expandChildren)
                 {
+                    int normalizedMaxDepth = Math.Max(0, Math.Min(maxDepth, ExpressionExpansionMaxDepth));
+                    var budget = new VariableExpansionBudget(ExpressionExpansionMaxNodes, ExpressionExpansionBudgetMs);
                     result.HasChildren = expr.DataMembers?.Count > 0;
                     if (result.HasChildren)
                     {
                         result.Children = new List<VariableInfo>();
                         foreach (EnvDTE.Expression child in expr.DataMembers)
                         {
-                            result.Children.Add(CreateVariableInfo(child, 0, maxDepth));
+                            if (!budget.CanContinue())
+                            {
+                                break;
+                            }
+
+                            var childInfo = CreateVariableInfo(child, 0, normalizedMaxDepth, budget);
+                            if (childInfo != null)
+                            {
+                                result.Children.Add(childInfo);
+                            }
+                        }
+
+                        if (budget.IsExceeded && string.IsNullOrEmpty(result.ErrorMessage))
+                        {
+                            result.ErrorMessage = budget.Reason;
                         }
                     }
                 }
@@ -2637,8 +3235,17 @@ namespace VSDebuggerMCP
 
         #region Full Context
 
-        public FullContextResult GetFullContext()
+        public FullContextResult GetFullContext(
+            bool threadIncludeFrames = true,
+            int threadMaxFramesPerThread = -1,
+            int threadMaxNodes = -1,
+            int threadBudgetMs = -1)
         {
+            int normalizedThreadMaxFramesPerThread = NormalizeThreadFrameLimit(threadMaxFramesPerThread);
+            int normalizedThreadMaxNodes = NormalizeThreadNodeLimit(threadMaxNodes);
+            int normalizedThreadBudgetMs = NormalizeThreadBudgetMs(threadBudgetMs);
+            int mainThreadTimeoutMs = Math.Max(HeavyMainThreadTimeoutMs, ComputeThreadMainThreadTimeoutMs(normalizedThreadBudgetMs));
+
             return ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
@@ -2655,7 +3262,15 @@ namespace VSDebuggerMCP
                     {
                         fullContext.Callstack = BuildCallStackResult(debugger);
                         fullContext.Locals = BuildLocalsResult(debugger, 2);
-                        fullContext.Threads = BuildThreadsResult(debugger);
+                        fullContext.Threads = BuildThreadsResult(
+                            debugger,
+                            threadIncludeFrames,
+                            normalizedThreadMaxFramesPerThread,
+                            normalizedThreadMaxNodes,
+                            normalizedThreadBudgetMs);
+                        fullContext.Threads.SnapshotAttempts = 1;
+                        fullContext.Threads.SnapshotStable = true;
+                        fullContext.Threads.SnapshotStatus = DetermineThreadsSnapshotStatus(fullContext.Threads, true);
                     }
                 }
                 catch (Exception ex) { _log($"GetFullContext: Debug data failed: {ex.Message}"); }
@@ -2665,13 +3280,32 @@ namespace VSDebuggerMCP
                 
                 try { fullContext.Modules = BuildModulesResult(debugger); }
                 catch (Exception ex) { _log($"GetFullContext: Modules failed: {ex.Message}"); }
-                
+
                 return fullContext;
-            });
+            }, mainThreadTimeoutMs);
         }
 
-        public DebugBundleResult CaptureDebugBundle(List<string> expressions = null, bool expandChildren = false, int maxDepth = 2, int outputTailLines = 80)
+        public DebugBundleResult CaptureDebugBundle(
+            List<string> expressions = null,
+            bool expandChildren = false,
+            int maxDepth = 2,
+            int outputTailLines = 80,
+            bool includeLocals = false,
+            bool includeModules = false,
+            bool includeRegisters = false,
+            bool includeOutput = false,
+            bool includeThreads = true,
+            bool includeException = true,
+            bool allowSideEffects = false,
+            bool threadIncludeFrames = true,
+            int threadMaxFramesPerThread = -1,
+            int threadMaxNodes = -1,
+            int threadBudgetMs = -1)
         {
+            int normalizedThreadMaxFramesPerThread = NormalizeThreadFrameLimit(threadMaxFramesPerThread);
+            int normalizedThreadMaxNodes = NormalizeThreadNodeLimit(threadMaxNodes);
+            int normalizedThreadBudgetMs = NormalizeThreadBudgetMs(threadBudgetMs);
+
             return ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
@@ -2686,7 +3320,9 @@ namespace VSDebuggerMCP
                     SnapshotId = snapshotId,
                     CapturedAt = capturedAt,
                     SnapshotStatus = "unavailable",
-                    Partial = true
+                    Partial = true,
+                    IncludedComponents = BuildIncludedDebugBundleComponents(includeLocals, includeModules, includeRegisters, includeOutput, includeThreads, includeException, normalizedExpressions.Count),
+                    OmittedComponents = BuildOmittedDebugBundleComponents(includeLocals, includeModules, includeRegisters, includeOutput, includeThreads, includeException)
                 };
 
                 if (debugger == null)
@@ -2722,7 +3358,18 @@ namespace VSDebuggerMCP
                             normalizedExpressions,
                             expandChildren,
                             normalizedDepth,
-                            normalizedTailLines);
+                            normalizedTailLines,
+                            includeLocals,
+                            includeModules,
+                            includeRegisters,
+                            includeOutput,
+                            includeThreads,
+                            includeException,
+                            allowSideEffects,
+                            threadIncludeFrames,
+                            normalizedThreadMaxFramesPerThread,
+                            normalizedThreadMaxNodes,
+                            normalizedThreadBudgetMs);
                         string tokenAfter = CreateDebuggerSnapshotToken(debugger);
                         bool stable = !string.IsNullOrEmpty(tokenBefore) && tokenBefore == tokenAfter;
 
@@ -2762,7 +3409,7 @@ namespace VSDebuggerMCP
                 }
 
                 return bestEffort;
-            });
+            }, DebugBundleMainThreadTimeoutMs);
         }
 
         private DebugBundleResult BuildDebugBundleResult(
@@ -2772,13 +3419,26 @@ namespace VSDebuggerMCP
             IReadOnlyList<string> expressions,
             bool expandChildren,
             int maxDepth,
-            int outputTailLines)
+            int outputTailLines,
+            bool includeLocals,
+            bool includeModules,
+            bool includeRegisters,
+            bool includeOutput,
+            bool includeThreads,
+            bool includeException,
+            bool allowSideEffects,
+            bool threadIncludeFrames,
+            int threadMaxFramesPerThread,
+            int threadMaxNodes,
+            int threadBudgetMs)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             var bundle = new DebugBundleResult
             {
                 SnapshotId = snapshotId,
-                CapturedAt = capturedAt
+                CapturedAt = capturedAt,
+                IncludedComponents = BuildIncludedDebugBundleComponents(includeLocals, includeModules, includeRegisters, includeOutput, includeThreads, includeException, expressions.Count),
+                OmittedComponents = BuildOmittedDebugBundleComponents(includeLocals, includeModules, includeRegisters, includeOutput, includeThreads, includeException)
             };
             var componentErrors = new List<string>();
 
@@ -2802,106 +3462,137 @@ namespace VSDebuggerMCP
                 };
             }
 
-            try
+            if (includeLocals)
             {
-                bundle.Locals = BuildLocalsResult(debugger, maxDepth);
-            }
-            catch (Exception ex)
-            {
-                componentErrors.Add($"locals: {ex.Message}");
-                bundle.Locals = new LocalsResult();
-            }
-
-            try
-            {
-                bundle.Exception = BuildExceptionResult(debugger);
-            }
-            catch (Exception ex)
-            {
-                componentErrors.Add($"exception: {ex.Message}");
-                bundle.Exception = new ExceptionResult
+                try
                 {
-                    Capability = "full_exception_details",
-                    HasException = false
-                };
-            }
-
-            try
-            {
-                bundle.Threads = BuildThreadsResult(debugger);
-                bundle.Threads.SnapshotAttempts = 1;
-                bundle.Threads.SnapshotStable = true;
-                bundle.Threads.SnapshotStatus = bundle.Threads.Threads.Count > 0 ? "ok" : "unavailable";
-            }
-            catch (Exception ex)
-            {
-                componentErrors.Add($"threads: {ex.Message}");
-                bundle.Threads = new ThreadsResult
+                    bundle.Locals = BuildLocalsResult(debugger, maxDepth);
+                    if (!string.IsNullOrEmpty(bundle.Locals.Error))
+                    {
+                        componentErrors.Add($"locals: {bundle.Locals.Error}");
+                    }
+                }
+                catch (Exception ex)
                 {
-                    Capability = "full_thread_metadata",
-                    SnapshotStatus = "unavailable"
-                };
-            }
-
-            try
-            {
-                bundle.Modules = BuildModulesResult(debugger);
-                if (!string.IsNullOrEmpty(bundle.Modules.Error))
-                {
-                    componentErrors.Add($"modules: {bundle.Modules.Error}");
+                    componentErrors.Add($"locals: {ex.Message}");
+                    bundle.Locals = new LocalsResult
+                    {
+                        Partial = true,
+                        Error = ex.Message
+                    };
                 }
             }
-            catch (Exception ex)
-            {
-                componentErrors.Add($"modules: {ex.Message}");
-                bundle.Modules = new ModulesResult
-                {
-                    Capability = "multi_source",
-                    Error = ex.Message
-                };
-            }
 
-            try
+            if (includeException)
             {
-                bundle.Registers = BuildRegistersResult(debugger);
-                if (!string.IsNullOrEmpty(bundle.Registers.Error))
+                try
                 {
-                    componentErrors.Add($"registers: {bundle.Registers.Error}");
+                    bundle.Exception = BuildExceptionResult(debugger);
+                }
+                catch (Exception ex)
+                {
+                    componentErrors.Add($"exception: {ex.Message}");
+                    bundle.Exception = new ExceptionResult
+                    {
+                        Capability = "full_exception_details",
+                        HasException = false
+                    };
                 }
             }
-            catch (Exception ex)
-            {
-                componentErrors.Add($"registers: {ex.Message}");
-                bundle.Registers = new RegistersResult
-                {
-                    Capability = "general_segment_sse",
-                    Error = ex.Message
-                };
-            }
 
-            try
+            if (includeThreads)
             {
-                bundle.Output = BuildOutputWindowResult("Debug", outputTailLines);
-                if (!string.IsNullOrEmpty(bundle.Output.Error))
+                try
                 {
-                    componentErrors.Add($"output: {bundle.Output.Error}");
+                    bundle.Threads = BuildThreadsResult(
+                        debugger,
+                        threadIncludeFrames,
+                        threadMaxFramesPerThread,
+                        threadMaxNodes,
+                        threadBudgetMs);
+                    bundle.Threads.SnapshotAttempts = 1;
+                    bundle.Threads.SnapshotStable = true;
+                    bundle.Threads.SnapshotStatus = DetermineThreadsSnapshotStatus(bundle.Threads, true);
+                }
+                catch (Exception ex)
+                {
+                    componentErrors.Add($"threads: {ex.Message}");
+                    bundle.Threads = new ThreadsResult
+                    {
+                        Capability = "full_thread_metadata",
+                        SnapshotStatus = "unavailable"
+                    };
                 }
             }
-            catch (Exception ex)
+
+            if (includeModules)
             {
-                componentErrors.Add($"output: {ex.Message}");
-                bundle.Output = new OutputWindowResult
+                try
                 {
-                    Pane = "Debug",
-                    Capability = "multi_pane_output",
-                    Error = ex.Message
-                };
+                    bundle.Modules = BuildModulesResult(debugger);
+                    if (!string.IsNullOrEmpty(bundle.Modules.Error))
+                    {
+                        componentErrors.Add($"modules: {bundle.Modules.Error}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    componentErrors.Add($"modules: {ex.Message}");
+                    bundle.Modules = new ModulesResult
+                    {
+                        Capability = "multi_source",
+                        Error = ex.Message
+                    };
+                }
+            }
+
+            if (includeRegisters)
+            {
+                try
+                {
+                    bundle.Registers = BuildRegistersResult(debugger);
+                    if (!string.IsNullOrEmpty(bundle.Registers.Error))
+                    {
+                        componentErrors.Add($"registers: {bundle.Registers.Error}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    componentErrors.Add($"registers: {ex.Message}");
+                    bundle.Registers = new RegistersResult
+                    {
+                        Capability = "general_segment_sse",
+                        Error = ex.Message
+                    };
+                }
+            }
+
+            if (includeOutput)
+            {
+                try
+                {
+                    bundle.Output = BuildOutputWindowResult("Debug", outputTailLines);
+                    if (!string.IsNullOrEmpty(bundle.Output.Error))
+                    {
+                        componentErrors.Add($"output: {bundle.Output.Error}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    componentErrors.Add($"output: {ex.Message}");
+                    bundle.Output = new OutputWindowResult
+                    {
+                        Pane = "Debug",
+                        Capability = "multi_pane_output",
+                        Error = ex.Message
+                    };
+                }
             }
 
             try
             {
                 bundle.Expressions = expressions.Count > 0
-                    ? BuildBatchEvaluateResult(debugger, expressions, expandChildren, maxDepth, snapshotId, capturedAt)
+                    ? BuildBatchEvaluateResult(debugger, expressions, expandChildren, maxDepth, allowSideEffects, snapshotId, capturedAt)
                     : new BatchEvaluateResult
                     {
                         SnapshotId = snapshotId,
@@ -2925,13 +3616,57 @@ namespace VSDebuggerMCP
                 bundle.Expressions = BuildUnavailableBatchEvaluateResult(snapshotId, capturedAt, expressions.Count, ex.Message);
             }
 
-            bundle.Partial = IsDebugBundlePartial(bundle);
             if (componentErrors.Count > 0)
             {
                 bundle.Error = string.Join("; ", componentErrors);
             }
+            bundle.Partial = IsDebugBundlePartial(bundle);
 
             return bundle;
+        }
+
+        private List<string> BuildIncludedDebugBundleComponents(
+            bool includeLocals,
+            bool includeModules,
+            bool includeRegisters,
+            bool includeOutput,
+            bool includeThreads,
+            bool includeException,
+            int expressionCount)
+        {
+            var components = new List<string> { "status", "callstack" };
+            if (includeException) components.Add("exception");
+            if (includeThreads) components.Add("threads");
+            if (includeLocals) components.Add("locals");
+            if (includeModules) components.Add("modules");
+            if (includeRegisters) components.Add("registers");
+            if (includeOutput) components.Add("output");
+            if (expressionCount > 0) components.Add("expressions");
+            return components;
+        }
+
+        private List<string> BuildOmittedDebugBundleComponents(
+            bool includeLocals,
+            bool includeModules,
+            bool includeRegisters,
+            bool includeOutput,
+            bool includeThreads,
+            bool includeException)
+        {
+            var components = new List<string>();
+            if (!includeException) components.Add("exception");
+            if (!includeThreads) components.Add("threads");
+            if (!includeLocals) components.Add("locals");
+            if (!includeModules) components.Add("modules");
+            if (!includeRegisters) components.Add("registers");
+            if (!includeOutput) components.Add("output");
+            return components;
+        }
+
+        private bool BundleIncludes(DebugBundleResult bundle, string component)
+        {
+            return bundle.IncludedComponents != null &&
+                bundle.IncludedComponents.Contains(component, StringComparer.OrdinalIgnoreCase);
         }
 
         private BatchEvaluateResult BuildUnavailableBatchEvaluateResult(string snapshotId, string capturedAt, int requestedCount, string error)
@@ -2966,19 +3701,27 @@ namespace VSDebuggerMCP
                 return true;
             }
 
-            if (bundle.Threads == null || bundle.Threads.SnapshotStatus != "ok")
+            if (BundleIncludes(bundle, "threads") &&
+                (bundle.Threads == null || bundle.Threads.SnapshotStatus != "ok" || bundle.Threads.Partial))
             {
                 return true;
             }
 
-            if (bundle.Modules?.Error != null ||
-                bundle.Registers?.Error != null ||
-                bundle.Output?.Error != null)
+            if (BundleIncludes(bundle, "locals") && (bundle.Locals == null || bundle.Locals.Partial))
             {
                 return true;
             }
 
-            if (bundle.Expressions != null && (bundle.Expressions.Partial || bundle.Expressions.FailedCount > 0))
+            if ((BundleIncludes(bundle, "modules") && bundle.Modules?.Error != null) ||
+                (BundleIncludes(bundle, "registers") && bundle.Registers?.Error != null) ||
+                (BundleIncludes(bundle, "output") && bundle.Output?.Error != null))
+            {
+                return true;
+            }
+
+            if (BundleIncludes(bundle, "expressions") &&
+                bundle.Expressions != null &&
+                (bundle.Expressions.Partial || bundle.Expressions.FailedCount > 0))
             {
                 return true;
             }
@@ -3084,6 +3827,7 @@ namespace VSDebuggerMCP
                         return result;
                     }
 
+                    _activeDumpFilePath = null;
                     target.Attach();
                     result.Success = true;
                     result.ProcessId = target.ProcessID;
@@ -3099,7 +3843,7 @@ namespace VSDebuggerMCP
                 }
 
                 return result;
-            });
+            }, HeavyMainThreadTimeoutMs);
         }
 
         /// <summary>
@@ -3131,6 +3875,12 @@ namespace VSDebuggerMCP
                             return result;
                         }
 
+                        if (TryStartActiveDumpDebugging(debugger, result))
+                        {
+                            return result;
+                        }
+
+                        _activeDumpFilePath = null;
                         debugger.Go(false);
                         result.Success = true;
                         result.Message = "Started debugging using the current Visual Studio startup configuration";
@@ -3160,6 +3910,7 @@ namespace VSDebuggerMCP
                         return result;
                     }
 
+                    _activeDumpFilePath = null;
                     var startInfo = new System.Diagnostics.ProcessStartInfo
                     {
                         FileName = normalizedExe,
@@ -3213,7 +3964,121 @@ namespace VSDebuggerMCP
                 }
 
                 return result;
+            }, HeavyMainThreadTimeoutMs);
+        }
+
+        private bool TryStartActiveDumpDebugging(Debugger5 debugger, ProcessDebugResult result)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            string activeDocumentPath = null;
+            try
+            {
+                activeDocumentPath = _dte?.ActiveDocument?.FullName;
+            }
+            catch
+            {
+                // ActiveDocument can be unavailable while VS is changing views.
+            }
+
+            if (!IsDumpFilePath(activeDocumentPath) || !System.IO.File.Exists(activeDocumentPath))
+            {
+                return false;
+            }
+
+            activeDocumentPath = System.IO.Path.GetFullPath(activeDocumentPath);
+            _activeDumpFilePath = activeDocumentPath;
+            result.ExecutablePath = activeDocumentPath;
+
+            try
+            {
+                QueueActiveDumpNativeOnlyDebugging();
+                result.Success = true;
+                result.Message = "Requested Visual Studio to start native debugging for active dump file";
+                result.Status = BuildDebugStatus(debugger);
+            }
+            catch (Exception ex)
+            {
+                result.Success = false;
+                result.Message = ex.Message;
+                result.Status = BuildDebugStatus(debugger);
+            }
+
+            return true;
+        }
+
+        private void QueueActiveDumpNativeOnlyDebugging()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            _lastDumpDebugStartTask = System.Threading.Tasks.Task.Run(async () =>
+            {
+                await System.Threading.Tasks.Task.Delay(100);
+                try
+                {
+                    if (!TryInvokeVisualStudioControl("Debug with Native Only"))
+                    {
+                        _log("Failed to find Visual Studio control: Debug with Native Only");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log($"Failed to invoke Debug with Native Only: {ex.Message}");
+                }
             });
+        }
+
+        private bool TryInvokeVisualStudioControl(string automationName)
+        {
+            var mainWindowHandle = System.Diagnostics.Process.GetCurrentProcess().MainWindowHandle;
+            if (mainWindowHandle == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            var root = AutomationElement.FromHandle(mainWindowHandle);
+            if (root == null)
+            {
+                return false;
+            }
+
+            var element = root.FindFirst(
+                TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.NameProperty, automationName));
+            if (element == null)
+            {
+                return false;
+            }
+
+            object pattern;
+            if (element.TryGetCurrentPattern(InvokePattern.Pattern, out pattern))
+            {
+                ((InvokePattern)pattern).Invoke();
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool IsDumpFilePath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return false;
+            }
+
+            string extension = null;
+            try
+            {
+                extension = System.IO.Path.GetExtension(path);
+            }
+            catch
+            {
+                return false;
+            }
+
+            return string.Equals(extension, ".dmp", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(extension, ".mdmp", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(extension, ".hdmp", StringComparison.OrdinalIgnoreCase);
         }
 
         private EnvDTE.Process FindLocalProcess(Debugger5 debugger, int processId, string processName)
@@ -3354,7 +4219,24 @@ namespace VSDebuggerMCP
         /// <summary>
         /// Continues execution if needed, waits for the debugger to stop again, and captures a debug bundle.
         /// </summary>
-        public ContinueAndWaitResult ContinueAndWaitForBreak(List<string> expressions = null, bool expandChildren = false, int maxDepth = 2, int outputTailLines = 80, int timeoutMs = 120000, int pollIntervalMs = 200)
+        public ContinueAndWaitResult ContinueAndWaitForBreak(
+            List<string> expressions = null,
+            bool expandChildren = false,
+            int maxDepth = 2,
+            int outputTailLines = 80,
+            int timeoutMs = 120000,
+            int pollIntervalMs = 200,
+            bool includeLocals = false,
+            bool includeModules = false,
+            bool includeRegisters = false,
+            bool includeOutput = false,
+            bool includeThreads = true,
+            bool includeException = true,
+            bool allowSideEffects = false,
+            bool threadIncludeFrames = true,
+            int threadMaxFramesPerThread = -1,
+            int threadMaxNodes = -1,
+            int threadBudgetMs = -1)
         {
             int normalizedTimeoutMs = Math.Max(1000, Math.Min(timeoutMs, 30 * 60 * 1000));
             int normalizedPollIntervalMs = Math.Max(50, Math.Min(pollIntervalMs, 1000));
@@ -3406,7 +4288,22 @@ namespace VSDebuggerMCP
 
                 if (status.IsPaused)
                 {
-                    var bundle = CaptureDebugBundle(expressions, expandChildren, maxDepth, outputTailLines);
+                    var bundle = CaptureDebugBundle(
+                        expressions,
+                        expandChildren,
+                        maxDepth,
+                        outputTailLines,
+                        includeLocals,
+                        includeModules,
+                        includeRegisters,
+                        includeOutput,
+                        includeThreads,
+                        includeException,
+                        allowSideEffects,
+                        threadIncludeFrames,
+                        threadMaxFramesPerThread,
+                        threadMaxNodes,
+                        threadBudgetMs);
                     result.Success = true;
                     result.BreakDetected = true;
                     result.TimedOut = false;
@@ -3620,6 +4517,52 @@ namespace VSDebuggerMCP
                     debugger.Stop(false);
                     result.Success = true;
                     result.Message = "Debugging stopped";
+                    _activeDumpFilePath = null;
+                }
+                catch (Exception ex)
+                {
+                    result.Success = false;
+                    result.Message = ex.Message;
+                }
+
+                return result;
+            });
+        }
+
+        /// <summary>
+        /// Detach the debugger from the current process without terminating it.
+        /// </summary>
+        public DebugControlResult Detach()
+        {
+            return ExecuteOnMainThread(() =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                var debugger = Debugger;
+                var result = new DebugControlResult { Action = "Detach" };
+
+                if (debugger == null || debugger.CurrentMode == dbgDebugMode.dbgDesignMode)
+                {
+                    result.Success = false;
+                    result.Message = "Not debugging";
+                    return result;
+                }
+
+                var process = debugger.CurrentProcess;
+                if (process == null)
+                {
+                    result.Success = false;
+                    result.Message = "No current debugged process";
+                    return result;
+                }
+
+                try
+                {
+                    string processName = process.Name;
+                    int processId = process.ProcessID;
+                    process.Detach(false);
+                    result.Success = true;
+                    result.Message = $"Debugger detached from {processName} ({processId})";
+                    _activeDumpFilePath = null;
                 }
                 catch (Exception ex)
                 {
@@ -5504,6 +6447,7 @@ namespace VSDebuggerMCP
                         if (frame != null)
                         {
                             debugger.CurrentStackFrame = frame;
+                            _selectedStackFrameIndex = frameIndex;
                             result.Success = true;
                             result.Message = $"Switched to frame {frameIndex}: {frame.FunctionName}";
                             result.NewLocation = new LocationInfo
@@ -5561,6 +6505,7 @@ namespace VSDebuggerMCP
                         if (thread.ID == threadId)
                         {
                             debugger.CurrentThread = thread;
+                            _selectedStackFrameIndex = 0;
                             found = true;
                             result.Success = true;
                             result.Message = $"Switched to thread {threadId}";
@@ -5606,13 +6551,19 @@ namespace VSDebuggerMCP
         /// Gets the file name from a stack frame safely - IMPROVED VERSION.
         /// Handles both native and managed code.
         /// </summary>
-        private string GetFrameFileName(EnvDTE.StackFrame frame)
+        private string GetFrameFileName(EnvDTE.StackFrame frame, int frameIndex = -1)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             try
             {
+                if (IsSyntheticExecutionPointFrame(frame))
+                {
+                    return frame.Module ?? "";
+                }
+
                 string language = frame.Language ?? "";
                 bool isManagedCode = language == "C#" || language == "VB" || language == "F#" || language == "Basic";
+                bool isCurrentOrSelectedFrame = IsCurrentOrSelectedStackFrame(frame, frameIndex);
                 
                 // Method 1: For managed code, try to find source file through solution search
                 if (isManagedCode)
@@ -5632,18 +6583,11 @@ namespace VSDebuggerMCP
 
                         // Fallback: use ActiveDocument only if this is the current frame 
                         // and the document matches the function name
-                        var debugger = Debugger;
-                        if (debugger != null && debugger.CurrentStackFrame == frame)
+                        if (isCurrentOrSelectedFrame)
                         {
-                            var activeDoc = _dte.ActiveDocument;
-                            if (activeDoc != null && !string.IsNullOrEmpty(activeDoc.FullName))
+                            if (TryGetActiveSourceDocumentPath(out string activeSourcePath))
                             {
-                                if (activeDoc.FullName.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) ||
-                                    activeDoc.FullName.EndsWith(".vb", StringComparison.OrdinalIgnoreCase) ||
-                                    activeDoc.FullName.EndsWith(".fs", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    return activeDoc.FullName;
-                                }
+                                return activeSourcePath;
                             }
                         }
                     }
@@ -5656,6 +6600,13 @@ namespace VSDebuggerMCP
                 // Method 2: For native code, try __FILE__ macro
                 if (language == "C++" || language == "C" || !isManagedCode)
                 {
+                    // Native dump debugging can expose the active source document in VS while
+                    // EnvDTE stack frames still report only the module path.
+                    if (isCurrentOrSelectedFrame && TryGetActiveSourceDocumentPath(out string activeSourcePath))
+                    {
+                        return activeSourcePath;
+                    }
+
                     try
                     {
                         var debugger = Debugger;
@@ -5716,13 +6667,18 @@ namespace VSDebuggerMCP
         /// Gets the line number from a stack frame safely - IMPROVED VERSION.
         /// Returns a tuple with line number and whether it's reliable (from the current frame).
         /// </summary>
-        private (int LineNumber, bool IsReliable) GetFrameLineNumberEx(EnvDTE.StackFrame frame)
+        private (int LineNumber, bool IsReliable) GetFrameLineNumberEx(EnvDTE.StackFrame frame, int frameIndex = -1)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             try
             {
+                if (IsSyntheticExecutionPointFrame(frame))
+                {
+                    return (0, false);
+                }
+
                 var debugger = Debugger;
-                bool isCurrentFrame = debugger != null && debugger.CurrentStackFrame == frame;
+                bool isCurrentFrame = IsCurrentOrSelectedStackFrame(frame, frameIndex);
                 string language = frame.Language ?? "";
                 bool isManagedCode = language == "C#" || language == "VB" || language == "F#" || language == "Basic";
 
@@ -5766,6 +6722,13 @@ namespace VSDebuggerMCP
                     {
                         _log($"[GetFrameLineNumberEx] Error using __LINE__ macro: {ex.Message}");
                     }
+                }
+
+                // Native dump frames often reject __LINE__ even though VS has opened the exact
+                // source location. Use the active editor position only for the current frame.
+                if (isCurrentFrame && TryGetActiveSourceLineNumber(out int activeLineNumber))
+                {
+                    return (activeLineNumber, true);
                 }
 
                 // Method 3: For non-current frames, try to find open document for this file
@@ -5816,6 +6779,149 @@ namespace VSDebuggerMCP
         private int GetFrameLineNumber(EnvDTE.StackFrame frame)
         {
             return GetFrameLineNumberEx(frame).LineNumber;
+        }
+
+        private bool IsCurrentOrSelectedStackFrame(EnvDTE.StackFrame frame, int frameIndex)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (IsSyntheticExecutionPointFrame(frame))
+            {
+                return false;
+            }
+
+            if (frameIndex >= 0 && frameIndex == _selectedStackFrameIndex)
+            {
+                return true;
+            }
+
+            try
+            {
+                var debugger = Debugger;
+                if (debugger?.CurrentStackFrame == null)
+                {
+                    return false;
+                }
+
+                var currentFrame = debugger.CurrentStackFrame;
+                if (currentFrame == frame)
+                {
+                    return true;
+                }
+
+                return string.Equals(currentFrame.FunctionName, frame.FunctionName, StringComparison.Ordinal) &&
+                       string.Equals(currentFrame.Module, frame.Module, StringComparison.OrdinalIgnoreCase) &&
+                       string.Equals(currentFrame.Language, frame.Language, StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool IsSyntheticExecutionPointFrame(EnvDTE.StackFrame frame)
+        {
+            try
+            {
+                return (frame?.FunctionName ?? string.Empty).StartsWith("[Execution point when dump was captured", StringComparison.Ordinal);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool TryGetActiveSourceDocumentPath(out string filePath)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            filePath = null;
+            try
+            {
+                var activeDoc = _dte.ActiveDocument;
+                if (activeDoc == null)
+                {
+                    return false;
+                }
+
+                var fullName = activeDoc.FullName;
+                if (IsSourceFilePath(fullName) && System.IO.File.Exists(fullName))
+                {
+                    filePath = fullName;
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                _log($"[TryGetActiveSourceDocumentPath] Error reading active document: {ex.Message}");
+            }
+
+            return false;
+        }
+
+        private bool TryGetActiveSourceLineNumber(out int lineNumber)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            lineNumber = 0;
+            try
+            {
+                if (!TryGetActiveSourceDocumentPath(out _))
+                {
+                    return false;
+                }
+
+                var selection = _dte.ActiveDocument?.Selection as TextSelection;
+                var line = selection?.ActivePoint?.Line ?? 0;
+                if (line > 0)
+                {
+                    lineNumber = line;
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                _log($"[TryGetActiveSourceLineNumber] Error reading active source line: {ex.Message}");
+            }
+
+            return false;
+        }
+
+        private bool IsSourceFilePath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return false;
+            }
+
+            string extension;
+            try
+            {
+                extension = System.IO.Path.GetExtension(path);
+            }
+            catch
+            {
+                return false;
+            }
+
+            switch ((extension ?? string.Empty).ToLowerInvariant())
+            {
+                case ".c":
+                case ".cc":
+                case ".cpp":
+                case ".cxx":
+                case ".h":
+                case ".hh":
+                case ".hpp":
+                case ".hxx":
+                case ".inl":
+                case ".ipp":
+                case ".cs":
+                case ".vb":
+                case ".fs":
+                case ".usf":
+                case ".ush":
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         /// <summary>
@@ -6311,7 +7417,7 @@ namespace VSDebuggerMCP
             return false;
         }
 
-        private T ExecuteOnMainThread<T>(Func<T> action)
+        private T ExecuteOnMainThread<T>(Func<T> action, int timeoutMs = DefaultMainThreadTimeoutMs)
         {
             // If already on UI thread, execute directly to avoid deadlock
             if (ThreadHelper.CheckAccess())
@@ -6341,11 +7447,10 @@ namespace VSDebuggerMCP
                     });
                 });
 
-                // Wait with timeout (10 seconds)
-                if (!task.Wait(TimeSpan.FromSeconds(10)))
+                if (!task.Wait(TimeSpan.FromMilliseconds(timeoutMs)))
                 {
-                    _log("ExecuteOnMainThread: Timeout waiting for UI thread");
-                    throw new TimeoutException("Timeout waiting for VS UI thread. Is Visual Studio responsive?");
+                    _log($"ExecuteOnMainThread: Timeout waiting for UI thread after {timeoutMs}ms");
+                    throw new TimeoutException($"Timeout waiting for VS UI thread after {timeoutMs}ms. Is Visual Studio responsive?");
                 }
 
                 if (capturedException != null)

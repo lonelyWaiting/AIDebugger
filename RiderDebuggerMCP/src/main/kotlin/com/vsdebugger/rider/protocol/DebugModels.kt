@@ -50,7 +50,9 @@ data class StackFrameInfo(
 
 data class LocalsResult(
     @SerializedName("frameIndex") val frameIndex: Int = 0,
-    @SerializedName("variables") val variables: MutableList<VariableInfo> = mutableListOf()
+    @SerializedName("variables") val variables: MutableList<VariableInfo> = mutableListOf(),
+    @SerializedName("partial") val partial: Boolean = false,
+    @SerializedName("error") val error: String? = null
 )
 
 data class VariableInfo(
@@ -70,6 +72,8 @@ data class ThreadsResult(
     @SerializedName("snapshotStable") var snapshotStable: Boolean = false,
     @SerializedName("snapshotAttempts") var snapshotAttempts: Int = 0,
     @SerializedName("snapshotStatus") var snapshotStatus: String = "unavailable",
+    @SerializedName("partial") var partial: Boolean = false,
+    @SerializedName("error") var error: String? = null,
     @SerializedName("threads") val threads: MutableList<ThreadInfo> = mutableListOf()
 )
 
@@ -228,6 +232,8 @@ data class DebugBundleResult(
     @SerializedName("snapshotAttempts") val snapshotAttempts: Int = 0,
     @SerializedName("snapshotStatus") val snapshotStatus: String = "unavailable",
     @SerializedName("partial") val partial: Boolean = false,
+    @SerializedName("includedComponents") val includedComponents: List<String> = emptyList(),
+    @SerializedName("omittedComponents") val omittedComponents: List<String> = emptyList(),
     @SerializedName("stopReason") val stopReason: String = "not_paused",
     @SerializedName("status") val status: DebugStatusResult? = null,
     @SerializedName("callstack") val callstack: CallStackResult? = null,

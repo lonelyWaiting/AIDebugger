@@ -368,7 +368,13 @@ namespace VSDebuggerMCP
                     return _debuggerService.GetLocals(localsDepth);
 
                 case "get_threads":
-                    return _debuggerService.GetThreads();
+                    {
+                        bool includeFrames = GetParam<bool>(request.Params, "includeFrames", true);
+                        int maxFramesPerThread = GetParam<int>(request.Params, "maxFramesPerThread", -1);
+                        int maxNodes = GetParam<int>(request.Params, "maxNodes", -1);
+                        int budgetMs = GetParam<int>(request.Params, "budgetMs", -1);
+                        return _debuggerService.GetThreads(includeFrames, maxFramesPerThread, maxNodes, budgetMs);
+                    }
 
                 case "get_modules":
                     return _debuggerService.GetModules();
@@ -381,7 +387,8 @@ namespace VSDebuggerMCP
                         string expression = GetParam<string>(request.Params, "expression", "");
                         bool expandChildren = GetParam<bool>(request.Params, "expandChildren", false);
                         int maxDepth = GetParam<int>(request.Params, "maxDepth", 2);
-                        return _debuggerService.EvaluateExpression(expression, expandChildren, maxDepth);
+                        bool allowSideEffects = GetParam<bool>(request.Params, "allowSideEffects", false);
+                        return _debuggerService.EvaluateExpression(expression, expandChildren, maxDepth, allowSideEffects);
                     }
 
                 case "evaluate_expressions_batch":
@@ -389,7 +396,8 @@ namespace VSDebuggerMCP
                         var expressions = GetStringListParam(request.Params, "expressions");
                         bool expandChildren = GetParam<bool>(request.Params, "expandChildren", false);
                         int maxDepth = GetParam<int>(request.Params, "maxDepth", 2);
-                        return _debuggerService.EvaluateExpressionsBatch(expressions, expandChildren, maxDepth);
+                        bool allowSideEffects = GetParam<bool>(request.Params, "allowSideEffects", false);
+                        return _debuggerService.EvaluateExpressionsBatch(expressions, expandChildren, maxDepth, allowSideEffects);
                     }
 
                 case "capture_debug_bundle":
@@ -398,7 +406,33 @@ namespace VSDebuggerMCP
                         bool expandChildren = GetParam<bool>(request.Params, "expandChildren", false);
                         int maxDepth = GetParam<int>(request.Params, "maxDepth", 2);
                         int outputTailLines = GetParam<int>(request.Params, "outputTailLines", 80);
-                        return _debuggerService.CaptureDebugBundle(expressions, expandChildren, maxDepth, outputTailLines);
+                        bool includeLocals = GetParam<bool>(request.Params, "includeLocals", false);
+                        bool includeModules = GetParam<bool>(request.Params, "includeModules", false);
+                        bool includeRegisters = GetParam<bool>(request.Params, "includeRegisters", false);
+                        bool includeOutput = GetParam<bool>(request.Params, "includeOutput", false);
+                        bool includeThreads = GetParam<bool>(request.Params, "includeThreads", true);
+                        bool includeException = GetParam<bool>(request.Params, "includeException", true);
+                        bool allowSideEffects = GetParam<bool>(request.Params, "allowSideEffects", false);
+                        bool threadIncludeFrames = GetParam<bool>(request.Params, "threadIncludeFrames", true);
+                        int threadMaxFramesPerThread = GetParam<int>(request.Params, "threadMaxFramesPerThread", -1);
+                        int threadMaxNodes = GetParam<int>(request.Params, "threadMaxNodes", -1);
+                        int threadBudgetMs = GetParam<int>(request.Params, "threadBudgetMs", -1);
+                        return _debuggerService.CaptureDebugBundle(
+                            expressions,
+                            expandChildren,
+                            maxDepth,
+                            outputTailLines,
+                            includeLocals,
+                            includeModules,
+                            includeRegisters,
+                            includeOutput,
+                            includeThreads,
+                            includeException,
+                            allowSideEffects,
+                            threadIncludeFrames,
+                            threadMaxFramesPerThread,
+                            threadMaxNodes,
+                            threadBudgetMs);
                     }
 
                 case "read_memory":
@@ -432,7 +466,17 @@ namespace VSDebuggerMCP
                     return _debuggerService.GetBuildErrors(warningsOnly: true);
 
                 case "get_full_context":
-                    return _debuggerService.GetFullContext();
+                    {
+                        bool threadIncludeFrames = GetParam<bool>(request.Params, "threadIncludeFrames", true);
+                        int threadMaxFramesPerThread = GetParam<int>(request.Params, "threadMaxFramesPerThread", -1);
+                        int threadMaxNodes = GetParam<int>(request.Params, "threadMaxNodes", -1);
+                        int threadBudgetMs = GetParam<int>(request.Params, "threadBudgetMs", -1);
+                        return _debuggerService.GetFullContext(
+                            threadIncludeFrames,
+                            threadMaxFramesPerThread,
+                            threadMaxNodes,
+                            threadBudgetMs);
+                    }
 
                 case "ping":
                     return new PingResult { Status = "ok", Timestamp = DateTime.UtcNow.ToString("o") };
@@ -468,7 +512,35 @@ namespace VSDebuggerMCP
                         int outputTailLines = GetParam<int>(request.Params, "outputTailLines", 80);
                         int timeoutMs = GetParam<int>(request.Params, "timeoutMs", 120000);
                         int pollIntervalMs = GetParam<int>(request.Params, "pollIntervalMs", 200);
-                        return _debuggerService.ContinueAndWaitForBreak(expressions, expandChildren, maxDepth, outputTailLines, timeoutMs, pollIntervalMs);
+                        bool includeLocals = GetParam<bool>(request.Params, "includeLocals", false);
+                        bool includeModules = GetParam<bool>(request.Params, "includeModules", false);
+                        bool includeRegisters = GetParam<bool>(request.Params, "includeRegisters", false);
+                        bool includeOutput = GetParam<bool>(request.Params, "includeOutput", false);
+                        bool includeThreads = GetParam<bool>(request.Params, "includeThreads", true);
+                        bool includeException = GetParam<bool>(request.Params, "includeException", true);
+                        bool allowSideEffects = GetParam<bool>(request.Params, "allowSideEffects", false);
+                        bool threadIncludeFrames = GetParam<bool>(request.Params, "threadIncludeFrames", true);
+                        int threadMaxFramesPerThread = GetParam<int>(request.Params, "threadMaxFramesPerThread", -1);
+                        int threadMaxNodes = GetParam<int>(request.Params, "threadMaxNodes", -1);
+                        int threadBudgetMs = GetParam<int>(request.Params, "threadBudgetMs", -1);
+                        return _debuggerService.ContinueAndWaitForBreak(
+                            expressions,
+                            expandChildren,
+                            maxDepth,
+                            outputTailLines,
+                            timeoutMs,
+                            pollIntervalMs,
+                            includeLocals,
+                            includeModules,
+                            includeRegisters,
+                            includeOutput,
+                            includeThreads,
+                            includeException,
+                            allowSideEffects,
+                            threadIncludeFrames,
+                            threadMaxFramesPerThread,
+                            threadMaxNodes,
+                            threadBudgetMs);
                     }
 
                 case "step_into":
@@ -485,6 +557,9 @@ namespace VSDebuggerMCP
 
                 case "stop":
                     return _debuggerService.Stop();
+
+                case "detach":
+                    return _debuggerService.Detach();
 
                 case "run_to_cursor":
                     {

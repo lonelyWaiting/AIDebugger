@@ -125,12 +125,33 @@ class IDEBridge:
         vs_bridge.clear_selection()
         rider_bridge.clear_selection()
 
+    def _is_stale_selected_instance_error(self, error: Exception) -> bool:
+        message = str(error).lower()
+        stale_markers = (
+            "not found",
+            "broken pipe",
+            "no data received from pipe",
+            "empty response received from pipe",
+            "error: 109",
+        )
+        return any(marker in message for marker in stale_markers)
+
     async def call(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 10.0) -> Any:
         async with self._lock:
             if self._selected_ide == "vs":
-                return await vs_bridge.call(method, params, timeout)
-            if self._selected_ide == "rider":
-                return await rider_bridge.call(method, params, timeout)
+                try:
+                    return await vs_bridge.call(method, params, timeout)
+                except vs_bridge.VSBridgeError as e:
+                    if not self._is_stale_selected_instance_error(e):
+                        raise IDEBridgeError(str(e))
+                    self.clear_selection()
+            elif self._selected_ide == "rider":
+                try:
+                    return await rider_bridge.call(method, params, timeout)
+                except rider_bridge.RiderBridgeError as e:
+                    if not self._is_stale_selected_instance_error(e):
+                        raise IDEBridgeError(str(e))
+                    self.clear_selection()
 
             instances = await self.discover_instances()
             if not instances:
@@ -152,9 +173,12 @@ class IDEBridge:
                 )
 
             self.select_instance(selected.ide, process_id=selected.process_id, pipe_name=selected.pipe_name)
-            if selected.ide == "vs":
-                return await vs_bridge.call(method, params, timeout)
-            return await rider_bridge.call(method, params, timeout)
+            try:
+                if selected.ide == "vs":
+                    return await vs_bridge.call(method, params, timeout)
+                return await rider_bridge.call(method, params, timeout)
+            except (vs_bridge.VSBridgeError, rider_bridge.RiderBridgeError) as e:
+                raise IDEBridgeError(str(e))
 
     def _auto_select_core(self, instances: List[IDEInstance]) -> Optional[IDEInstance]:
         if len(instances) == 1:

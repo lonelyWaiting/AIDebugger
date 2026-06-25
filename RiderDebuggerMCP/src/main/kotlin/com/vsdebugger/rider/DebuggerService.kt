@@ -60,6 +60,12 @@ class DebuggerService {
     private var selectedFrameIndex: Int? = null
     private val snapshotMaxAttempts = 2
     private val snapshotRetryDelayMs = 40L
+    private val variableExpansionMaxNodes = 128
+    private val variableExpansionBudgetMs = 1500L
+    private val variableExpansionMaxDepth = 4
+    private val threadEnumerationBudgetMs = 2500L
+    private val threadFrameExpansionMaxNodes = 128
+    private val threadFramesMaxPerThread = 16
 
     fun setPipeName(value: String) {
         pipeName = value
@@ -74,27 +80,62 @@ class DebuggerService {
                 val depth = getParam(request.params, "depth", 2)
                 getLocals(depth)
             }
-            "get_threads" -> getThreads()
+            "get_threads" -> {
+                val includeFrames = getParam(request.params, "includeFrames", true)
+                val maxFramesPerThread = getParam(request.params, "maxFramesPerThread", -1)
+                val maxNodes = getParam(request.params, "maxNodes", -1)
+                val budgetMs = getParam(request.params, "budgetMs", -1)
+                getThreads(includeFrames, maxFramesPerThread, maxNodes, budgetMs)
+            }
             "get_modules" -> getModules()
             "get_exception" -> getException()
             "evaluate_expression" -> {
                 val expression = getParam(request.params, "expression", "")
                 val expand = getParam(request.params, "expandChildren", false)
                 val maxDepth = getParam(request.params, "maxDepth", 2)
-                evaluateExpression(expression, expand, maxDepth)
+                val allowSideEffects = getParam(request.params, "allowSideEffects", false)
+                evaluateExpression(expression, expand, maxDepth, allowSideEffects)
             }
             "evaluate_expressions_batch" -> {
                 val expressions = getStringListParam(request.params, "expressions")
                 val expand = getParam(request.params, "expandChildren", false)
                 val maxDepth = getParam(request.params, "maxDepth", 2)
-                evaluateExpressionsBatch(expressions, expand, maxDepth)
+                val allowSideEffects = getParam(request.params, "allowSideEffects", false)
+                evaluateExpressionsBatch(expressions, expand, maxDepth, allowSideEffects)
             }
             "capture_debug_bundle" -> {
                 val expressions = getStringListParam(request.params, "expressions")
                 val expand = getParam(request.params, "expandChildren", false)
                 val maxDepth = getParam(request.params, "maxDepth", 2)
                 val outputTailLines = getParam(request.params, "outputTailLines", 80)
-                captureDebugBundle(expressions, expand, maxDepth, outputTailLines)
+                val includeLocals = getParam(request.params, "includeLocals", false)
+                val includeModules = getParam(request.params, "includeModules", false)
+                val includeRegisters = getParam(request.params, "includeRegisters", false)
+                val includeOutput = getParam(request.params, "includeOutput", false)
+                val includeThreads = getParam(request.params, "includeThreads", true)
+                val includeException = getParam(request.params, "includeException", true)
+                val allowSideEffects = getParam(request.params, "allowSideEffects", false)
+                val threadIncludeFrames = getParam(request.params, "threadIncludeFrames", true)
+                val threadMaxFramesPerThread = getParam(request.params, "threadMaxFramesPerThread", -1)
+                val threadMaxNodes = getParam(request.params, "threadMaxNodes", -1)
+                val threadBudgetMs = getParam(request.params, "threadBudgetMs", -1)
+                captureDebugBundle(
+                    expressions,
+                    expand,
+                    maxDepth,
+                    outputTailLines,
+                    includeLocals,
+                    includeModules,
+                    includeRegisters,
+                    includeOutput,
+                    includeThreads,
+                    includeException,
+                    allowSideEffects,
+                    threadIncludeFrames,
+                    threadMaxFramesPerThread,
+                    threadMaxNodes,
+                    threadBudgetMs
+                )
             }
             "read_memory" -> {
                 val address = getParam(request.params, "address", "")
@@ -114,7 +155,13 @@ class DebuggerService {
             "get_build_errors" -> getBuildErrors()
             "get_errors_only" -> getBuildErrors(errorsOnly = true)
             "get_warnings_only" -> getBuildErrors(warningsOnly = true)
-            "get_full_context" -> getFullContext()
+            "get_full_context" -> {
+                val threadIncludeFrames = getParam(request.params, "threadIncludeFrames", true)
+                val threadMaxFramesPerThread = getParam(request.params, "threadMaxFramesPerThread", -1)
+                val threadMaxNodes = getParam(request.params, "threadMaxNodes", -1)
+                val threadBudgetMs = getParam(request.params, "threadBudgetMs", -1)
+                getFullContext(threadIncludeFrames, threadMaxFramesPerThread, threadMaxNodes, threadBudgetMs)
+            }
             "ping" -> PingResult(status = "ok", timestamp = Instant.now().toString())
             "get_instance_info" -> getInstanceInfo(getParam(request.params, "pipeName", ""))
             "continue" -> debugContinue()
@@ -125,13 +172,43 @@ class DebuggerService {
                 val outputTailLines = getParam(request.params, "outputTailLines", 80)
                 val timeoutMs = getParam(request.params, "timeoutMs", 120000)
                 val pollIntervalMs = getParam(request.params, "pollIntervalMs", 200)
-                continueAndWaitForBreak(expressions, expand, maxDepth, outputTailLines, timeoutMs, pollIntervalMs)
+                val includeLocals = getParam(request.params, "includeLocals", false)
+                val includeModules = getParam(request.params, "includeModules", false)
+                val includeRegisters = getParam(request.params, "includeRegisters", false)
+                val includeOutput = getParam(request.params, "includeOutput", false)
+                val includeThreads = getParam(request.params, "includeThreads", true)
+                val includeException = getParam(request.params, "includeException", true)
+                val allowSideEffects = getParam(request.params, "allowSideEffects", false)
+                val threadIncludeFrames = getParam(request.params, "threadIncludeFrames", true)
+                val threadMaxFramesPerThread = getParam(request.params, "threadMaxFramesPerThread", -1)
+                val threadMaxNodes = getParam(request.params, "threadMaxNodes", -1)
+                val threadBudgetMs = getParam(request.params, "threadBudgetMs", -1)
+                continueAndWaitForBreak(
+                    expressions,
+                    expand,
+                    maxDepth,
+                    outputTailLines,
+                    timeoutMs,
+                    pollIntervalMs,
+                    includeLocals,
+                    includeModules,
+                    includeRegisters,
+                    includeOutput,
+                    includeThreads,
+                    includeException,
+                    allowSideEffects,
+                    threadIncludeFrames,
+                    threadMaxFramesPerThread,
+                    threadMaxNodes,
+                    threadBudgetMs
+                )
             }
             "step_into" -> debugStepInto()
             "step_over" -> debugStepOver()
             "step_out" -> debugStepOut()
             "break" -> debugBreak()
             "stop" -> debugStop()
+            "detach" -> debugDetach()
             "run_to_cursor" -> {
                 val filePath = getParam(request.params, "filePath", "")
                 val lineNumber = getParam(request.params, "lineNumber", 0)
@@ -350,11 +427,25 @@ class DebuggerService {
 
     private fun buildLocalsResult(session: XDebugSession, maxDepth: Int): LocalsResult {
         val frame = getSelectedFrame(session) ?: return LocalsResult()
-        val variables = collectVariables(frame, 0, maxDepth.coerceIn(0, 10))
-        return LocalsResult(frameIndex = selectedFrameIndex ?: 0, variables = variables.toMutableList())
+        val budget = VariableExpansionBudget(variableExpansionMaxNodes, variableExpansionBudgetMs)
+        val variables = collectVariables(frame, 0, maxDepth.coerceIn(0, variableExpansionMaxDepth), budget)
+        return LocalsResult(
+            frameIndex = selectedFrameIndex ?: 0,
+            variables = variables.toMutableList(),
+            partial = budget.isExceeded,
+            error = budget.reason
+        )
     }
 
-    private fun getThreads(): ThreadsResult {
+    private fun getThreads(
+        includeFrames: Boolean = true,
+        maxFramesPerThread: Int = -1,
+        maxNodes: Int = -1,
+        budgetMs: Int = -1
+    ): ThreadsResult {
+        val normalizedMaxFramesPerThread = normalizeThreadFrameLimit(maxFramesPerThread)
+        val normalizedMaxNodes = normalizeThreadNodeLimit(maxNodes)
+        val normalizedBudgetMs = normalizeThreadBudgetMs(budgetMs)
         var bestEffort = ThreadsResult(
             snapshotStatus = "unavailable",
             capability = "partial_thread_metadata"
@@ -370,7 +461,13 @@ class DebuggerService {
             try {
                 val suspendContext = session.suspendContext ?: return bestEffort
                 val tokenBefore = suspendSnapshotToken(session, suspendContext)
-                val snapshot = buildThreadsResult(suspendContext)
+                val snapshot = buildThreadsResult(
+                    suspendContext,
+                    includeFrames,
+                    normalizedMaxFramesPerThread,
+                    normalizedMaxNodes,
+                    normalizedBudgetMs
+                )
                 val currentContext = session.suspendContext
                 val stable = currentContext != null &&
                     session.isSuspended &&
@@ -378,13 +475,7 @@ class DebuggerService {
 
                 snapshot.snapshotAttempts = attempt
                 snapshot.snapshotStable = stable
-                snapshot.snapshotStatus = if (stable) {
-                    "ok"
-                } else if (snapshot.threads.isNotEmpty()) {
-                    "unstable"
-                } else {
-                    "unavailable"
-                }
+                snapshot.snapshotStatus = determineThreadsSnapshotStatus(snapshot, stable)
                 bestEffort = snapshot
                 if (stable) {
                     return snapshot
@@ -469,19 +560,20 @@ class DebuggerService {
         )
     }
 
-    private fun evaluateExpression(expression: String, expandChildren: Boolean, maxDepth: Int): EvaluateResult {
+    private fun evaluateExpression(expression: String, expandChildren: Boolean, maxDepth: Int, allowSideEffects: Boolean = false): EvaluateResult {
         val session = currentSession() ?: return EvaluateResult(expression = expression, isValid = false, errorMessage = "No debug session")
         val evaluator = getEvaluator(session) ?: return EvaluateResult(expression = expression, isValid = false, errorMessage = "No evaluator available")
-        return evaluateExpressionCore(expression, expandChildren, maxDepth, session, evaluator)
+        return evaluateExpressionCore(expression, expandChildren, maxDepth, session, evaluator, allowSideEffects)
     }
 
-    private fun evaluateExpressionsBatch(expressions: List<String>, expandChildren: Boolean, maxDepth: Int): BatchEvaluateResult {
+    private fun evaluateExpressionsBatch(expressions: List<String>, expandChildren: Boolean, maxDepth: Int, allowSideEffects: Boolean = false): BatchEvaluateResult {
         val snapshotId = java.util.UUID.randomUUID().toString().replace("-", "")
         val capturedAt = Instant.now().toString()
         return evaluateExpressionsBatchInternal(
             normalizeExpressions(expressions),
             expandChildren,
             maxDepth,
+            allowSideEffects,
             snapshotId,
             capturedAt
         )
@@ -491,6 +583,7 @@ class DebuggerService {
         normalizedExpressions: List<String>,
         expandChildren: Boolean,
         maxDepth: Int,
+        allowSideEffects: Boolean,
         snapshotId: String,
         capturedAt: String
     ): BatchEvaluateResult {
@@ -536,6 +629,7 @@ class DebuggerService {
                     normalizedExpressions = normalizedExpressions,
                     expandChildren = expandChildren,
                     maxDepth = normalizedDepth,
+                    allowSideEffects = allowSideEffects,
                     session = session,
                     evaluator = evaluator,
                     snapshotId = snapshotId,
@@ -581,17 +675,19 @@ class DebuggerService {
         normalizedExpressions: List<String>,
         expandChildren: Boolean,
         maxDepth: Int,
+        allowSideEffects: Boolean,
         session: XDebugSession,
         evaluator: XDebuggerEvaluator,
         snapshotId: String,
         capturedAt: String
     ): BatchEvaluateResult {
         val results = normalizedExpressions.map { expression ->
-            evaluateExpressionCore(expression, expandChildren, maxDepth, session, evaluator)
+            evaluateExpressionCore(expression, expandChildren, maxDepth, session, evaluator, allowSideEffects)
         }.toMutableList()
         val successCount = results.count { it.isValid }
         val failedCount = results.size - successCount
-        val partial = failedCount > 0
+        val partial = failedCount > 0 ||
+            results.any { it.errorMessage?.contains("Expansion truncated") == true }
 
         return BatchEvaluateResult(
             snapshotId = snapshotId,
@@ -627,7 +723,8 @@ class DebuggerService {
         expandChildren: Boolean,
         maxDepth: Int,
         session: XDebugSession,
-        evaluator: XDebuggerEvaluator
+        evaluator: XDebuggerEvaluator,
+        allowSideEffects: Boolean = false
     ): EvaluateResult {
         val eval = evaluateValue(evaluator, expression, session.currentPosition)
         if (eval.value == null) {
@@ -635,8 +732,9 @@ class DebuggerService {
         }
 
         val presentation = describeValue(eval.value)
+        val budget = newVariableExpansionBudget()
         val children = if (expandChildren && presentation.hasChildren) {
-            collectVariables(eval.value, 0, maxDepth).toMutableList()
+            collectVariables(eval.value, 0, maxDepth.coerceIn(0, variableExpansionMaxDepth), budget).toMutableList()
         } else {
             null
         }
@@ -646,6 +744,7 @@ class DebuggerService {
             value = presentation.value,
             type = presentation.type,
             isValid = true,
+            errorMessage = budget.reason,
             hasChildren = presentation.hasChildren,
             children = children
         )
@@ -856,13 +955,18 @@ class DebuggerService {
         return BuildErrorsResult(errorCount = errorCount, warningCount = warningCount, items = items)
     }
 
-    private fun getFullContext(): FullContextResult {
+    private fun getFullContext(
+        threadIncludeFrames: Boolean = true,
+        threadMaxFramesPerThread: Int = -1,
+        threadMaxNodes: Int = -1,
+        threadBudgetMs: Int = -1
+    ): FullContextResult {
         return FullContextResult(
             status = getDebugStatus(),
             callstack = getCallStack(),
             locals = getLocals(),
             exception = getException(),
-            threads = getThreads(),
+            threads = getThreads(threadIncludeFrames, threadMaxFramesPerThread, threadMaxNodes, threadBudgetMs),
             modules = getModules()
         )
     }
@@ -871,18 +975,51 @@ class DebuggerService {
         expressions: List<String>,
         expandChildren: Boolean,
         maxDepth: Int,
-        outputTailLines: Int
+        outputTailLines: Int,
+        includeLocals: Boolean = false,
+        includeModules: Boolean = false,
+        includeRegisters: Boolean = false,
+        includeOutput: Boolean = false,
+        includeThreads: Boolean = true,
+        includeException: Boolean = true,
+        allowSideEffects: Boolean = false,
+        threadIncludeFrames: Boolean = true,
+        threadMaxFramesPerThread: Int = -1,
+        threadMaxNodes: Int = -1,
+        threadBudgetMs: Int = -1
     ): DebugBundleResult {
         val normalizedExpressions = normalizeExpressions(expressions)
         val normalizedDepth = maxDepth.coerceIn(0, 4)
         val normalizedTailLines = outputTailLines.coerceIn(0, 500)
+        val normalizedThreadMaxFramesPerThread = normalizeThreadFrameLimit(threadMaxFramesPerThread)
+        val normalizedThreadMaxNodes = normalizeThreadNodeLimit(threadMaxNodes)
+        val normalizedThreadBudgetMs = normalizeThreadBudgetMs(threadBudgetMs)
         val snapshotId = java.util.UUID.randomUUID().toString().replace("-", "")
         val capturedAt = Instant.now().toString()
+        val includedComponents = buildIncludedDebugBundleComponents(
+            includeLocals,
+            includeModules,
+            includeRegisters,
+            includeOutput,
+            includeThreads,
+            includeException,
+            normalizedExpressions.size
+        )
+        val omittedComponents = buildOmittedDebugBundleComponents(
+            includeLocals,
+            includeModules,
+            includeRegisters,
+            includeOutput,
+            includeThreads,
+            includeException
+        )
         var bestEffort = DebugBundleResult(
             snapshotId = snapshotId,
             capturedAt = capturedAt,
             snapshotStatus = "unavailable",
-            partial = true
+            partial = true,
+            includedComponents = includedComponents,
+            omittedComponents = omittedComponents
         )
 
         for (attempt in 1..snapshotMaxAttempts) {
@@ -935,16 +1072,26 @@ class DebuggerService {
                     it.snapshotStable = true
                     it.snapshotStatus = if (it.frames.isNotEmpty()) "ok" else "unavailable"
                 }
-                val locals = buildLocalsResult(session, normalizedDepth)
-                val exception = getException()
-                val threads = buildThreadsResult(suspendContext).also {
-                    it.snapshotAttempts = 1
-                    it.snapshotStable = true
-                    it.snapshotStatus = if (it.threads.isNotEmpty()) "ok" else "unavailable"
+                val locals = if (includeLocals) buildLocalsResult(session, normalizedDepth) else null
+                val exception = if (includeException) getException() else null
+                val threads = if (includeThreads) {
+                    buildThreadsResult(
+                        suspendContext,
+                        threadIncludeFrames,
+                        normalizedThreadMaxFramesPerThread,
+                        normalizedThreadMaxNodes,
+                        normalizedThreadBudgetMs
+                    ).also {
+                        it.snapshotAttempts = 1
+                        it.snapshotStable = true
+                        it.snapshotStatus = determineThreadsSnapshotStatus(it, true)
+                    }
+                } else {
+                    null
                 }
-                val modules = getModules()
-                val registers = getRegisters()
-                val output = getOutputWindow("Debug", normalizedTailLines)
+                val modules = if (includeModules) getModules() else null
+                val registers = if (includeRegisters) getRegisters() else null
+                val output = if (includeOutput) getOutputWindow("Debug", normalizedTailLines) else null
                 val evaluator = getEvaluator(session)
                 val expressionBatch = when {
                     normalizedExpressions.isEmpty() -> BatchEvaluateResult(
@@ -968,6 +1115,7 @@ class DebuggerService {
                         normalizedExpressions = normalizedExpressions,
                         expandChildren = expandChildren,
                         maxDepth = normalizedDepth,
+                        allowSideEffects = allowSideEffects,
                         session = session,
                         evaluator = evaluator,
                         snapshotId = snapshotId,
@@ -989,7 +1137,16 @@ class DebuggerService {
                     snapshotAttempts = attempt,
                     snapshotStatus = expressionStatus
                 )
-                val partial = isBundlePartial(callstack, threads, modules, registers, output, expressionBatch)
+                val partial = isBundlePartial(
+                    callstack,
+                    locals,
+                    threads,
+                    modules,
+                    registers,
+                    output,
+                    expressionBatch,
+                    includedComponents
+                )
                 val snapshotStatus = if (stable) {
                     if (partial) "partial" else "ok"
                 } else {
@@ -997,9 +1154,11 @@ class DebuggerService {
                 }
 
                 val errorParts = mutableListOf<String>()
-                modules.error?.let { if (it.isNotBlank()) errorParts.add("modules: $it") }
-                registers.error?.let { if (it.isNotBlank()) errorParts.add("registers: $it") }
-                output.error?.let { if (it.isNotBlank()) errorParts.add("output: $it") }
+                locals?.error?.let { if (it.isNotBlank()) errorParts.add("locals: $it") }
+                modules?.error?.let { if (it.isNotBlank()) errorParts.add("modules: $it") }
+                registers?.error?.let { if (it.isNotBlank()) errorParts.add("registers: $it") }
+                output?.error?.let { if (it.isNotBlank()) errorParts.add("output: $it") }
+                threads?.error?.let { if (it.isNotBlank()) errorParts.add("threads: $it") }
                 expressionBatch.error?.let { if (it.isNotBlank()) errorParts.add("expressions: $it") }
 
                 val snapshot = DebugBundleResult(
@@ -1009,6 +1168,8 @@ class DebuggerService {
                     snapshotAttempts = attempt,
                     snapshotStatus = snapshotStatus,
                     partial = partial,
+                    includedComponents = includedComponents,
+                    omittedComponents = omittedComponents,
                     stopReason = status.stopReason,
                     status = status,
                     callstack = callstack,
@@ -1047,19 +1208,60 @@ class DebuggerService {
 
     private fun isBundlePartial(
         callstack: CallStackResult,
-        threads: ThreadsResult,
-        modules: ModulesResult,
-        registers: RegistersResult,
-        output: OutputWindowResult,
-        expressions: BatchEvaluateResult
+        locals: LocalsResult?,
+        threads: ThreadsResult?,
+        modules: ModulesResult?,
+        registers: RegistersResult?,
+        output: OutputWindowResult?,
+        expressions: BatchEvaluateResult,
+        includedComponents: List<String>
     ): Boolean {
         if (callstack.snapshotStatus != "ok") return true
-        if (threads.snapshotStatus != "ok") return true
-        if (!modules.error.isNullOrBlank()) return true
-        if (!registers.error.isNullOrBlank()) return true
-        if (!output.error.isNullOrBlank()) return true
-        if (expressions.partial || expressions.failedCount > 0) return true
+        if ("threads" in includedComponents && (threads == null || threads.snapshotStatus != "ok" || threads.partial)) return true
+        if ("locals" in includedComponents && (locals == null || locals.partial)) return true
+        if ("modules" in includedComponents && !modules?.error.isNullOrBlank()) return true
+        if ("registers" in includedComponents && !registers?.error.isNullOrBlank()) return true
+        if ("output" in includedComponents && !output?.error.isNullOrBlank()) return true
+        if ("expressions" in includedComponents && (expressions.partial || expressions.failedCount > 0)) return true
         return false
+    }
+
+    private fun buildIncludedDebugBundleComponents(
+        includeLocals: Boolean,
+        includeModules: Boolean,
+        includeRegisters: Boolean,
+        includeOutput: Boolean,
+        includeThreads: Boolean,
+        includeException: Boolean,
+        expressionCount: Int
+    ): List<String> {
+        val components = mutableListOf("status", "callstack")
+        if (includeException) components.add("exception")
+        if (includeThreads) components.add("threads")
+        if (includeLocals) components.add("locals")
+        if (includeModules) components.add("modules")
+        if (includeRegisters) components.add("registers")
+        if (includeOutput) components.add("output")
+        if (expressionCount > 0) components.add("expressions")
+        return components
+    }
+
+    private fun buildOmittedDebugBundleComponents(
+        includeLocals: Boolean,
+        includeModules: Boolean,
+        includeRegisters: Boolean,
+        includeOutput: Boolean,
+        includeThreads: Boolean,
+        includeException: Boolean
+    ): List<String> {
+        val components = mutableListOf<String>()
+        if (!includeException) components.add("exception")
+        if (!includeThreads) components.add("threads")
+        if (!includeLocals) components.add("locals")
+        if (!includeModules) components.add("modules")
+        if (!includeRegisters) components.add("registers")
+        if (!includeOutput) components.add("output")
+        return components
     }
 
     private fun getInstanceInfo(pipeName: String): InstanceInfoResult {
@@ -1091,7 +1293,18 @@ class DebuggerService {
         maxDepth: Int,
         outputTailLines: Int,
         timeoutMs: Int,
-        pollIntervalMs: Int
+        pollIntervalMs: Int,
+        includeLocals: Boolean = false,
+        includeModules: Boolean = false,
+        includeRegisters: Boolean = false,
+        includeOutput: Boolean = false,
+        includeThreads: Boolean = true,
+        includeException: Boolean = true,
+        allowSideEffects: Boolean = false,
+        threadIncludeFrames: Boolean = true,
+        threadMaxFramesPerThread: Int = -1,
+        threadMaxNodes: Int = -1,
+        threadBudgetMs: Int = -1
     ): ContinueAndWaitResult {
         val normalizedTimeoutMs = timeoutMs.coerceIn(1000, 30 * 60 * 1000)
         val normalizedPollIntervalMs = pollIntervalMs.coerceIn(50, 1000)
@@ -1137,7 +1350,23 @@ class DebuggerService {
             }
 
             if (status.isPaused) {
-                val bundle = captureDebugBundle(expressions, expandChildren, maxDepth, outputTailLines)
+                val bundle = captureDebugBundle(
+                    expressions,
+                    expandChildren,
+                    maxDepth,
+                    outputTailLines,
+                    includeLocals,
+                    includeModules,
+                    includeRegisters,
+                    includeOutput,
+                    includeThreads,
+                    includeException,
+                    allowSideEffects,
+                    threadIncludeFrames,
+                    threadMaxFramesPerThread,
+                    threadMaxNodes,
+                    threadBudgetMs
+                )
                 val bundleStatus = bundle.status ?: status
                 return result.copy(
                     success = true,
@@ -1183,6 +1412,15 @@ class DebuggerService {
 
     private fun debugStop(): DebugControlResult = executeDebugAction("Stop") { session ->
         session.stop()
+    }
+
+    private fun debugDetach(): DebugControlResult {
+        currentSession() ?: return DebugControlResult(action = "Detach", success = false, message = "No debug session")
+        return DebugControlResult(
+            action = "Detach",
+            success = false,
+            message = "Detach is not supported by the Rider MCP bridge; use debug_stop to stop the session."
+        )
     }
 
     private fun debugRunToCursor(filePath: String, lineNumber: Int): DebugControlResult {
@@ -1781,35 +2019,69 @@ class DebuggerService {
         return result
     }
 
-    private fun buildThreadsResult(suspendContext: XSuspendContext): ThreadsResult {
+    private fun buildThreadsResult(
+        suspendContext: XSuspendContext,
+        includeFrames: Boolean = true,
+        maxFramesPerThread: Int = threadFramesMaxPerThread,
+        maxNodes: Int = threadFrameExpansionMaxNodes,
+        budgetMs: Long = threadEnumerationBudgetMs
+    ): ThreadsResult {
         val stacks = suspendContext.executionStacks?.toList() ?: emptyList()
         val active = suspendContext.activeExecutionStack
         val result = ThreadsResult(capability = "partial_thread_metadata")
-        stacks.forEach { stack ->
+        val budget = VariableExpansionBudget(maxNodes, budgetMs)
+        val partialReasons = mutableListOf<String>()
+
+        if (stacks.isEmpty()) {
+            result.error = "No execution stacks available"
+            return result
+        }
+
+        for (stack in stacks) {
+            if (!budget.canContinue()) {
+                break
+            }
+
             val id = threadId(stack)
             val location = getStackLocation(stack)
-            val threadFrames = try {
-                val xFrames = collectStackFrames(stack)
-                val frameInfos = mutableListOf<StackFrameInfo>()
-                xFrames.forEachIndexed { index, frame ->
-                    val loc = getFrameLocation(frame)
-                    val frameName = getFrameName(frame)
-                    frameInfos.add(
-                        StackFrameInfo(
-                            index = index,
-                            functionName = frameName,
-                            filePath = loc?.filePath ?: "",
-                            lineNumber = loc?.lineNumber ?: 0,
-                            lineNumberReliable = loc != null,
-                            columnNumber = loc?.columnNumber ?: 1,
-                            module = parseModuleFromFrameName(frameName),
-                            language = inferLanguage(loc?.filePath, frameName),
-                            returnType = null
-                        )
-                    )
+            val threadFrames = if (includeFrames) {
+                try {
+                    val collected = collectStackFramesWithStatus(stack, maxFramesPerThread, budget.remainingMs())
+                    collected.partialReason?.let { addPartialReason(partialReasons, "thread $id: $it") }
+                    val frameInfos = mutableListOf<StackFrameInfo>()
+
+                    for ((index, frame) in collected.frames.withIndex()) {
+                        if (!budget.tryEnterNode()) {
+                            break
+                        }
+
+                        try {
+                            val loc = getFrameLocation(frame)
+                            val frameName = getFrameName(frame)
+                            frameInfos.add(
+                                StackFrameInfo(
+                                    index = index,
+                                    functionName = frameName,
+                                    filePath = loc?.filePath ?: "",
+                                    lineNumber = loc?.lineNumber ?: 0,
+                                    lineNumberReliable = loc != null,
+                                    columnNumber = loc?.columnNumber ?: 1,
+                                    module = parseModuleFromFrameName(frameName),
+                                    language = inferLanguage(loc?.filePath, frameName),
+                                    returnType = null
+                                )
+                            )
+                        } catch (ex: Exception) {
+                            addPartialReason(partialReasons, "thread $id frame $index: ${ex.message ?: "unavailable"}")
+                        }
+                    }
+
+                    frameInfos.takeIf { it.isNotEmpty() }
+                } catch (ex: Exception) {
+                    addPartialReason(partialReasons, "thread $id: ${ex.message ?: "frame enumeration failed"}")
+                    null
                 }
-                frameInfos.takeIf { it.isNotEmpty() }
-            } catch (_: Exception) {
+            } else {
                 null
             }
             result.threads.add(
@@ -1826,7 +2098,21 @@ class DebuggerService {
             )
         }
         result.currentThreadId = selectedThreadId ?: (active?.let { threadId(it) } ?: 0)
+        if (budget.isExceeded) {
+            result.partial = true
+            result.error = budget.reason
+        } else if (partialReasons.isNotEmpty()) {
+            result.partial = true
+            result.error = partialReasons.joinToString("; ")
+        }
         return result
+    }
+
+    private fun determineThreadsSnapshotStatus(threads: ThreadsResult?, stable: Boolean): String {
+        if (threads == null) return "unavailable"
+        if (!stable) return if (threads.threads.isNotEmpty()) "unstable" else "unavailable"
+        if (threads.partial) return "partial"
+        return if (threads.threads.isNotEmpty()) "ok" else "unavailable"
     }
 
     private fun suspendSnapshotToken(session: XDebugSession, suspendContext: XSuspendContext): String {
@@ -1860,37 +2146,141 @@ class DebuggerService {
         return frames.getOrNull(index) ?: stack.topFrame ?: session.currentStackFrame
     }
 
-    private fun collectStackFrames(stack: XExecutionStack): List<XStackFrame> {
+    private data class StackFrameCollection(
+        val frames: List<XStackFrame>,
+        val partialReason: String? = null
+    )
+
+    private fun collectStackFrames(stack: XExecutionStack): List<XStackFrame> =
+        collectStackFramesWithStatus(stack, 256, 2000L).frames
+
+    private fun collectStackFramesWithStatus(
+        stack: XExecutionStack,
+        maxFrames: Int,
+        budgetMs: Long
+    ): StackFrameCollection {
         val frames = mutableListOf<XStackFrame>()
         val latch = CountDownLatch(1)
+        val partialReason = AtomicReference<String?>(null)
+        val frameLimit = if (maxFrames <= 0) Int.MAX_VALUE else maxFrames
+        val timeoutMs = budgetMs.coerceAtLeast(1L)
 
         stack.computeStackFrames(0, object : XExecutionStack.XStackFrameContainer {
             override fun addStackFrames(stackFrames: MutableList<out XStackFrame>, last: Boolean) {
-                frames.addAll(stackFrames)
-                if (last || frames.size >= 256) {
+                val remaining = frameLimit - frames.size
+                if (remaining > 0) {
+                    frames.addAll(stackFrames.take(remaining))
+                }
+                if (!last && frames.size >= frameLimit) {
+                    partialReason.compareAndSet(
+                        null,
+                        "Thread frame enumeration truncated after $frameLimit frames per thread"
+                    )
+                    latch.countDown()
+                    return
+                }
+                if (last) {
                     latch.countDown()
                 }
             }
 
             override fun errorOccurred(errorMessage: String) {
+                partialReason.compareAndSet(null, errorMessage.ifBlank { "Stack frame enumeration failed" })
                 latch.countDown()
             }
 
             override fun isObsolete(): Boolean = false
         })
 
-        latch.await(2, TimeUnit.SECONDS)
-        return if (frames.size > 256) frames.take(256) else frames
+        val completed = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        if (!completed) {
+            partialReason.compareAndSet(null, "Stack frame enumeration timed out after ${timeoutMs}ms")
+        }
+        return StackFrameCollection(frames.toList(), partialReason.get())
     }
 
-    private fun collectVariables(container: XValueContainer, currentDepth: Int, maxDepth: Int): List<VariableInfo> {
-        if (currentDepth > maxDepth) return emptyList()
+    private fun normalizeThreadFrameLimit(maxFramesPerThread: Int): Int = when {
+        maxFramesPerThread < 0 -> threadFramesMaxPerThread
+        maxFramesPerThread == 0 -> Int.MAX_VALUE
+        else -> maxFramesPerThread.coerceAtMost(4096)
+    }
+
+    private fun normalizeThreadNodeLimit(maxNodes: Int): Int = when {
+        maxNodes < 0 -> threadFrameExpansionMaxNodes
+        maxNodes == 0 -> Int.MAX_VALUE
+        else -> maxNodes.coerceAtMost(100000)
+    }
+
+    private fun normalizeThreadBudgetMs(budgetMs: Int): Long = when {
+        budgetMs < 0 -> threadEnumerationBudgetMs
+        budgetMs == 0 -> 115000L
+        else -> budgetMs.coerceAtMost(115000).toLong()
+    }
+
+    private fun addPartialReason(partialReasons: MutableList<String>, reason: String) {
+        if (reason.isBlank()) return
+        if (partialReasons.size < 8) {
+            partialReasons.add(reason)
+        } else if (partialReasons.size == 8) {
+            partialReasons.add("additional thread/frame errors omitted")
+        }
+    }
+
+    private class VariableExpansionBudget(
+        private val maxNodes: Int,
+        private val maxElapsedMs: Long
+    ) {
+        private val startedAt = System.nanoTime()
+        private var nodes = 0
+        var reason: String? = null
+            private set
+
+        val isExceeded: Boolean
+            get() = reason != null
+
+        fun tryEnterNode(): Boolean {
+            if (!canContinue()) return false
+            nodes += 1
+            return true
+        }
+
+        fun canContinue(): Boolean {
+            if (reason != null) return false
+            if (nodes >= maxNodes) {
+                reason = "Expansion truncated after $maxNodes nodes"
+                return false
+            }
+            val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+            if (elapsedMs >= maxElapsedMs) {
+                reason = "Expansion truncated after ${maxElapsedMs}ms"
+                return false
+            }
+            return true
+        }
+
+        fun remainingMs(): Long {
+            if (reason != null) return 1L
+            val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+            return (maxElapsedMs - elapsedMs).coerceAtLeast(1L)
+        }
+    }
+
+    private fun newVariableExpansionBudget(): VariableExpansionBudget =
+        VariableExpansionBudget(variableExpansionMaxNodes, variableExpansionBudgetMs)
+
+    private fun collectVariables(
+        container: XValueContainer,
+        currentDepth: Int,
+        maxDepth: Int,
+        budget: VariableExpansionBudget = newVariableExpansionBudget()
+    ): List<VariableInfo> {
+        if (currentDepth > maxDepth || !budget.canContinue()) return emptyList()
         val result = mutableListOf<VariableInfo>()
         val latch = CountDownLatch(1)
 
         container.computeChildren(object : XCompositeNode {
             override fun addChildren(children: XValueChildrenList, last: Boolean) {
-                result.addAll(convertChildren(children, currentDepth, maxDepth))
+                result.addAll(convertChildren(children, currentDepth, maxDepth, budget))
                 if (last) {
                     latch.countDown()
                 }
@@ -1926,28 +2316,46 @@ class DebuggerService {
         return result
     }
 
-    private fun convertChildren(children: XValueChildrenList, currentDepth: Int, maxDepth: Int): List<VariableInfo> {
+    private fun convertChildren(
+        children: XValueChildrenList,
+        currentDepth: Int,
+        maxDepth: Int,
+        budget: VariableExpansionBudget
+    ): List<VariableInfo> {
         val result = mutableListOf<VariableInfo>()
 
         children.topGroups?.forEach { group ->
-            result.add(describeGroup(group, currentDepth, maxDepth))
+            if (!budget.canContinue()) return result
+            describeGroup(group, currentDepth, maxDepth, budget)?.let { result.add(it) }
         }
 
         for (i in 0 until children.size()) {
+            if (!budget.canContinue()) break
             val name = children.getName(i)
             val value = children.getValue(i)
-            result.add(describeValue(name, value, currentDepth, maxDepth))
+            describeValue(name, value, currentDepth, maxDepth, budget)?.let { result.add(it) }
         }
 
         children.bottomGroups?.forEach { group ->
-            result.add(describeGroup(group, currentDepth, maxDepth))
+            if (!budget.canContinue()) return result
+            describeGroup(group, currentDepth, maxDepth, budget)?.let { result.add(it) }
         }
 
         return result
     }
 
-    private fun describeGroup(group: XValueGroup, currentDepth: Int, maxDepth: Int): VariableInfo {
-        val children = if (currentDepth < maxDepth) collectVariables(group, currentDepth + 1, maxDepth).toMutableList() else null
+    private fun describeGroup(
+        group: XValueGroup,
+        currentDepth: Int,
+        maxDepth: Int,
+        budget: VariableExpansionBudget
+    ): VariableInfo? {
+        if (!budget.tryEnterNode()) return null
+        val children = if (currentDepth < maxDepth && budget.canContinue()) {
+            collectVariables(group, currentDepth + 1, maxDepth, budget).toMutableList()
+        } else {
+            null
+        }
         return VariableInfo(
             name = group.name,
             value = group.comment,
@@ -2011,10 +2419,17 @@ class DebuggerService {
         )
     }
 
-    private fun describeValue(name: String, value: XValue, currentDepth: Int, maxDepth: Int): VariableInfo {
+    private fun describeValue(
+        name: String,
+        value: XValue,
+        currentDepth: Int,
+        maxDepth: Int,
+        budget: VariableExpansionBudget
+    ): VariableInfo? {
+        if (!budget.tryEnterNode()) return null
         val presentation = describeValue(value)
-        val children = if (presentation.hasChildren && currentDepth < maxDepth) {
-            collectVariables(value, currentDepth + 1, maxDepth).toMutableList()
+        val children = if (presentation.hasChildren && currentDepth < maxDepth && budget.canContinue()) {
+            collectVariables(value, currentDepth + 1, maxDepth, budget).toMutableList()
         } else {
             null
         }

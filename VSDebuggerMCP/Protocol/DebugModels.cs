@@ -125,6 +125,12 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "variables")]
         public List<VariableInfo> Variables { get; set; } = new List<VariableInfo>();
+
+        [DataMember(Name = "partial")]
+        public bool Partial { get; set; }
+
+        [DataMember(Name = "error")]
+        public string Error { get; set; }
     }
 
     [DataContract]
@@ -170,6 +176,12 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "snapshotStatus")]
         public string SnapshotStatus { get; set; } = "unavailable";
+
+        [DataMember(Name = "partial")]
+        public bool Partial { get; set; }
+
+        [DataMember(Name = "error")]
+        public string Error { get; set; }
 
         [DataMember(Name = "threads")]
         public List<ThreadInfo> Threads { get; set; } = new List<ThreadInfo>();
@@ -586,6 +598,12 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "partial")]
         public bool Partial { get; set; }
+
+        [DataMember(Name = "includedComponents")]
+        public List<string> IncludedComponents { get; set; } = new List<string>();
+
+        [DataMember(Name = "omittedComponents")]
+        public List<string> OmittedComponents { get; set; } = new List<string>();
 
         [DataMember(Name = "stopReason")]
         public string StopReason { get; set; } = "not_paused";

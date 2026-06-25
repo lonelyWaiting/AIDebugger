@@ -41,11 +41,12 @@ namespace VSDebuggerMCP
 
 ### 崩溃/异常分析（最常见场景）
 - 关键词：崩溃、crash、异常、exception、错误、error、闪退、挂起、hang、死循环
-- 推荐操作：优先调用 capture_debug_bundle（必要时附带 expressions）获取稳定快照；退化场景再用 get_full_context 或 get_exception + get_callstack
+- 推荐操作：优先调用 capture_debug_bundle() 获取低阻塞（low-blocking）快照（默认 status/callstack/exception/threads）；只有确实需要时才显式开启 include_locals/include_modules/include_registers/include_output；需要完整线程栈时显式传 thread_max_frames_per_thread=0、thread_max_nodes=0、thread_budget_ms=0 或较大的 thread_budget_ms，并给足 timeout_seconds
 
 ### 调试分析
 - 关键词：调试、debug、断点、breakpoint、单步、step、堆栈、stack、变量、variable
 - 推荐操作：先 get_debug_status 判断 stopReason，再按需 get_callstack/get_locals；多表达式分析优先 evaluate_expressions_batch
+- 表达式求值会尝试执行请求并返回 IDE 的明确 value/error/timeout；UE 调试中如果 GetName() 这类函数调用失败或不适合调用，再优先读取字段、地址、FName 原始值或内存进行无调用解析
 - 如果不确定该用哪个工具，先调用 debug_capabilities 查看按场景分类的工具索引
 
 ### 主动检测调试现场（推荐）
@@ -55,7 +56,8 @@ namespace VSDebuggerMCP
 ### 主动断点式定位
 - 关键词：attach、附加进程、启动调试、start debugging、设置断点、清除断点、watchpoint、数据断点
 - 推荐操作：无会话时先 attach_process(process_name=""UnrealEditor.exe"") 或 start_debugging；按位置用 set_breakpoint(file_path,line_number)，按函数用 set_function_breakpoint；需要线程/栈帧切换时用 get_threads/list_threads + select_thread、get_callstack/get_call_stack + select_stack_frame
-- 调试控制短名可用：continue、pause、step_over、step_into、step_out；兼容旧名 debug_continue、debug_break、debug_step_over、debug_step_into、debug_step_out
+- 调试控制短名可用：continue、pause、step_over、step_into、step_out；兼容旧名 debug_continue、debug_break、debug_step_over、debug_step_into、debug_step_out；统一入口 debug_control(action) 也可用于 continue/pause/stop/step/detach
+- For stop debugging / stop debug / terminate debug session, use debug_stop, stop_debugging, or debug_control(action=""stop""). For Visual Studio detach without terminating the process, use detach_process or debug_control(action=""detach""); Rider detach is not exposed as supported.
 - set_breakpoint/set_function_breakpoint 支持 condition、condition_type、hit_count、hit_count_type；clear_breakpoint 是 delete_breakpoint 的别名
 - 当前不暴露 logpoint 工具：VS EnvDTE 没有可靠公开的非中断 tracepoint action/message API；需要时改用源码 UE_LOG/OutputDebugString 或条件断点+手动求值
 
@@ -70,10 +72,10 @@ namespace VSDebuggerMCP
 ## 推荐工作流程
 
 ### 崩溃分析标准流程：
-1. 调用 capture_debug_bundle 一次性获取稳定上下文（含 snapshotId/partial/snapshotStatus）
+1. 调用 capture_debug_bundle 获取低阻塞（low-blocking）稳定上下文（含 snapshotId/partial/snapshotStatus）
 2. 根据返回的文件路径，使用 Read 工具读取相关源代码
 3. 分析异常信息和堆栈，定位问题根因
-4. 如需更多信息，优先 evaluate_expressions_batch；仅单条场景再用 evaluate_expression
+4. 如需更多信息，按需开启 include_locals/include_output 或使用 evaluate_expressions_batch；需要完整线程帧时提升 thread_* 预算；仅单条场景再用 evaluate_expression
 
 ### 断点调试流程：
 1. detect_debug_sessions(prefer_ide=""{1}"") 或 list_vs_instances/select_vs_instance 确认 VS 实例
@@ -88,7 +90,7 @@ namespace VSDebuggerMCP
 - 支持多个IDE实例，会自动选择处于断点暂停状态的实例
 - 如果有多个实例且无法自动选择，使用 list_ide_instances 查看，然后 select_ide_instance 选择
 - 调试控制工具（如 debug_step_over）会改变程序状态，需谨慎使用
-- 首选 capture_debug_bundle 作为分析起点；当 IDE 不支持完整快照时再退化到 get_full_context";
+- 首选 capture_debug_bundle 的低阻塞默认模式作为分析起点；不要默认使用 get_full_context 或完整 include_* 快照";
 
         private static string BuildServerUseInstructions(string ideLabel, string preferredIde)
         {

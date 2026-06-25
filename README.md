@@ -88,11 +88,11 @@ The MCP keeps the low-level tools exposed for client compatibility, but AI agent
 |------|-------------|
 | `get_debug_status` | Get current debugging state (running, paused, etc.) |
 | `get_callstack` | Get complete call stack with file paths and line numbers |
-| `get_locals` | Get local variables and parameters in current scope |
+| `get_locals` | Get local variables and parameters in current scope with bounded expansion |
 | `get_threads` | Get all threads with their states and locations |
 | `get_modules` | Get loaded modules/assemblies |
 | `get_exception` | Get current exception details |
-| `evaluate_expression` | Evaluate arbitrary expressions in debug context |
+| `evaluate_expression` | Evaluate expressions in debug context with `timeout_seconds` and bounded child expansion |
 | `evaluate_expressions_batch` | Evaluate multiple expressions in one snapshot to reduce drift |
 | `read_memory` | Read raw memory at specified address |
 | `get_disassembly` | Get disassembly at current location |
@@ -101,9 +101,12 @@ The MCP keeps the low-level tools exposed for client compatibility, but AI agent
 | `get_errors_only` | Get only build errors |
 | `get_warnings_only` | Get only build warnings |
 | `get_full_context` | Get all debugging information at once |
-| `capture_debug_bundle` | Capture a stable debug bundle with snapshot metadata for AI diagnosis |
+| `capture_debug_bundle` | Capture a stable low-blocking debug bundle with snapshot metadata; locals/modules/registers/output are explicit opt-ins |
 
 `get_debug_status` and `capture_debug_bundle` include standardized `stopReason` values (`not_paused`, `breakpoint`, `exception`, `step`, `user_break`, `pause_unknown`) so AI prompts can branch on a stable schema.
+By default, `capture_debug_bundle()` captures only status, call stack, exception, and threads. Use `include_locals`, `include_modules`, `include_registers`, or `include_output` only when that heavier data is actually needed.
+Thread frames are budgeted by default. For a complete thread snapshot, pass `thread_max_frames_per_thread=0`, `thread_max_nodes=0`, `thread_budget_ms=0` or a large `thread_budget_ms`, and enough `timeout_seconds`; `partial=false` means the returned thread/frame set was complete within that budget.
+Expression tools attempt the requested expression and return the IDE's explicit value/error/timeout result. When a function call is risky or unavailable in the debug engine, prefer field/address/memory inspection or Unreal-specific value decoding.
 
 ### Debug Control
 
@@ -111,9 +114,10 @@ The MCP keeps the low-level tools exposed for client compatibility, but AI agent
 |------|-------------|
 | `attach_process` | Attach Visual Studio to a process by PID or executable name |
 | `start_debugging` | Start the current VS debug profile, or launch an exe and attach |
+| `debug_control` | Unified execution-control entry point (`continue`, `pause`, `stop`, `step_over`, `step_into`, `step_out`, `detach`) |
 | `debug_continue` | Continue execution (F5) |
 | `continue` | Alias for `debug_continue` |
-| `continue_and_wait_for_break` | Continue or wait for the next debug stop, then auto-capture a debug bundle |
+| `continue_and_wait_for_break` | Continue or wait for the next debug stop, then auto-capture the same low-blocking debug bundle |
 | `debug_step_over` | Step over current line (F10) |
 | `step_over` | Alias for `debug_step_over` |
 | `debug_step_into` | Step into function (F11) |
@@ -122,7 +126,10 @@ The MCP keeps the low-level tools exposed for client compatibility, but AI agent
 | `step_out` | Alias for `debug_step_out` |
 | `debug_break` | Break/pause execution |
 | `pause` | Alias for `debug_break` |
-| `debug_stop` | Stop debugging session (Shift+F5) |
+| `debug_stop` | Stop debugging / terminate current debug session (Shift+F5) |
+| `stop_debugging` | Alias for `debug_stop` |
+| `detach_process` | Detach the Visual Studio debugger from the current process without terminating it |
+| `detach_debugger` | Alias for `detach_process` |
 | `debug_run_to_cursor` | Run to specified file and line |
 | `debug_set_next_statement` | Set next statement to execute (move IP) |
 

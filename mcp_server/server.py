@@ -14,6 +14,7 @@ import io
 import os
 import sys
 import json
+import asyncio
 from typing import Any, Dict, List, Optional
 
 # Force UTF-8 for stdio before anything else.
@@ -38,8 +39,16 @@ import ide_bridge
 mcp = FastMCP("AIDebugger")
 
 BATCH_EVALUATION_TIMEOUT_SECONDS = 45.0
+EVALUATION_TIMEOUT_SECONDS = 30.0
+SAFE_DEBUG_BUNDLE_TIMEOUT_SECONDS = 20.0
 DEBUG_BUNDLE_TIMEOUT_SECONDS = 60.0
+THREADS_TIMEOUT_SECONDS = 30.0
+MODULES_TIMEOUT_SECONDS = 45.0
+EXCEPTION_TIMEOUT_SECONDS = 20.0
+OUTPUT_TIMEOUT_SECONDS = 20.0
+START_DEBUGGING_TIMEOUT_SECONDS = 60.0
 MAX_TOOL_TIMEOUT_SECONDS = 300.0
+MAX_THREAD_BUDGET_SECONDS = 115.0
 
 
 def clamp_tool_timeout(timeout_seconds: Optional[float], default_seconds: float) -> float:
@@ -49,6 +58,82 @@ def clamp_tool_timeout(timeout_seconds: Optional[float], default_seconds: float)
         return max(1.0, min(float(timeout_seconds), MAX_TOOL_TIMEOUT_SECONDS))
     except (TypeError, ValueError):
         return default_seconds
+
+
+def tool_timeout_for_budget(
+    timeout_seconds: Optional[float],
+    default_seconds: float,
+    budget_ms: Optional[int],
+    overhead_seconds: float = 15.0,
+) -> float:
+    if timeout_seconds is not None:
+        return clamp_tool_timeout(timeout_seconds, default_seconds)
+    try:
+        if budget_ms is None:
+            budget_seconds = 0.0
+        elif float(budget_ms) == 0.0:
+            budget_seconds = MAX_THREAD_BUDGET_SECONDS
+        else:
+            budget_seconds = float(budget_ms) / 1000.0
+    except (TypeError, ValueError):
+        budget_seconds = 0.0
+    if budget_seconds <= 0:
+        return default_seconds
+    return min(MAX_TOOL_TIMEOUT_SECONDS, max(default_seconds, budget_seconds + overhead_seconds))
+
+
+def add_thread_capture_params(
+    params: Dict[str, Any],
+    thread_include_frames: bool,
+    thread_max_frames_per_thread: Optional[int],
+    thread_max_nodes: Optional[int],
+    thread_budget_ms: Optional[int],
+) -> Dict[str, Any]:
+    params["threadIncludeFrames"] = thread_include_frames
+    if thread_max_frames_per_thread is not None:
+        params["threadMaxFramesPerThread"] = int(thread_max_frames_per_thread)
+    if thread_max_nodes is not None:
+        params["threadMaxNodes"] = int(thread_max_nodes)
+    if thread_budget_ms is not None:
+        params["threadBudgetMs"] = int(thread_budget_ms)
+    return params
+
+
+async def wait_for_debugging_to_start(result: Any, timeout_seconds: float, attach: bool) -> Any:
+    if not isinstance(result, dict) or not result.get("success") or attach is False:
+        return result
+
+    executable_path = str(result.get("executablePath") or "")
+    wait_for_pause = executable_path.lower().endswith((".dmp", ".mdmp", ".hdmp"))
+    status = result.get("status")
+    if isinstance(status, dict) and status.get("isDebugging") and (not wait_for_pause or status.get("isPaused")):
+        return result
+
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    last_status = status
+    while asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.5)
+        try:
+            last_status = await ide_bridge.call("get_debug_status", timeout=5.0)
+        except ide_bridge.IDEBridgeError:
+            continue
+
+        if isinstance(last_status, dict):
+            result["status"] = last_status
+            if last_status.get("isDebugging") and (not wait_for_pause or last_status.get("isPaused")):
+                result["success"] = True
+                result["message"] = "Started debugging" if not wait_for_pause else "Started dump debugging and paused"
+                return result
+
+    result["success"] = False
+    result["message"] = (
+        "Timed out waiting for Visual Studio to pause in dump debugging"
+        if wait_for_pause
+        else "Timed out waiting for Visual Studio to enter debugging mode"
+    )
+    if isinstance(last_status, dict):
+        result["status"] = last_status
+    return result
 
 
 # ============== MCP Prompt: Tool Usage Guide ==============
@@ -64,25 +149,27 @@ def debug_guide() -> str:
 
 当用户提到调试、崩溃、异常等场景时，推荐的调用顺序：
 
-### 1. 获取完整调试快照（推荐首选）
+### 1. 获取低阻塞调试快照（推荐首选）
 ```
 capture_debug_bundle()
 ```
-这一个调用会返回：状态、堆栈、局部变量、异常、线程、模块、寄存器、输出日志。
+默认只返回状态、堆栈、异常、线程，避免 locals/modules/registers/output 等重操作卡住 VS/Rider UI 线程。
 
-### 2. 或分步获取信息
+### 2. 按需分步获取重信息
 ```
 get_debug_status()     # 无参数 - 查看调试状态
 get_callstack()        # 无参数 - 查看调用堆栈
 get_locals()           # 无参数 - 查看局部变量
 get_exception()        # 无参数 - 查看异常信息
 ```
+确实需要完整包时显式传 include_locals/include_modules/include_registers/include_output。
 
 ### 3. 求值特定表达式
 ```
 evaluate_expression(expression="myVariable")
 evaluate_expression(expression="obj.Property", expand_children=True)
 ```
+表达式默认交给 IDE 求值；失败、不可用或超时会返回明确错误。UE 对象名等信息优先用字段、地址、FName/内存解码等无调用路径补充分析。
 
 ## 参数格式说明
 
@@ -94,7 +181,7 @@ evaluate_expression(expression="obj.Property", expand_children=True)
 
 | 场景 | 推荐工具 |
 |------|----------|
-| 分析崩溃/异常 | capture_debug_bundle() 或 get_exception() |
+| 分析崩溃/异常 | capture_debug_bundle()（低阻塞）或 get_exception() |
 | 等待复现并自动抓现场 | continue_and_wait_for_break() |
 | 查看变量值 | get_locals() 或 evaluate_expression(expression="xxx") |
 | 查看调用链 | get_callstack() |
@@ -147,7 +234,9 @@ async def debug_capabilities() -> str:
     Return a categorized index of AIDebugger tools. Use this first when unsure which
     debugger tool to call, especially for active debugging workflows such as attach,
     start, breakpoints, stepping, stack/thread selection, expression evaluation,
-    memory inspection, or data breakpoints.
+    memory inspection, stop debugging, detach, or data breakpoints.
+
+    Use this before concluding a debugger capability is missing.
     """
     return format_result({
         "recommendedWorkflow": [
@@ -155,8 +244,11 @@ async def debug_capabilities() -> str:
             "attach_process(...) or start_debugging(...) if no debug session is active",
             "set_breakpoint(...) / set_function_breakpoint(...) / set_data_breakpoint(...)",
             "continue_and_wait_for_break(...) or continue()",
-            "get_callstack() + get_threads(), then select_stack_frame(...) / select_thread(...)",
-            "evaluate_expressions_batch(...) for multiple values, evaluate_expression(...) for one value",
+            "capture_debug_bundle() for low-blocking status/callstack/exception/threads",
+            "for complete thread frames pass thread_max_frames_per_thread=0, thread_max_nodes=0, thread_budget_ms=0 or a large thread_budget_ms, and enough timeout_seconds",
+            "opt in to include_locals/include_modules/include_registers/include_output only when needed",
+            "evaluate_expressions_batch(...) for multiple values, evaluate_expression(...) for one value; prefer field/address/memory reads when function calls are risky",
+            "debug_control(action='stop') or stop_debugging() to stop/terminate the current debug session",
         ],
         "categories": {
             "session": [
@@ -177,6 +269,7 @@ async def debug_capabilities() -> str:
                 "delete_all_breakpoints",
             ],
             "executionControl": [
+                "debug_control",
                 "continue",
                 "debug_continue",
                 "pause",
@@ -187,6 +280,11 @@ async def debug_capabilities() -> str:
                 "debug_run_to_cursor",
                 "debug_set_next_statement",
                 "debug_stop",
+                "stop_debugging",
+            ],
+            "visualStudioOnly": [
+                "detach_process",
+                "detach_debugger",
             ],
             "inspection": [
                 "capture_debug_bundle",
@@ -220,6 +318,10 @@ async def debug_capabilities() -> str:
             ],
         },
         "capabilityNotes": {
+            "capture_debug_bundle": "Safe by default: captures status, callstack, exception, and budgeted threads. Locals/modules/registers/output are explicit opt-ins; complete thread frames require thread_max_frames_per_thread=0, thread_max_nodes=0, thread_budget_ms=0 or a large thread_budget_ms, and enough timeout_seconds.",
+            "expression_evaluation": "Expressions are attempted by default with bounded IDE timeouts. If a function call is unavailable or unsafe in the debug engine, the IDE result is returned instead of pre-rejecting it.",
+            "stop": "Supported. Use debug_stop, stop_debugging, or debug_control(action='stop') to stop debugging / terminate the current debug session.",
+            "detach": "Visual Studio detach is supported for the current debugged process via detach_process or debug_control(action='detach'). Rider detach returns an explicit unsupported result because no reliable public detach path is exposed here.",
             "set_data_breakpoint": "Uses Visual Studio native data breakpoints/watchpoints where supported by the active debug engine.",
             "logpoints": "Non-breaking Visual Studio tracepoint/logpoint actions are not exposed as a tool because EnvDTE has no reliable public action/message API.",
             "aliases": "Short aliases are exposed for common LLM names, but existing debug_* and switch_* names remain supported.",
@@ -559,7 +661,7 @@ async def get_locals(depth: int = 2) -> str:
     获取当前栈帧的所有局部变量和参数，包含变量名、类型和当前值。
     
     Args:
-        depth: 变量展开深度（0-10），默认2。值越大展开的子成员层级越多。
+        depth: 变量展开深度（0-4），默认2。值越大展开的子成员层级越多，超过预算会截断。
     
     返回示例:
     ```json
@@ -574,7 +676,7 @@ async def get_locals(depth: int = 2) -> str:
     **触发场景**: 当用户询问"变量值是什么"、"参数是多少"、"局部变量"、"当前状态"时调用此工具。
     """
     try:
-        result = await ide_bridge.call("get_locals", {"depth": max(0, min(depth, 10))})
+        result = await ide_bridge.call("get_locals", {"depth": max(0, min(depth, 4))})
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_locals")
@@ -584,7 +686,9 @@ async def get_locals(depth: int = 2) -> str:
 async def evaluate_expression(
     expression: str,
     expand_children: bool = False,
-    max_depth: int = 2
+    max_depth: int = 2,
+    timeout_seconds: Optional[float] = None,
+    allow_side_effects: bool = False
 ) -> str:
     """
     在当前调试上下文中求值任意表达式。可以获取变量的地址、计算偏移量、访问结构成员等。
@@ -594,6 +698,8 @@ async def evaluate_expression(
         expression: 要求值的表达式，如：&myVariable、myPointer->field、sizeof(MyStruct)、(int*)0x1234
         expand_children: 是否展开对象的子成员，默认false
         max_depth: 展开子成员的最大深度，默认2
+        timeout_seconds: 等待 IDE 响应的最长秒数，默认30，最大300
+        allow_side_effects: 兼容旧客户端的参数；当前不会因函数调用形态预先拒绝表达式，IDE 会返回实际求值结果/错误/超时
     
     调用示例:
     ```
@@ -608,8 +714,9 @@ async def evaluate_expression(
         result = await ide_bridge.call("evaluate_expression", {
             "expression": expression,
             "expandChildren": expand_children,
-            "maxDepth": max_depth
-        })
+            "maxDepth": max_depth,
+            "allowSideEffects": allow_side_effects,
+        }, timeout=clamp_tool_timeout(timeout_seconds, EVALUATION_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "evaluate_expression")
@@ -620,7 +727,8 @@ async def evaluate_expressions_batch(
     expressions: List[str],
     expand_children: bool = False,
     max_depth: int = 2,
-    timeout_seconds: Optional[float] = None
+    timeout_seconds: Optional[float] = None,
+    allow_side_effects: bool = False
 ) -> str:
     """
     在同一调试快照中批量求值多个表达式，减少逐条请求导致的上下文漂移。
@@ -630,12 +738,15 @@ async def evaluate_expressions_batch(
         expand_children: 是否展开对象子成员，默认False
         max_depth: 子成员展开深度，默认2
         timeout_seconds: 等待 IDE 响应的最长秒数，默认45，最大300
+        allow_side_effects: 兼容旧客户端的参数；当前不会因函数调用形态预先拒绝表达式
     """
+    normalized_expressions = expressions or []
     try:
         result = await ide_bridge.call("evaluate_expressions_batch", {
-            "expressions": expressions,
+            "expressions": normalized_expressions,
             "expandChildren": expand_children,
-            "maxDepth": max_depth
+            "maxDepth": max_depth,
+            "allowSideEffects": allow_side_effects,
         }, timeout=clamp_tool_timeout(timeout_seconds, BATCH_EVALUATION_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
@@ -645,36 +756,76 @@ async def evaluate_expressions_batch(
 # ============== Thread Tools ==============
 
 @mcp.tool()
-async def get_threads() -> str:
+async def get_threads(
+    timeout_seconds: Optional[float] = None,
+    include_frames: bool = True,
+    max_frames_per_thread: Optional[int] = None,
+    max_nodes: Optional[int] = None,
+    budget_ms: Optional[int] = None,
+) -> str:
     """
     获取调试进程中所有线程的信息，包括线程ID、名称、状态和当前位置。
+
+    默认低阻塞，可能返回 partial=true。需要完整线程帧时传
+    max_frames_per_thread=0、max_nodes=0、budget_ms=0 或较大的 budget_ms；timeout_seconds 会随
+    budget_ms 自动上调。partial=false 表示请求预算内线程/帧集合完整返回。
     
     **触发场景**: 当用户提到"线程"、"thread"、"多线程"、"并发"、"死锁"时调用此工具。
     """
     try:
-        result = await ide_bridge.call("get_threads")
+        params: Dict[str, Any] = {"includeFrames": include_frames}
+        if max_frames_per_thread is not None:
+            params["maxFramesPerThread"] = int(max_frames_per_thread)
+        if max_nodes is not None:
+            params["maxNodes"] = int(max_nodes)
+        if budget_ms is not None:
+            params["budgetMs"] = int(budget_ms)
+        result = await ide_bridge.call(
+            "get_threads",
+            params,
+            timeout=tool_timeout_for_budget(timeout_seconds, THREADS_TIMEOUT_SECONDS, budget_ms),
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_threads")
 
 
 @mcp.tool()
-async def list_threads() -> str:
+async def list_threads(
+    timeout_seconds: Optional[float] = None,
+    include_frames: bool = True,
+    max_frames_per_thread: Optional[int] = None,
+    max_nodes: Optional[int] = None,
+    budget_ms: Optional[int] = None,
+) -> str:
     """
+    Get debugger thread metadata. Defaults are low-blocking and may return partial=true.
+
+    For a complete thread snapshot, raise max_frames_per_thread, max_nodes,
+    budget_ms, and timeout_seconds. Use max_frames_per_thread=0, max_nodes=0,
+    or budget_ms=0 to use the maximum bounded capture budget for an explicit full capture. partial=false means the
+    returned thread/frame set was complete within the requested budget.
+
     Alias for get_threads.
     """
-    return await get_threads()
+    return await get_threads(
+        timeout_seconds=timeout_seconds,
+        include_frames=include_frames,
+        max_frames_per_thread=max_frames_per_thread,
+        max_nodes=max_nodes,
+        budget_ms=budget_ms,
+    )
 
 
 # ============== Module Tools ==============
 
 @mcp.tool()
-async def get_modules() -> str:
+async def get_modules(timeout_seconds: Optional[float] = None) -> str:
     """
     获取调试进程中已加载的所有模块/程序集信息。
     """
     try:
-        result = await ide_bridge.call("get_modules")
+        result = await ide_bridge.call("get_modules", timeout=clamp_tool_timeout(timeout_seconds, MODULES_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_modules")
@@ -683,7 +834,7 @@ async def get_modules() -> str:
 # ============== Exception Tools ==============
 
 @mcp.tool()
-async def get_exception() -> str:
+async def get_exception(timeout_seconds: Optional[float] = None) -> str:
     """
     获取当前异常的详细信息，包括异常类型、消息、堆栈跟踪和内部异常。
     
@@ -702,7 +853,7 @@ async def get_exception() -> str:
     **触发场景**: 当用户提到"崩溃"、"crash"、"异常"、"exception"、"报错"、"出错了"、"抛异常"时，优先调用此工具。
     """
     try:
-        result = await ide_bridge.call("get_exception")
+        result = await ide_bridge.call("get_exception", timeout=clamp_tool_timeout(timeout_seconds, EXCEPTION_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_exception")
@@ -825,7 +976,8 @@ async def get_warnings_only() -> str:
 @mcp.tool()
 async def get_debug_output(
     pane: str = "Debug",
-    tail_lines: int = 50
+    tail_lines: int = 50,
+    timeout_seconds: Optional[float] = None
 ) -> str:
     """
     获取Visual Studio Output窗口的内容。用于查看调试输出、构建日志、程序输出等。
@@ -841,7 +993,7 @@ async def get_debug_output(
         result = await ide_bridge.call("get_output_window", {
             "pane": pane,
             "tailLines": tail_lines
-        })
+        }, timeout=clamp_tool_timeout(timeout_seconds, OUTPUT_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_debug_output")
@@ -853,7 +1005,8 @@ async def search_output(
     pane: str = "Debug",
     is_regex: bool = False,
     context_lines: int = 2,
-    max_matches: int = 20
+    max_matches: int = 20,
+    timeout_seconds: Optional[float] = None
 ) -> str:
     """
     在Visual Studio Output窗口中搜索指定模式。可用于查找特定错误、检查执行状态、定位关键输出等。
@@ -872,7 +1025,7 @@ async def search_output(
             "isRegex": is_regex,
             "contextLines": context_lines,
             "maxMatches": max_matches
-        })
+        }, timeout=clamp_tool_timeout(timeout_seconds, OUTPUT_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "search_output")
@@ -881,7 +1034,13 @@ async def search_output(
 # ============== Full Context Tools ==============
 
 @mcp.tool()
-async def get_full_context() -> str:
+async def get_full_context(
+    timeout_seconds: Optional[float] = None,
+    thread_include_frames: bool = True,
+    thread_max_frames_per_thread: Optional[int] = None,
+    thread_max_nodes: Optional[int] = None,
+    thread_budget_ms: Optional[int] = None,
+) -> str:
     """
     一次性获取所有调试上下文信息，包括状态、堆栈、变量、异常、线程和模块。
     当你需要完整分析调试现场时使用此工具。
@@ -890,7 +1049,18 @@ async def get_full_context() -> str:
     **触发场景**: 当用户说"帮我分析一下"、"看看发生了什么"、"调试现场"、"为什么会这样"等需要全面了解情况时调用此工具。
     """
     try:
-        result = await ide_bridge.call("get_full_context")
+        params = add_thread_capture_params(
+            {},
+            thread_include_frames,
+            thread_max_frames_per_thread,
+            thread_max_nodes,
+            thread_budget_ms,
+        )
+        result = await ide_bridge.call(
+            "get_full_context",
+            params,
+            timeout=tool_timeout_for_budget(timeout_seconds, DEBUG_BUNDLE_TIMEOUT_SECONDS, thread_budget_ms),
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_full_context")
@@ -902,20 +1072,41 @@ async def capture_debug_bundle(
     expand_children: bool = False,
     max_depth: int = 2,
     output_tail_lines: int = 80,
-    timeout_seconds: Optional[float] = None
+    timeout_seconds: Optional[float] = None,
+    include_locals: bool = False,
+    include_modules: bool = False,
+    include_registers: bool = False,
+    include_output: bool = False,
+    include_threads: bool = True,
+    include_exception: bool = True,
+    allow_side_effects: bool = False,
+    thread_include_frames: bool = True,
+    thread_max_frames_per_thread: Optional[int] = None,
+    thread_max_nodes: Optional[int] = None,
+    thread_budget_ms: Optional[int] = None,
 ) -> str:
     """
-    一次性抓取"可分析快照包"（status/callstack/locals/exception/threads/modules/registers/output + 可选批量表达式）。
+    抓取可分析调试快照包。
     返回 snapshotId/capturedAt/snapshotStatus/partial，可直接用于AI诊断。
     
-    这是分析调试现场的推荐入口，一次调用获取全部信息。
+    默认低阻塞：只抓 status/callstack/exception/threads，避免 locals/modules/registers/output 在 VS UI 线程上拖住整次请求。
+    需要完整包时显式打开 include_locals/include_modules/include_registers/include_output。
 
     Args:
         expressions: 可选表达式列表，会在同一快照中批量求值
         expand_children: 表达式是否展开子成员，默认False
         max_depth: 表达式子成员展开深度，默认2
         output_tail_lines: Debug Output 末尾行数，默认80
-        timeout_seconds: 等待 IDE 响应的最长秒数，默认60，最大300
+        timeout_seconds: 等待 IDE 响应的最长秒数，默认低阻塞20/完整60，最大300；传 thread_budget_ms 时自动上调
+        include_locals: 是否抓取当前帧 locals，默认False
+        include_modules: 是否抓取模块/程序集，默认False
+        include_registers: 是否抓取寄存器，默认False
+        include_output: 是否读取 Debug Output，默认False
+        include_threads: 是否抓取线程列表，默认True
+        include_exception: 是否抓取异常信息，默认True
+        allow_side_effects: 兼容旧客户端的参数；当前不会因函数调用形态预先拒绝表达式
+        thread_include_frames: 是否在 threads 中包含 stack frames，默认True
+        thread_max_frames_per_thread/thread_max_nodes/thread_budget_ms: 线程帧抓取预算；0 表示使用最大受控抓取预算
     
     调用示例:
     ```
@@ -925,17 +1116,35 @@ async def capture_debug_bundle(
     # 带表达式求值
     capture_debug_bundle(expressions=["myVar", "obj.Property", "arr.Length"])
     
-    # 展开对象
-    capture_debug_bundle(expressions=["complexObj"], expand_children=True, max_depth=3)
+    # 显式完整包
+    capture_debug_bundle(include_locals=True, include_modules=True, include_registers=True, include_output=True)
     ```
     """
+    normalized_expressions = expressions or []
+    heavy_components_requested = (
+        include_locals or include_modules or include_registers or include_output or bool(normalized_expressions)
+    )
+    default_timeout = DEBUG_BUNDLE_TIMEOUT_SECONDS if heavy_components_requested else SAFE_DEBUG_BUNDLE_TIMEOUT_SECONDS
+
     try:
-        result = await ide_bridge.call("capture_debug_bundle", {
-            "expressions": expressions or [],
+        params = add_thread_capture_params({
+            "expressions": normalized_expressions,
             "expandChildren": expand_children,
             "maxDepth": max_depth,
-            "outputTailLines": output_tail_lines
-        }, timeout=clamp_tool_timeout(timeout_seconds, DEBUG_BUNDLE_TIMEOUT_SECONDS))
+            "outputTailLines": output_tail_lines,
+            "includeLocals": include_locals,
+            "includeModules": include_modules,
+            "includeRegisters": include_registers,
+            "includeOutput": include_output,
+            "includeThreads": include_threads,
+            "includeException": include_exception,
+            "allowSideEffects": allow_side_effects,
+        }, thread_include_frames, thread_max_frames_per_thread, thread_max_nodes, thread_budget_ms)
+        result = await ide_bridge.call(
+            "capture_debug_bundle",
+            params,
+            timeout=tool_timeout_for_budget(timeout_seconds, default_timeout, thread_budget_ms),
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "capture_debug_bundle")
@@ -970,7 +1179,8 @@ async def start_debugging(
     executable_path: Optional[str] = None,
     working_dir: Optional[str] = None,
     args: Optional[str] = None,
-    attach: bool = True
+    attach: bool = True,
+    timeout_seconds: Optional[float] = None
 ) -> str:
     """
     Start debugging. With no executable_path, uses the current Visual Studio
@@ -978,15 +1188,80 @@ async def start_debugging(
     attaches the VS debugger by default.
     """
     try:
+        wait_timeout = clamp_tool_timeout(timeout_seconds, START_DEBUGGING_TIMEOUT_SECONDS)
         result = await ide_bridge.call("start_debugging", {
             "executablePath": executable_path,
             "workingDirectory": working_dir,
             "arguments": args,
             "attach": attach
-        })
+        }, timeout=wait_timeout)
+        result = await wait_for_debugging_to_start(result, wait_timeout, attach)
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "start_debugging")
+
+
+@mcp.tool()
+async def debug_control(action: str) -> str:
+    """
+    Unified debugger execution-control entry point.
+
+    Use this when searching for stop debugging, stop debug, pause, continue,
+    step over, step into, step out, or detach current Visual Studio debugger
+    capability. Supported actions: continue, pause, break, stop, stop_debugging,
+    step_over, step_into, step_out, detach, detach_process.
+    """
+    normalized = (action or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "go": "continue",
+        "run": "continue",
+        "resume": "continue",
+        "debug_continue": "continue",
+        "pause": "break",
+        "debug_break": "break",
+        "debug_pause": "break",
+        "stop": "stop",
+        "stop_debug": "stop",
+        "stop_debugging": "stop",
+        "debug_stop": "stop",
+        "terminate": "stop",
+        "terminate_debug_session": "stop",
+        "stepover": "step_over",
+        "debug_step_over": "step_over",
+        "stepinto": "step_into",
+        "debug_step_into": "step_into",
+        "stepout": "step_out",
+        "debug_step_out": "step_out",
+        "detach": "detach",
+        "detach_process": "detach",
+        "detach_debugger": "detach",
+        "debug_detach": "detach",
+    }
+    normalized = aliases.get(normalized, normalized)
+
+    if normalized == "continue":
+        return await debug_continue()
+    if normalized == "break":
+        return await debug_break()
+    if normalized == "stop":
+        return await debug_stop()
+    if normalized == "step_over":
+        return await debug_step_over()
+    if normalized == "step_into":
+        return await debug_step_into()
+    if normalized == "step_out":
+        return await debug_step_out()
+    if normalized == "detach":
+        return await detach_process()
+
+    return format_result({
+        "action": action,
+        "success": False,
+        "message": (
+            "Unsupported debug_control action. Use one of: continue, pause, "
+            "break, stop, step_over, step_into, step_out, detach."
+        ),
+    })
 
 
 @mcp.tool()
@@ -1020,7 +1295,18 @@ async def continue_and_wait_for_break(
     expressions: Optional[List[str]] = None,
     expand_children: bool = False,
     max_depth: int = 2,
-    output_tail_lines: int = 80
+    output_tail_lines: int = 80,
+    include_locals: bool = False,
+    include_modules: bool = False,
+    include_registers: bool = False,
+    include_output: bool = False,
+    include_threads: bool = True,
+    include_exception: bool = True,
+    allow_side_effects: bool = False,
+    thread_include_frames: bool = True,
+    thread_max_frames_per_thread: Optional[int] = None,
+    thread_max_nodes: Optional[int] = None,
+    thread_budget_ms: Optional[int] = None,
 ) -> str:
     """
     继续运行（或在已经运行时直接等待），直到调试器再次进入暂停状态，然后自动抓取一个 debug bundle。
@@ -1033,19 +1319,35 @@ async def continue_and_wait_for_break(
         expand_children: 是否展开表达式子成员，默认False
         max_depth: 表达式展开深度，默认2
         output_tail_lines: Debug Output 末尾行数，默认80
+        include_locals/include_modules/include_registers/include_output: 命中后是否抓取重组件，默认False
+        include_threads/include_exception: 命中后是否抓取线程/异常，默认True
+        allow_side_effects: 兼容旧客户端的参数；当前不会因函数调用形态预先拒绝表达式
+        thread_include_frames/thread_max_frames_per_thread/thread_max_nodes/thread_budget_ms: 命中后线程帧抓取预算
     """
     timeout_seconds = max(1, min(timeout_seconds, 1800))
     poll_interval_ms = max(50, min(poll_interval_ms, 1000))
-
+    normalized_expressions = expressions or []
     try:
-        result = await ide_bridge.call("continue_and_wait_for_break", {
+        params = add_thread_capture_params({
             "timeoutMs": timeout_seconds * 1000,
             "pollIntervalMs": poll_interval_ms,
-            "expressions": expressions or [],
+            "expressions": normalized_expressions,
             "expandChildren": expand_children,
             "maxDepth": max_depth,
             "outputTailLines": output_tail_lines,
-        }, timeout=float(timeout_seconds + 15))
+            "includeLocals": include_locals,
+            "includeModules": include_modules,
+            "includeRegisters": include_registers,
+            "includeOutput": include_output,
+            "includeThreads": include_threads,
+            "includeException": include_exception,
+            "allowSideEffects": allow_side_effects,
+        }, thread_include_frames, thread_max_frames_per_thread, thread_max_nodes, thread_budget_ms)
+        result = await ide_bridge.call(
+            "continue_and_wait_for_break",
+            params,
+            timeout=float(timeout_seconds + tool_timeout_for_budget(None, 15.0, thread_budget_ms)),
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "continue_and_wait_for_break")
@@ -1138,6 +1440,11 @@ async def pause() -> str:
 @mcp.tool()
 async def debug_stop() -> str:
     """
+    Stop debugging / stop debug / terminate debug session (Shift+F5).
+    Stops the current Visual Studio or Rider debugging session.
+    stop current Visual Studio debugging session.
+    terminate current debug session.
+
     停止调试会话 (Shift+F5)。
     """
     try:
@@ -1145,6 +1452,37 @@ async def debug_stop() -> str:
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "stop")
+
+
+@mcp.tool()
+async def stop_debugging() -> str:
+    """
+    Alias for debug_stop. Stop debugging, stop debug, terminate debug session,
+    stop current Visual Studio debugging session, or Shift+F5.
+    """
+    return await debug_stop()
+
+
+@mcp.tool()
+async def detach_process() -> str:
+    """
+    Detach the Visual Studio debugger from the current debugged process without
+    terminating it. Use for detach debugger / detach process / stop debugging
+    without killing the process. Rider returns an explicit unsupported result.
+    """
+    try:
+        result = await ide_bridge.call("detach")
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "detach")
+
+
+@mcp.tool()
+async def detach_debugger() -> str:
+    """
+    Alias for detach_process. Detach debugger from the current process.
+    """
+    return await detach_process()
 
 
 @mcp.tool()
