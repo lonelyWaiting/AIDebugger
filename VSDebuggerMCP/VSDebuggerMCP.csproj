@@ -57,6 +57,13 @@
     <Compile Include="McpClientRegistration.cs" />
   </ItemGroup>
   <ItemGroup>
+    <Content Include="ManagedInspectionHelper\bin\$(Configuration)\ManagedInspectionHelper.exe">
+      <Link>ManagedInspectionHelper.exe</Link>
+      <IncludeInVSIX>true</IncludeInVSIX>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+  <ItemGroup>
     <Reference Include="System" />
     <Reference Include="System.Xml" />
     <Reference Include="System.Web.Extensions" />
@@ -128,6 +135,12 @@
   <!-- Auto-stamp version from git before every real build (skipped during IntelliSense) -->
   <Target Name="StampVersion" BeforeTargets="BeforeBuild" Condition="'$(DesignTimeBuild)' != 'true'">
     <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\..\tools\Stamp-Version.ps1&quot;" IgnoreExitCode="true" />
+  </Target>
+
+  <Target Name="BuildManagedInspectionHelper" BeforeTargets="BeforeBuild" Condition="'$(DesignTimeBuild)' != 'true'">
+    <MSBuild Projects="$(MSBuildProjectDirectory)\ManagedInspectionHelper\ManagedInspectionHelper.csproj"
+             Targets="Build"
+             Properties="Configuration=$(Configuration);Platform=AnyCPU" />
   </Target>
 
   <Target Name="CreateSplitVsixPackages" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' and Exists('$(MSBuildProjectDirectory)\$(OutputPath)$(AssemblyName).vsix')">

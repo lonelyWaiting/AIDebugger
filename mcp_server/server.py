@@ -49,6 +49,9 @@ OUTPUT_TIMEOUT_SECONDS = 20.0
 START_DEBUGGING_TIMEOUT_SECONDS = 60.0
 MEMORY_TIMEOUT_SECONDS = 20.0
 DISASSEMBLY_TIMEOUT_SECONDS = 20.0
+NATIVE_CONTEXT_TIMEOUT_SECONDS = 45.0
+MANAGED_INSPECTION_TIMEOUT_SECONDS = 75.0
+HYBRID_CONTEXT_TIMEOUT_SECONDS = 135.0
 MAX_TOOL_TIMEOUT_SECONDS = 300.0
 MAX_THREAD_BUDGET_SECONDS = 115.0
 MAX_MEMORY_SEARCH_CHUNK_SIZE = 0x100000
@@ -263,6 +266,9 @@ async def debug_capabilities() -> str:
             "detect_debug_sessions(prefer_ide='vs') or list_vs_instances()",
             "attach_process(...) or start_debugging(...) if no debug session is active",
             "set_breakpoint(...) / set_function_breakpoint(...) / set_data_breakpoint(...)",
+            "Visual Studio only: for no-source native debugging use resolve_address, get_module_layout, set_address_breakpoint, capture_native_context, and continue_and_capture_native",
+            "Visual Studio only: for no-source managed analysis use inspect_managed_assembly, inspect_managed_type, and inspect_managed_method_il against the target assembly path",
+            "Visual Studio only: for mixed native/managed stops use capture_hybrid_context and continue_and_capture_breakpoint to collect native context, threads, and breakpoint binding data together",
             "continue_and_wait_for_break(...) or continue()",
             "capture_debug_bundle() for low-blocking status/callstack/exception/threads",
             "for complete get_threads frames pass max_frames_per_thread=0, max_nodes=0, budget_ms=0 or a large budget_ms, and enough timeout_seconds",
@@ -286,6 +292,8 @@ async def debug_capabilities() -> str:
                 "clear_breakpoint",
                 "delete_breakpoint",
                 "get_breakpoints",
+                "get_breakpoint_bindings",
+                "continue_and_capture_breakpoint",
                 "enable_breakpoint",
                 "delete_all_breakpoints",
             ],
@@ -335,9 +343,34 @@ async def debug_capabilities() -> str:
                 "search_memory",
                 "set_data_breakpoint",
                 "set_watchpoint",
+                "get_breakpoint_bindings",
+                "continue_and_capture_breakpoint",
                 "add_watch",
                 "get_debug_output",
                 "search_output",
+            ],
+            "noSourceNative": [
+                "resolve_address",
+                "get_module_layout",
+                "set_address_breakpoint",
+                "capture_native_context",
+                "continue_and_capture_native",
+                "get_disassembly_at",
+                "read_memory",
+                "search_memory",
+                "get_registers",
+            ],
+            "noSourceManaged": [
+                "inspect_managed_assembly",
+                "inspect_managed_type",
+                "inspect_managed_method_il",
+            ],
+            "noSourceHybrid": [
+                "capture_hybrid_context",
+                "continue_and_capture_breakpoint",
+                "get_breakpoint_bindings",
+                "switch_thread",
+                "switch_stack_frame",
             ],
         },
         "capabilityNotes": {
@@ -348,6 +381,11 @@ async def debug_capabilities() -> str:
             "stop": "Supported. Use debug_stop, stop_debugging, or debug_control(action='stop') to stop debugging / terminate the current debug session.",
             "detach": "Visual Studio detach is supported for the current debugged process via detach_process or debug_control(action='detach'). Rider detach returns an explicit unsupported result because no reliable public detach path is exposed here.",
             "set_data_breakpoint": "Uses Visual Studio native data breakpoints/watchpoints where supported by the active debug engine.",
+            "breakpoint_binding_verification": "Breakpoint results include bindingVerificationStatus, isRelocated, nearbyProbeAttempted, optimizedCodeSuspected, and verificationStatus so optimized-away or unbound source locations are explicit instead of treated as successful hits.",
+            "no_source_native": "Information-only native debugging surface: normalize addresses as module+RVA, inspect PE layout, set address breakpoints, capture registers/disassembly/stack memory/modules, and let the AI decide the next probe. No write-memory or patching tool is exposed.",
+            "no_source_managed": "Read-only managed assembly analysis: enumerate metadata, select types/methods, and decode IL instructions/tokens without source or UI automation.",
+            "no_source_hybrid": "Breakpoint-oriented dynamic loop: collect binding status, continue until the next stop, then capture native context plus managed thread/frame data in one snapshot.",
+            "no_source_backend_support": "The no-source native/managed/hybrid tools are Visual Studio only in this version. Rider support is explicitly missing rather than inferred from VS behavior.",
             "logpoints": "Non-breaking Visual Studio tracepoint/logpoint actions are not exposed as a tool because EnvDTE has no reliable public action/message API.",
             "aliases": "Short aliases are exposed for common LLM names, but existing debug_* and switch_* names remain supported.",
         },
@@ -986,6 +1024,223 @@ async def get_disassembly_at(
         return handle_ide_error(e, "get_disassembly_at")
 
 
+@mcp.tool()
+async def resolve_address(
+    address: str,
+    timeout_seconds: Optional[float] = None
+) -> str:
+    """
+    Resolve a native address expression into a stable module+RVA form.
+
+    Accepts absolute addresses, register expressions such as @rip/@eip, and
+    module+RVA expressions such as devenv.exe+0x1234.
+    """
+    try:
+        result = await ide_bridge.call(
+            "resolve_address",
+            {"address": address},
+            timeout=clamp_tool_timeout(timeout_seconds, NATIVE_CONTEXT_TIMEOUT_SECONDS),
+            preferred_ide="vs",
+        )
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "resolve_address")
+
+
+@mcp.tool()
+async def get_module_layout(
+    module: str,
+    max_import_functions: int = 256,
+    max_exports: int = 512,
+    timeout_seconds: Optional[float] = None
+) -> str:
+    """
+    Return PE layout information for a loaded module or module file path.
+
+    Includes sections, entrypoint, image size, and bounded import/export summaries.
+    """
+    try:
+        result = await ide_bridge.call(
+            "get_module_layout",
+            {
+                "module": module,
+                "maxImportFunctions": max(0, min(max_import_functions, 4096)),
+                "maxExports": max(0, min(max_exports, 4096)),
+            },
+            timeout=clamp_tool_timeout(timeout_seconds, NATIVE_CONTEXT_TIMEOUT_SECONDS),
+            preferred_ide="vs",
+        )
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_module_layout")
+
+
+@mcp.tool()
+async def capture_native_context(
+    disassembly_count: int = 32,
+    stack_bytes: int = 256,
+    include_modules: bool = True,
+    timeout_seconds: Optional[float] = None
+) -> str:
+    """
+    Capture an information-only native debugging context at the current stop.
+
+    Returns normalized RIP/EIP and stack pointer addresses, registers, callstack,
+    nearby disassembly, stack memory, and optionally loaded modules.
+    """
+    try:
+        result = await ide_bridge.call(
+            "capture_native_context",
+            {
+                "disassemblyCount": max(1, min(disassembly_count, 256)),
+                "stackBytes": max(16, min(stack_bytes, 4096)),
+                "includeModules": include_modules,
+            },
+            timeout=clamp_tool_timeout(timeout_seconds, NATIVE_CONTEXT_TIMEOUT_SECONDS),
+            preferred_ide="vs",
+        )
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "capture_native_context")
+
+
+@mcp.tool()
+async def inspect_managed_assembly(
+    assembly_path: str,
+    type_filter: Optional[str] = None,
+    max_types: int = 256,
+    max_methods_per_type: int = 64,
+    timeout_seconds: Optional[float] = None
+) -> str:
+    """
+    Read managed assembly metadata without source or UI automation.
+
+    Returns bounded type and method summaries for a DLL/EXE path. Use
+    type_filter to narrow large shipping assemblies before inspecting IL.
+    """
+    try:
+        params = {
+            "assemblyPath": assembly_path,
+            "maxTypes": max(1, min(max_types, 4096)),
+            "maxMethodsPerType": max(0, min(max_methods_per_type, 512)),
+        }
+        if type_filter:
+            params["typeFilter"] = type_filter
+        result = await ide_bridge.call(
+            "inspect_managed_assembly",
+            params,
+            timeout=clamp_tool_timeout(timeout_seconds, MANAGED_INSPECTION_TIMEOUT_SECONDS),
+            preferred_ide="vs",
+        )
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "inspect_managed_assembly")
+
+
+@mcp.tool()
+async def inspect_managed_type(
+    assembly_path: str,
+    type_name: str,
+    max_methods: int = 512,
+    timeout_seconds: Optional[float] = None
+) -> str:
+    """
+    Return detailed metadata for one managed type in a DLL/EXE path.
+
+    type_name may be a full name or a simple type name when unique enough for
+    the assembly.
+    """
+    try:
+        result = await ide_bridge.call(
+            "inspect_managed_type",
+            {
+                "assemblyPath": assembly_path,
+                "typeName": type_name,
+                "maxMethods": max(0, min(max_methods, 4096)),
+            },
+            timeout=clamp_tool_timeout(timeout_seconds, MANAGED_INSPECTION_TIMEOUT_SECONDS),
+            preferred_ide="vs",
+        )
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "inspect_managed_type")
+
+
+@mcp.tool()
+async def inspect_managed_method_il(
+    assembly_path: str,
+    type_name: str,
+    method_name: str,
+    overload_index: int = 0,
+    max_instructions: int = 512,
+    timeout_seconds: Optional[float] = None
+) -> str:
+    """
+    Decode IL for a managed method without source or UI automation.
+
+    Includes opcode offsets, branch targets, switch targets, metadata tokens,
+    resolved members/strings/types where possible, parameters, and locals.
+    Constructors can be requested with method_name=".ctor" or ".cctor".
+    """
+    try:
+        result = await ide_bridge.call(
+            "inspect_managed_method_il",
+            {
+                "assemblyPath": assembly_path,
+                "typeName": type_name,
+                "methodName": method_name,
+                "overloadIndex": max(0, overload_index),
+                "maxInstructions": max(1, min(max_instructions, 4096)),
+            },
+            timeout=clamp_tool_timeout(timeout_seconds, MANAGED_INSPECTION_TIMEOUT_SECONDS),
+            preferred_ide="vs",
+        )
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "inspect_managed_method_il")
+
+
+@mcp.tool()
+async def capture_hybrid_context(
+    disassembly_count: int = 32,
+    stack_bytes: int = 256,
+    include_native: bool = True,
+    include_modules: bool = True,
+    include_threads: bool = True,
+    include_breakpoints: bool = True,
+    thread_include_frames: bool = True,
+    thread_max_frames_per_thread: Optional[int] = None,
+    thread_max_nodes: Optional[int] = None,
+    thread_budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None
+) -> str:
+    """
+    Capture a mixed no-source debug snapshot at the current stop.
+
+    Combines native address/register/disassembly/stack memory, managed thread
+    frames, and breakpoint binding state so the caller can reason about the
+    current stop without reading UI panels.
+    """
+    try:
+        params = add_thread_capture_params({
+            "disassemblyCount": max(1, min(disassembly_count, 256)),
+            "stackBytes": max(16, min(stack_bytes, 4096)),
+            "includeNative": include_native,
+            "includeModules": include_modules,
+            "includeThreads": include_threads,
+            "includeBreakpoints": include_breakpoints,
+        }, thread_include_frames, thread_max_frames_per_thread, thread_max_nodes, thread_budget_ms)
+        result = await ide_bridge.call(
+            "capture_hybrid_context",
+            params,
+            timeout=tool_timeout_for_budget(timeout_seconds, HYBRID_CONTEXT_TIMEOUT_SECONDS, thread_budget_ms),
+            preferred_ide="vs",
+        )
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "capture_hybrid_context")
+
+
 # ============== Build Error Tools ==============
 
 @mcp.tool()
@@ -1576,6 +1831,41 @@ async def continue_and_wait_for_break(
 
 
 @mcp.tool()
+async def continue_and_capture_native(
+    timeout_seconds: int = 120,
+    poll_interval_ms: int = 200,
+    disassembly_count: int = 32,
+    stack_bytes: int = 256,
+    include_modules: bool = True
+) -> str:
+    """
+    Continue execution, poll briefly until the debugger breaks, then capture native context.
+
+    This is the no-source native debugging loop: it returns the stop status,
+    normalized current address, registers, nearby disassembly, stack memory,
+    callstack, and optionally loaded modules.
+    """
+    timeout_seconds = max(1, min(timeout_seconds, 1800))
+    poll_interval_ms = max(50, min(poll_interval_ms, 1000))
+    try:
+        result = await ide_bridge.call(
+            "continue_and_capture_native",
+            {
+                "timeoutMs": timeout_seconds * 1000,
+                "pollIntervalMs": poll_interval_ms,
+                "disassemblyCount": max(1, min(disassembly_count, 256)),
+                "stackBytes": max(16, min(stack_bytes, 4096)),
+                "includeModules": include_modules,
+            },
+            timeout=float(timeout_seconds + NATIVE_CONTEXT_TIMEOUT_SECONDS),
+            preferred_ide="vs",
+        )
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "continue_and_capture_native")
+
+
+@mcp.tool()
 async def debug_step_over() -> str:
     """
     单步跳过当前行 (F10)，不进入函数内部。
@@ -1764,6 +2054,68 @@ async def get_breakpoints() -> str:
 
 
 @mcp.tool()
+async def get_breakpoint_bindings() -> str:
+    """
+    Return breakpoints with binding status and bound-child counts.
+
+    This is a no-source attribution helper for function/address breakpoints:
+    bound, pending, unbound, and multi-bind states are returned without reading
+    the Visual Studio Breakpoints UI.
+    """
+    try:
+        result = await ide_bridge.call("get_breakpoint_bindings", preferred_ide="vs")
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_breakpoint_bindings")
+
+
+@mcp.tool()
+async def continue_and_capture_breakpoint(
+    timeout_seconds: int = 120,
+    poll_interval_ms: int = 200,
+    disassembly_count: int = 32,
+    stack_bytes: int = 256,
+    include_native: bool = True,
+    include_modules: bool = True,
+    include_threads: bool = True,
+    include_breakpoints: bool = True,
+    thread_include_frames: bool = True,
+    thread_max_frames_per_thread: Optional[int] = None,
+    thread_max_nodes: Optional[int] = None,
+    thread_budget_ms: Optional[int] = None,
+) -> str:
+    """
+    Continue execution until the next debug stop and capture breakpoint context.
+
+    Use after setting file/function/address/data breakpoints in no-source tasks.
+    The result includes stop reason, current status, breakpoint bindings, and an
+    optional hybrid native+managed snapshot at the stop.
+    """
+    timeout_seconds = max(1, min(timeout_seconds, 1800))
+    poll_interval_ms = max(50, min(poll_interval_ms, 1000))
+    try:
+        params = add_thread_capture_params({
+            "timeoutMs": timeout_seconds * 1000,
+            "pollIntervalMs": poll_interval_ms,
+            "disassemblyCount": max(1, min(disassembly_count, 256)),
+            "stackBytes": max(16, min(stack_bytes, 4096)),
+            "includeNative": include_native,
+            "includeModules": include_modules,
+            "includeThreads": include_threads,
+            "includeBreakpoints": include_breakpoints,
+        }, thread_include_frames, thread_max_frames_per_thread, thread_max_nodes, thread_budget_ms)
+        result = await ide_bridge.call(
+            "continue_and_capture_breakpoint",
+            params,
+            timeout=float(timeout_seconds + tool_timeout_for_budget(None, HYBRID_CONTEXT_TIMEOUT_SECONDS, thread_budget_ms)),
+            preferred_ide="vs",
+        )
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "continue_and_capture_breakpoint")
+
+
+@mcp.tool()
 async def set_breakpoint(
     file_path: str,
     line_number: int,
@@ -1860,10 +2212,41 @@ async def set_data_breakpoint(
             params["hitCountType"] = hit_count_type
         if condition_type:
             params["conditionType"] = condition_type
-        result = await ide_bridge.call("set_data_breakpoint", params)
+        result = await ide_bridge.call("set_data_breakpoint", params, preferred_ide="vs")
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "set_data_breakpoint")
+
+
+@mcp.tool()
+async def set_address_breakpoint(
+    address: str,
+    condition: Optional[str] = None,
+    hit_count: int = 0,
+    hit_count_type: Optional[str] = None,
+    condition_type: Optional[str] = None
+) -> str:
+    """
+    Set a Visual Studio native code breakpoint at an absolute address or module+RVA.
+
+    Examples: set_address_breakpoint(address="0x7ff700001234"),
+    set_address_breakpoint(address="devenv.exe+0x1234").
+    """
+    try:
+        params = {
+            "address": address,
+            "hitCount": max(0, hit_count),
+        }
+        if condition:
+            params["condition"] = condition
+        if hit_count_type:
+            params["hitCountType"] = hit_count_type
+        if condition_type:
+            params["conditionType"] = condition_type
+        result = await ide_bridge.call("set_address_breakpoint", params, preferred_ide="vs")
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "set_address_breakpoint")
 
 
 @mcp.tool(name="set_watchpoint")

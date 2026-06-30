@@ -176,10 +176,31 @@ class IDEBridge:
         )
         return any(marker in message for marker in stale_markers)
 
-    async def call(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 10.0) -> Any:
+    async def call(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: float = 10.0,
+        preferred_ide: Optional[str] = None,
+    ) -> Any:
+        requested_preferred = self._normalize_ide(preferred_ide)
+        if preferred_ide is not None and requested_preferred is None:
+            raise IDEBridgeError("preferred_ide must be 'vs' or 'rider'")
+        if requested_preferred and self._preferred_ide and self._preferred_ide != requested_preferred:
+            raise IDEBridgeError(
+                f"{method} requires {requested_preferred.upper()}, but this MCP server is locked to "
+                f"{self._preferred_ide.upper()} by AIDB_PREFERRED_IDE."
+            )
+        preferred = self._resolve_preferred_ide(preferred_ide)
+
         async with self._lock:
             selected_ide = self._selected_ide
             selected_pipe = self._selected_pipe
+
+        if preferred and selected_ide and selected_ide != preferred:
+            raise IDEBridgeError(
+                f"{method} requires {preferred.upper()}, but the selected IDE is {selected_ide.upper()}."
+            )
 
         if selected_ide == "vs":
             try:
@@ -204,13 +225,13 @@ class IDEBridge:
                     if self._selected_ide == "rider" and self._selected_pipe == selected_pipe:
                         self.clear_selection()
 
-        instances = await self.discover_instances()
+        instances = await self.discover_instances(preferred_ide=preferred)
         if not instances:
             raise IDEBridgeError(
-                "No IDE instances found. Please ensure VS or Rider is running with the MCP plugin installed."
+                "No IDE instances found. Please ensure the required IDE is running with the MCP plugin installed."
             )
 
-        candidates, preferred = self.get_candidate_instances(instances)
+        candidates, preferred = self.get_candidate_instances(instances, preferred_ide=preferred)
         selected = self._auto_select_core(candidates)
         if selected is None:
             instance_list = "\n".join([
@@ -273,9 +294,14 @@ def get_bridge() -> IDEBridge:
     return _bridge
 
 
-async def call(method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 10.0) -> Any:
+async def call(
+    method: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: float = 10.0,
+    preferred_ide: Optional[str] = None,
+) -> Any:
     bridge = get_bridge()
-    return await bridge.call(method, params, timeout)
+    return await bridge.call(method, params, timeout, preferred_ide=preferred_ide)
 
 
 async def discover_instances(preferred_ide: Optional[str] = None) -> List[IDEInstance]:

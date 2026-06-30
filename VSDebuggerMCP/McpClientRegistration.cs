@@ -68,6 +68,9 @@ namespace VSDebuggerMCP
 ### 内存/底层分析
 - 关键词：内存、memory、指针、pointer、地址、address、反汇编、disassembly、寄存器
 - 推荐操作：使用 read_memory、get_disassembly、get_registers 等
+- No-source native: use resolve_address, get_module_layout, set_address_breakpoint, capture_native_context, and continue_and_capture_native. No write-memory or patching tool is exposed.
+- No-source managed: use inspect_managed_assembly, inspect_managed_type, and inspect_managed_method_il to read metadata and decode IL from a target DLL/EXE without source or UI automation.
+- No-source hybrid dynamic loop: use get_breakpoint_bindings, capture_hybrid_context, and continue_and_capture_breakpoint to correlate breakpoint binding, native register/disassembly/stack data, and managed thread frames.
 
 ## 推荐工作流程
 

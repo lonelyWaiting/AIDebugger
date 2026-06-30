@@ -456,6 +456,122 @@ namespace VSDebuggerMCP
                         return _debuggerService.GetDisassemblyAt(address, count);
                     }
 
+                case "resolve_address":
+                    {
+                        string address = GetParam<string>(request.Params, "address", "");
+                        return _debuggerService.ResolveAddress(address);
+                    }
+
+                case "get_module_layout":
+                    {
+                        string module = GetParam<string>(request.Params, "module", "");
+                        int maxImportFunctions = GetParam<int>(request.Params, "maxImportFunctions", 256);
+                        int maxExports = GetParam<int>(request.Params, "maxExports", 512);
+                        return _debuggerService.GetModuleLayout(module, maxImportFunctions, maxExports);
+                    }
+
+                case "capture_native_context":
+                    {
+                        int disassemblyCount = GetParam<int>(request.Params, "disassemblyCount", 32);
+                        int stackBytes = GetParam<int>(request.Params, "stackBytes", 256);
+                        bool includeModules = GetParam<bool>(request.Params, "includeModules", true);
+                        return _debuggerService.CaptureNativeContext(disassemblyCount, stackBytes, includeModules);
+                    }
+
+                case "continue_and_capture_native":
+                    {
+                        int timeoutMs = GetParam<int>(request.Params, "timeoutMs", 120000);
+                        int pollIntervalMs = GetParam<int>(request.Params, "pollIntervalMs", 200);
+                        int disassemblyCount = GetParam<int>(request.Params, "disassemblyCount", 32);
+                        int stackBytes = GetParam<int>(request.Params, "stackBytes", 256);
+                        bool includeModules = GetParam<bool>(request.Params, "includeModules", true);
+                        return _debuggerService.ContinueAndCaptureNative(timeoutMs, pollIntervalMs, disassemblyCount, stackBytes, includeModules);
+                    }
+
+                case "inspect_managed_assembly":
+                    {
+                        string assemblyPath = GetParam<string>(request.Params, "assemblyPath", "");
+                        string typeFilter = GetParam<string>(request.Params, "typeFilter", null);
+                        int maxTypes = GetParam<int>(request.Params, "maxTypes", 256);
+                        int maxMethodsPerType = GetParam<int>(request.Params, "maxMethodsPerType", 64);
+                        return _debuggerService.InspectManagedAssembly(assemblyPath, typeFilter, maxTypes, maxMethodsPerType);
+                    }
+
+                case "inspect_managed_type":
+                    {
+                        string assemblyPath = GetParam<string>(request.Params, "assemblyPath", "");
+                        string typeName = GetParam<string>(request.Params, "typeName", "");
+                        int maxMethods = GetParam<int>(request.Params, "maxMethods", 512);
+                        return _debuggerService.InspectManagedType(assemblyPath, typeName, maxMethods);
+                    }
+
+                case "inspect_managed_method_il":
+                    {
+                        string assemblyPath = GetParam<string>(request.Params, "assemblyPath", "");
+                        string typeName = GetParam<string>(request.Params, "typeName", "");
+                        string methodName = GetParam<string>(request.Params, "methodName", "");
+                        int overloadIndex = GetParam<int>(request.Params, "overloadIndex", 0);
+                        int maxInstructions = GetParam<int>(request.Params, "maxInstructions", 512);
+                        return _debuggerService.InspectManagedMethodIl(assemblyPath, typeName, methodName, overloadIndex, maxInstructions);
+                    }
+
+                case "capture_hybrid_context":
+                    {
+                        int disassemblyCount = GetParam<int>(request.Params, "disassemblyCount", 32);
+                        int stackBytes = GetParam<int>(request.Params, "stackBytes", 256);
+                        bool includeNative = GetParam<bool>(request.Params, "includeNative", true);
+                        bool includeModules = GetParam<bool>(request.Params, "includeModules", true);
+                        bool includeThreads = GetParam<bool>(request.Params, "includeThreads", true);
+                        bool includeBreakpoints = GetParam<bool>(request.Params, "includeBreakpoints", true);
+                        bool threadIncludeFrames = GetParam<bool>(request.Params, "threadIncludeFrames", true);
+                        int threadMaxFramesPerThread = GetParam<int>(request.Params, "threadMaxFramesPerThread", -1);
+                        int threadMaxNodes = GetParam<int>(request.Params, "threadMaxNodes", -1);
+                        int threadBudgetMs = GetParam<int>(request.Params, "threadBudgetMs", -1);
+                        return _debuggerService.CaptureHybridContext(
+                            disassemblyCount,
+                            stackBytes,
+                            includeNative,
+                            includeModules,
+                            includeThreads,
+                            includeBreakpoints,
+                            threadIncludeFrames,
+                            threadMaxFramesPerThread,
+                            threadMaxNodes,
+                            threadBudgetMs);
+                    }
+
+                case "get_breakpoint_bindings":
+                    return _debuggerService.GetBreakpointBindings();
+
+                case "continue_and_capture_breakpoint":
+                    {
+                        int timeoutMs = GetParam<int>(request.Params, "timeoutMs", 120000);
+                        int pollIntervalMs = GetParam<int>(request.Params, "pollIntervalMs", 200);
+                        int disassemblyCount = GetParam<int>(request.Params, "disassemblyCount", 32);
+                        int stackBytes = GetParam<int>(request.Params, "stackBytes", 256);
+                        bool includeNative = GetParam<bool>(request.Params, "includeNative", true);
+                        bool includeModules = GetParam<bool>(request.Params, "includeModules", true);
+                        bool includeThreads = GetParam<bool>(request.Params, "includeThreads", true);
+                        bool includeBreakpoints = GetParam<bool>(request.Params, "includeBreakpoints", true);
+                        bool threadIncludeFrames = GetParam<bool>(request.Params, "threadIncludeFrames", true);
+                        int threadMaxFramesPerThread = GetParam<int>(request.Params, "threadMaxFramesPerThread", -1);
+                        int threadMaxNodes = GetParam<int>(request.Params, "threadMaxNodes", -1);
+                        int threadBudgetMs = GetParam<int>(request.Params, "threadBudgetMs", -1);
+                        return _debuggerService.ContinueAndCaptureBreakpoint(
+                            timeoutMs,
+                            pollIntervalMs,
+                            disassemblyCount,
+                            stackBytes,
+                            includeNative,
+                            includeModules,
+                            includeThreads,
+                            includeBreakpoints,
+                            threadIncludeFrames,
+                            threadMaxFramesPerThread,
+                            threadMaxNodes,
+                            threadBudgetMs);
+                    }
+
                 case "get_build_errors":
                     return _debuggerService.GetBuildErrors();
 
@@ -610,6 +726,16 @@ namespace VSDebuggerMCP
                         string hitCountType = GetParam<string>(request.Params, "hitCountType", null);
                         string conditionType = GetParam<string>(request.Params, "conditionType", null);
                         return _debuggerService.SetDataBreakpoint(dataExpression, byteCount, condition, hitCount, hitCountType, conditionType);
+                    }
+
+                case "set_address_breakpoint":
+                    {
+                        string address = GetParam<string>(request.Params, "address", "");
+                        string condition = GetParam<string>(request.Params, "condition", null);
+                        int hitCount = GetParam<int>(request.Params, "hitCount", 0);
+                        string hitCountType = GetParam<string>(request.Params, "hitCountType", null);
+                        string conditionType = GetParam<string>(request.Params, "conditionType", null);
+                        return _debuggerService.SetAddressBreakpoint(address, condition, hitCount, hitCountType, conditionType);
                     }
 
                 case "delete_breakpoint":

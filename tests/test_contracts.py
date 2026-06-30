@@ -1,8 +1,20 @@
+import json
 import pathlib
+import subprocess
 import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def find_msbuild() -> pathlib.Path | None:
+    candidates = [
+        pathlib.Path(r"C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe"),
+        pathlib.Path(r"C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe"),
+        pathlib.Path(r"C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe"),
+        pathlib.Path(r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe"),
+    ]
+    return next((path for path in candidates if path.exists()), None)
 
 
 def read(path: str) -> str:
@@ -202,6 +214,11 @@ class ContractTests(unittest.TestCase):
             self.assertIn(tool_name, server_py)
 
         self.assertNotIn("async def set_logpoint", server_py)
+        data_breakpoint_tool = function_source(server_py, "set_data_breakpoint")
+        self.assertIn('preferred_ide="vs"', data_breakpoint_tool)
+        watchpoint_alias = function_source(server_py, "set_watchpoint_alias")
+        self.assertIn("return await set_data_breakpoint(", watchpoint_alias)
+        self.assertNotIn("ide_bridge.call", watchpoint_alias)
 
     def test_stop_and_detach_discovery_terms_are_indexed(self) -> None:
         server_py = read("mcp_server/server.py")
@@ -259,6 +276,584 @@ class ContractTests(unittest.TestCase):
         self.assertNotIn("SetLogpoint", vs_service)
         self.assertIn("ProcessDebugResult", vs_models)
         self.assertIn("KnownType(typeof(ProcessDebugResult))", vs_response)
+
+    def test_no_source_native_tools_are_exposed_without_patch_surface(self) -> None:
+        server_py = read("mcp_server/server.py")
+
+        for tool_name in (
+            "resolve_address",
+            "get_module_layout",
+            "capture_native_context",
+            "continue_and_capture_native",
+            "set_address_breakpoint",
+        ):
+            self.assertIn(f"async def {tool_name}", server_py)
+
+        debug_capabilities = function_source(server_py, "debug_capabilities")
+        self.assertIn("noSourceNative", debug_capabilities)
+        self.assertIn("module+RVA", debug_capabilities)
+        self.assertIn("No write-memory or patching tool is exposed", debug_capabilities)
+        self.assertIn("Visual Studio only", debug_capabilities)
+        self.assertIn("Rider support is explicitly missing", debug_capabilities)
+        self.assertIn("NATIVE_CONTEXT_TIMEOUT_SECONDS = 45.0", server_py)
+        self.assertIn("timeout=float(timeout_seconds + NATIVE_CONTEXT_TIMEOUT_SECONDS)", function_source(server_py, "continue_and_capture_native"))
+        for tool_name in (
+            "resolve_address",
+            "get_module_layout",
+            "capture_native_context",
+            "continue_and_capture_native",
+            "set_address_breakpoint",
+        ):
+            self.assertIn('preferred_ide="vs"', function_source(server_py, tool_name))
+        self.assertNotIn("async def write_memory", server_py)
+        self.assertNotIn("WriteProcessMemory", read("VSDebuggerMCP/DebuggerService.cs"))
+
+    def test_vs_no_source_native_protocol_is_routed_and_serializable(self) -> None:
+        vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
+        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+        vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+        vs_response = read("VSDebuggerMCP/Protocol/DebugResponse.cs")
+
+        for method_name in (
+            '"resolve_address"',
+            '"get_module_layout"',
+            '"capture_native_context"',
+            '"continue_and_capture_native"',
+            '"set_address_breakpoint"',
+            '"maxImportFunctions"',
+            '"maxExports"',
+            '"disassemblyCount"',
+            '"stackBytes"',
+        ):
+            self.assertIn(method_name, vs_pipe)
+
+        for symbol in (
+            "ResolveAddress",
+            "GetModuleLayout",
+            "CaptureNativeContext",
+            "ContinueAndCaptureNative",
+            "SetAddressBreakpoint",
+            "NativeAddressInfo",
+            "ModuleLayoutResult",
+            "NativeContextResult",
+            "NativeContinueResult",
+        ):
+            self.assertIn(symbol, vs_service + vs_models)
+
+        for known_type in (
+            "KnownType(typeof(NativeAddressInfo))",
+            "KnownType(typeof(ModuleLayoutResult))",
+            "KnownType(typeof(ModuleSectionInfo))",
+            "KnownType(typeof(ImportedModuleInfo))",
+            "KnownType(typeof(ImportFunctionInfo))",
+            "KnownType(typeof(ExportInfo))",
+            "KnownType(typeof(NativeContextResult))",
+            "KnownType(typeof(NativeContinueResult))",
+        ):
+            self.assertIn(known_type, vs_response)
+
+        for field in (
+            "virtualAddress",
+            "addressValue",
+            "moduleName",
+            "moduleBase",
+            "moduleSizeBytes",
+            "rva",
+            "sectionName",
+            "entryPointRva",
+            "imports",
+            "exports",
+            "stackMemory",
+        ):
+            self.assertIn(field, vs_models)
+
+    def test_vs_native_address_resolution_handles_hard_address_cases(self) -> None:
+        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+        vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+        vs_response = read("VSDebuggerMCP/Protocol/DebugResponse.cs")
+
+        self.assertIn("TryParseModuleRvaExpression", vs_service)
+        self.assertIn("expression.LastIndexOf('+')", vs_service)
+        self.assertIn("module+RVA expression overflows address space", vs_service)
+        self.assertIn("Expression-based address resolution requires break mode", vs_service)
+        self.assertIn("FindContainingModule", vs_service)
+        self.assertIn("m.Size != 0 && address >= m.Base && address - m.Base < m.Size", vs_service)
+        self.assertIn("OrderByDescending(m => m.Base)", vs_service)
+        self.assertIn("ModuleInfo explicitModule = null", vs_service)
+        self.assertIn("module+RVA is outside the module image size", vs_service)
+        self.assertNotIn(".Where(m => m.Base != 0 && address >= m.Base)", vs_service)
+        self.assertIn("FindSectionForRva", vs_service)
+        self.assertIn("NearestSymbol", vs_service)
+        self.assertIn("SizeBytes = GetModuleSizeFromBase", vs_service)
+        self.assertIn("existing.SizeBytes == 0 && moduleInfo.SizeBytes != 0", vs_service)
+        self.assertIn("FormatRva(result.RvaValue - sectionRva)", vs_service)
+        self.assertIn("FunctionStatus", vs_models)
+        self.assertIn("FunctionError", vs_models)
+        self.assertIn('Name = "functionStatus"', vs_models)
+        self.assertIn('Name = "functionError"', vs_models)
+        self.assertIn("KnownType(typeof(NativeFunctionInfo))", vs_response)
+        self.assertNotIn("NativeControlFlowInfo", vs_models + vs_response)
+        self.assertNotIn("controlFlow", vs_models)
+        self.assertNotIn("prologueFound", vs_models)
+        self.assertNotIn("terminatorFound", vs_models)
+        self.assertIn("BuildExactExportFunctionAttribution", vs_service)
+        self.assertIn('"No exact native function symbol is available for this address"', vs_service)
+        self.assertIn('"Only nearestSymbol+offset is available; exact native function attribution is missing"', vs_service)
+        self.assertNotIn("FindFunctionStartIndex", vs_service)
+        self.assertNotIn("FindFunctionEndIndex", vs_service)
+        self.assertNotIn("Math.Max(0, currentIndex - 16)", vs_service)
+        self.assertNotIn("function boundary is heuristic", vs_service)
+        self.assertNotIn("prologue", vs_service.lower())
+        self.assertNotIn("heuristic", vs_service.lower())
+
+    def test_vs_module_layout_parser_covers_pe_boundaries_and_truncation(self) -> None:
+        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+
+        for marker in (
+            "Missing MZ header",
+            "Missing PE signature",
+            "Unsupported PE optional header magic",
+            "safeSectionCount = Math.Min(sectionCount, (ushort)96)",
+            "ReadExports",
+            "ReadImports",
+            "RvaToFileOffset",
+            "ReadNullTerminatedAscii",
+            "maxImportFunctions",
+            "maxExports",
+            "result.Truncated = true",
+            "ordinalFlag",
+            "thunkMask",
+            "0x8000000000000000UL",
+            "0x80000000UL",
+            "FileShare.ReadWrite | System.IO.FileShare.Delete",
+        ):
+            self.assertIn(marker, vs_service)
+
+    def test_vs_native_context_is_snapshot_oriented_and_read_only(self) -> None:
+        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+        server_py = read("mcp_server/server.py")
+
+        native_context = csharp_slice(vs_service, "private NativeContextResult BuildNativeContextResult", "        private NativeAddressInfo ResolveAddressInternal")
+        self.assertIn('string ipRegister = is64Bit ? "@rip" : "@eip"', native_context)
+        self.assertIn('string spRegister = is64Bit ? "@rsp" : "@esp"', native_context)
+        self.assertIn("ResolveAddressInternal(debugger, ipRegister)", native_context)
+        self.assertIn("BuildRegistersResult(debugger)", native_context)
+        self.assertIn("BuildCallStackResult(debugger)", native_context)
+        self.assertIn("ExecuteDisassemblyAt(debugger, ipExpression, disassemblyCount", native_context)
+        self.assertIn("ReadMemoryInternal(debugger, spExpression, stackBytes)", native_context)
+        self.assertIn("BuildModulesResult(debugger)", native_context)
+
+        continue_native = csharp_slice(vs_service, "public NativeContinueResult ContinueAndCaptureNative", "        private NativeContextResult BuildNativeContextResult")
+        self.assertIn("Math.Max(50, Math.Min(pollIntervalMs, 1000))", continue_native)
+        self.assertIn("System.Threading.Thread.Sleep(normalizedPollIntervalMs)", continue_native)
+        self.assertIn("CaptureNativeContext(disassemblyCount, stackBytes, includeModules)", continue_native)
+        self.assertIn("Timed out waiting for debugger to enter break mode", continue_native)
+
+        self.assertIn('"includeModules": include_modules', function_source(server_py, "capture_native_context"))
+        self.assertIn('"includeModules": include_modules', function_source(server_py, "continue_and_capture_native"))
+
+    def test_no_source_managed_and_hybrid_tools_are_exposed(self) -> None:
+        server_py = read("mcp_server/server.py")
+        vs_registration = read("VSDebuggerMCP/McpClientRegistration.cs")
+
+        for tool_name in (
+            "inspect_managed_assembly",
+            "inspect_managed_type",
+            "inspect_managed_method_il",
+            "capture_hybrid_context",
+            "get_breakpoint_bindings",
+            "continue_and_capture_breakpoint",
+        ):
+            self.assertIn(f"async def {tool_name}", server_py)
+
+        debug_capabilities = function_source(server_py, "debug_capabilities")
+        self.assertIn("noSourceManaged", debug_capabilities)
+        self.assertIn("noSourceHybrid", debug_capabilities)
+        self.assertIn("without source or UI automation", debug_capabilities)
+        self.assertIn("Breakpoint-oriented dynamic loop", debug_capabilities)
+        self.assertIn("MANAGED_INSPECTION_TIMEOUT_SECONDS = 75.0", server_py)
+        self.assertIn("HYBRID_CONTEXT_TIMEOUT_SECONDS = 135.0", server_py)
+        self.assertIn("tool_timeout_for_budget(timeout_seconds, HYBRID_CONTEXT_TIMEOUT_SECONDS, thread_budget_ms)", function_source(server_py, "capture_hybrid_context"))
+        for tool_name in (
+            "inspect_managed_assembly",
+            "inspect_managed_type",
+            "inspect_managed_method_il",
+            "capture_hybrid_context",
+            "get_breakpoint_bindings",
+            "continue_and_capture_breakpoint",
+        ):
+            self.assertIn('preferred_ide="vs"', function_source(server_py, tool_name))
+        self.assertIn("continue_and_capture_breakpoint", vs_registration)
+        self.assertIn("inspect_managed_method_il", vs_registration)
+        self.assertIn("No-source hybrid dynamic loop", vs_registration)
+
+    def test_vs_no_source_managed_and_hybrid_protocol_is_routed_and_serializable(self) -> None:
+        vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
+        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+        vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+        vs_response = read("VSDebuggerMCP/Protocol/DebugResponse.cs")
+
+        for method_name in (
+            '"inspect_managed_assembly"',
+            '"inspect_managed_type"',
+            '"inspect_managed_method_il"',
+            '"capture_hybrid_context"',
+            '"get_breakpoint_bindings"',
+            '"continue_and_capture_breakpoint"',
+            '"assemblyPath"',
+            '"typeName"',
+            '"methodName"',
+            '"overloadIndex"',
+            '"maxInstructions"',
+            '"includeNative"',
+            '"includeBreakpoints"',
+        ):
+            self.assertIn(method_name, vs_pipe)
+
+        for symbol in (
+            "InspectManagedAssembly",
+            "InspectManagedType",
+            "InspectManagedMethodIl",
+            "CaptureHybridContext",
+            "GetBreakpointBindings",
+            "ContinueAndCaptureBreakpoint",
+            "ManagedAssemblyResult",
+            "ManagedMethodIlResult",
+            "HybridContextResult",
+            "BreakpointCaptureResult",
+        ):
+            self.assertIn(symbol, vs_service + vs_models)
+
+        for known_type in (
+            "KnownType(typeof(ManagedAssemblyResult))",
+            "KnownType(typeof(ManagedTypeResult))",
+            "KnownType(typeof(ManagedTypeInfo))",
+            "KnownType(typeof(ManagedMethodInfo))",
+            "KnownType(typeof(ManagedParameterInfo))",
+            "KnownType(typeof(ManagedLocalInfo))",
+            "KnownType(typeof(ManagedMethodIlResult))",
+            "KnownType(typeof(ManagedIlInstructionInfo))",
+            "KnownType(typeof(HybridContextResult))",
+            "KnownType(typeof(BreakpointCaptureResult))",
+            "KnownType(typeof(BreakpointHitInfo))",
+        ):
+            self.assertIn(known_type, vs_response)
+
+        for field in (
+            "assemblyFullName",
+            "moduleVersionId",
+            "metadataTokenHex",
+            "operandType",
+            "resolvedMember",
+            "branchTarget",
+            "switchTargets",
+            "nativeContext",
+            "selectedStackFrameIndex",
+            "continueResult",
+            "hitAttributionStatus",
+            "hitAttributionError",
+            "hitVerificationStatus",
+            "hitVerificationMessage",
+            "hitBreakpoint",
+            "trackedAddress",
+            "trackedAddresses",
+            "bindingVerificationStatus",
+            "bindingWarning",
+            "isRelocated",
+            "nearbyProbeAttempted",
+            "nearbyProbeSucceeded",
+            "optimizedCodeSuspected",
+            "verificationStatus",
+            "verificationMessage",
+        ):
+            self.assertIn(field, vs_models)
+        self.assertNotIn("likelyHitBreakpoint", vs_models)
+        self.assertNotIn("boundAddresses", vs_models)
+
+    def test_managed_inspection_helper_is_packaged_as_external_process(self) -> None:
+        vs_project = read("VSDebuggerMCP/VSDebuggerMCP.csproj")
+        helper_project = read("VSDebuggerMCP/ManagedInspectionHelper/ManagedInspectionHelper.csproj")
+        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+
+        self.assertIn("<OutputType>Exe</OutputType>", helper_project)
+        self.assertIn("<TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion>", helper_project)
+        self.assertIn('<Compile Include="..\\Protocol\\DebugModels.cs">', helper_project)
+        self.assertIn("<Link>Protocol\\DebugModels.cs</Link>", helper_project)
+        self.assertIn('<Reference Include="System.Web.Extensions" />', helper_project)
+        self.assertIn("BuildManagedInspectionHelper", vs_project)
+        self.assertIn("ManagedInspectionHelper\\ManagedInspectionHelper.csproj", vs_project)
+        self.assertIn("ManagedInspectionHelper\\bin\\$(Configuration)\\ManagedInspectionHelper.exe", vs_project)
+        self.assertIn("<IncludeInVSIX>true</IncludeInVSIX>", vs_project)
+
+        managed_entrypoints = csharp_slice(vs_service, "public ManagedAssemblyResult InspectManagedAssembly", "        public HybridContextResult CaptureHybridContext")
+        self.assertIn("RunManagedInspectionHelper<ManagedAssemblyResult>", managed_entrypoints)
+        self.assertIn("RunManagedInspectionHelper<ManagedTypeResult>", managed_entrypoints)
+        self.assertIn("RunManagedInspectionHelper<ManagedMethodIlResult>", managed_entrypoints)
+        self.assertIn("external_process_managed_metadata_and_il_read_only", managed_entrypoints)
+        self.assertIn("FileNotFoundException(\"ManagedInspectionHelper.exe was not found", vs_service)
+        self.assertNotIn("Assembly.LoadFrom", vs_service)
+        self.assertNotIn("ReflectionTypeLoadException", vs_service)
+        self.assertNotIn("AssemblyResolve", vs_service)
+        self.assertNotIn("DecodeIlInstructions", vs_service)
+        self.assertNotIn("OperandType.", vs_service)
+        self.assertNotIn("BuildOpCodeMap", vs_service)
+
+    def test_managed_inspection_helper_covers_hard_operands_and_metadata_boundaries(self) -> None:
+        helper = read("VSDebuggerMCP/ManagedInspectionHelper/Program.cs")
+        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+        il_decoder = csharp_slice(helper, "private static List<ManagedIlInstructionInfo> DecodeIlInstructions", "        private static OpCode[] BuildOpCodeMap")
+
+        for marker in (
+            "OperandType.InlineSwitch",
+            "OperandType.ShortInlineBrTarget",
+            "OperandType.InlineBrTarget",
+            "OperandType.InlineMethod",
+            "OperandType.InlineField",
+            "OperandType.InlineString",
+            "OperandType.InlineType",
+            "OperandType.InlineTok",
+            "OperandType.InlineSig",
+            "ResolveIlToken",
+            "module.ResolveMember",
+            "module.ResolveString",
+            "module.ResolveType",
+            "module.ResolveField",
+            "GetSafeGenericArguments",
+            "RequireIlBytes",
+            "<truncated operand>",
+            "Unknown opcode",
+            "FormatIlOffset",
+        ):
+            self.assertIn(marker, il_decoder)
+
+        for marker in (
+            "Assembly.LoadFrom(normalizedPath)",
+            "ReflectionTypeLoadException",
+            "AssemblyResolve",
+            "ResolveManagedDependency",
+            "NormalizeProbeDirectories",
+            "method.GetMethodBody()",
+            "body.GetILAsByteArray()",
+            "LocalVariableInfo",
+            "methodName, \".ctor\"",
+            "methodName, \".cctor\"",
+            "overloadIndex",
+            "maxInstructions",
+        ):
+            self.assertIn(marker, helper)
+
+        for marker in (
+            "PublicAssemblies",
+            "PrivateAssemblies",
+            "CommonExtensions\", \"Microsoft\", \"Editor",
+            "SharedAssemblies",
+        ):
+            self.assertIn(marker, vs_service)
+
+        self.assertNotIn("Assembly.LoadFrom", vs_service)
+
+    def test_managed_inspection_edge_fixture_exercises_nontrivial_il(self) -> None:
+        fixture_project = read("tests/fixtures/ManagedInspectionEdgeCases/ManagedInspectionEdgeCases.csproj")
+        fixture_code = read("tests/fixtures/ManagedInspectionEdgeCases/HardIlCases.cs")
+
+        self.assertIn("<OutputType>Library</OutputType>", fixture_project)
+        for marker in (
+            "public int DenseSwitch",
+            "switch (mode)",
+            "checked(value * 2)",
+            "public string TokenHeavy<T>",
+            "typeof(T)",
+            "string.Format",
+            "public int Overloaded(int value)",
+            "public string Overloaded(string value)",
+            "public int TryFinallyLoop",
+            "finally",
+            "private int Helper",
+        ):
+            self.assertIn(marker, fixture_code)
+
+    def test_managed_inspection_helper_executes_edge_fixture(self) -> None:
+        msbuild = find_msbuild()
+        if msbuild is None:
+            self.skipTest("MSBuild.exe not found")
+
+        helper_project = ROOT / "VSDebuggerMCP/ManagedInspectionHelper/ManagedInspectionHelper.csproj"
+        fixture_project = ROOT / "tests/fixtures/ManagedInspectionEdgeCases/ManagedInspectionEdgeCases.csproj"
+        for project in (helper_project, fixture_project):
+            completed = subprocess.run(
+                [str(msbuild), str(project), "/p:Configuration=Release", "/m:1", "/v:minimal"],
+                cwd=ROOT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+        helper_exe = ROOT / "VSDebuggerMCP/ManagedInspectionHelper/bin/Release/ManagedInspectionHelper.exe"
+        fixture_dll = ROOT / "tests/fixtures/ManagedInspectionEdgeCases/bin/Release/ManagedInspectionEdgeCases.dll"
+        self.assertTrue(helper_exe.exists())
+        self.assertTrue(fixture_dll.exists())
+
+        def invoke_helper(request: dict) -> dict:
+            completed = subprocess.run(
+                [str(helper_exe)],
+                cwd=ROOT,
+                input=json.dumps(request),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertTrue(completed.stdout.strip(), completed.stderr)
+            return json.loads(completed.stdout)
+
+        def result_value(result: dict, name: str):
+            pascal_name = name[:1].upper() + name[1:]
+            return result.get(name, result.get(pascal_name))
+
+        common = {
+            "AssemblyPath": str(fixture_dll),
+            "TypeName": "ManagedInspectionEdgeCases.HardIlCases",
+            "ProbeDirectories": [str(fixture_dll.parent)],
+        }
+        dense_switch = invoke_helper({
+            **common,
+            "Operation": "inspect_managed_method_il",
+            "MethodName": "DenseSwitch",
+            "OverloadIndex": 0,
+            "MaxInstructions": 512,
+        })
+        dense_instructions = result_value(dense_switch, "instructions")
+        self.assertFalse(result_value(dense_switch, "partial"), result_value(dense_switch, "error"))
+        self.assertTrue(any(result_value(i, "switchTargets") for i in dense_instructions))
+        self.assertTrue(any(result_value(i, "branchTarget") for i in dense_instructions))
+
+        token_heavy = invoke_helper({
+            **common,
+            "Operation": "inspect_managed_method_il",
+            "MethodName": "TokenHeavy",
+            "OverloadIndex": 0,
+            "MaxInstructions": 512,
+        })
+        token_instructions = result_value(token_heavy, "instructions")
+        self.assertTrue(any(result_value(i, "resolvedMember") for i in token_instructions))
+        self.assertTrue(any(result_value(i, "operandType") == "InlineType" for i in token_instructions))
+
+        bad_overload = invoke_helper({
+            **common,
+            "Operation": "inspect_managed_method_il",
+            "MethodName": "Overloaded",
+            "OverloadIndex": 99,
+            "MaxInstructions": 512,
+        })
+        self.assertIn("overloadIndex 99 is out of range", result_value(bad_overload, "error") or "")
+
+    def test_hybrid_breakpoint_capture_composes_no_source_dynamic_snapshot(self) -> None:
+        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+        server_py = read("mcp_server/server.py")
+
+        hybrid = csharp_slice(vs_service, "public HybridContextResult CaptureHybridContext", "        public BreakpointsResult GetBreakpointBindings")
+        for marker in (
+            "BuildDebugStatus(debugger)",
+            "SelectedStackFrameIndex = _selectedStackFrameIndex",
+            "BuildNativeContextResult(debugger",
+            "BuildThreadsResult(",
+            "DetermineThreadsSnapshotStatus",
+            "BuildBreakpointsResult(debugger)",
+            "includeNative",
+            "includeThreads",
+            "includeBreakpoints",
+        ):
+            self.assertIn(marker, hybrid)
+
+        capture = csharp_slice(vs_service, "public BreakpointCaptureResult ContinueAndCaptureBreakpoint", "        private static string NormalizeAssemblyPath")
+        for marker in (
+            "ContinueAndWaitForBreak(",
+            "includeException: true",
+            "allowSideEffects: false",
+            "CaptureHybridContext(",
+            "GetBreakpointBindings()",
+            "waitResult.BreakDetected",
+            "DetermineHitBreakpointExact",
+            "HitAttributionStatus = \"ok\"",
+            "HitAttributionStatus = \"missing\"",
+            "\"No debug stop was captured\"",
+            "\"Current instruction address exactly matches an enabled bound tracked address breakpoint\"",
+            "\"Current source location exactly matches an enabled bound source breakpoint resolved location\"",
+            "\"No enabled bound tracked address breakpoint or source breakpoint exactly matches the current stop location\"",
+            "\"Multiple tracked address breakpoints match the current instruction address\"",
+            "\"Multiple enabled bound source breakpoints match the current source location\"",
+        ):
+            self.assertIn(marker, capture)
+
+        self.assertIn("AddressBreakpointTagPrefix = \"AIDB_ADDR=\"", vs_service)
+        self.assertIn("TrySetAddressBreakpointTag(breakpoint, addressText)", vs_service)
+        self.assertIn("TryGetAddressBreakpointTag", vs_service)
+        self.assertIn("breakpointInfo.TrackedAddress = ResolveAddressInternal(debugger, taggedAddress)", vs_service)
+        self.assertIn("breakpointInfo.TrackedAddresses.Add(breakpointInfo.TrackedAddress)", vs_service)
+        self.assertIn("!breakpoint.Enabled", vs_service)
+        self.assertIn("!breakpoint.IsBound", vs_service)
+        self.assertIn("PopulateHitVerification(result)", vs_service)
+        self.assertIn("hit_exact_tracked_address", vs_service)
+        self.assertIn("hit_exact_source_location", vs_service)
+        self.assertIn("not_hit_timeout", vs_service)
+        self.assertIn("breakpoint_stop_unattributed", vs_service)
+        self.assertIn("stopped_not_verified_as_breakpoint", vs_service)
+        self.assertIn("FindCurrentSourceLocationBreakpointMatches", vs_service)
+        self.assertNotIn("LikelyHitBreakpoint", vs_service)
+        self.assertNotIn("exactMatches.Count == 0 && breakpoints.Count == 1", vs_service)
+
+        breakpoint_tool = function_source(server_py, "continue_and_capture_breakpoint")
+        self.assertIn("add_thread_capture_params", breakpoint_tool)
+        self.assertIn('"includeNative": include_native', breakpoint_tool)
+        self.assertIn('"includeBreakpoints": include_breakpoints', breakpoint_tool)
+        self.assertIn("timeout=float(timeout_seconds + tool_timeout_for_budget(None, HYBRID_CONTEXT_TIMEOUT_SECONDS, thread_budget_ms))", breakpoint_tool)
+
+    def test_breakpoint_binding_verification_surfaces_optimized_or_unbound_locations(self) -> None:
+        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+        vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+        server_py = read("mcp_server/server.py")
+
+        for field in (
+            "bindingVerificationStatus",
+            "bindingWarning",
+            "isRelocated",
+            "nearbyProbeAttempted",
+            "nearbyProbeSucceeded",
+            "optimizedCodeSuspected",
+            "verificationStatus",
+            "verificationMessage",
+        ):
+            self.assertIn(field, vs_models)
+
+        for marker in (
+            "PopulateBreakpointBindingAwareness",
+            "ApplyBreakpointOperationVerification",
+            "MarkNearbyProbeResult",
+            "IsActiveDebugSession",
+            "effectiveRequestedLineNumber",
+            "breakpoint.LocationType == dbgBreakpointLocationType.dbgBreakpointLocationTypeFile",
+            "bound_relocated",
+            "bound_exact",
+            "unbound",
+            "Breakpoint did not bind in the current debug session",
+            "Requested source line did not bind; a nearby executable line was selected",
+            "no nearby bound executable line was found",
+            "Optimized code, statement folding, or source/symbol mismatch may be involved",
+            "BreakpointProbeBindWaitMs",
+            "dbgDebugMode.dbgRunMode",
+            "return \"pending\"",
+            "debugger.CurrentMode == dbgDebugMode.dbgBreakMode",
+        ):
+            self.assertIn(marker, vs_service)
+
+        set_breakpoint = csharp_slice(vs_service, "public BreakpointOperationResult SetBreakpoint", "        public BreakpointOperationResult SetFunctionBreakpoint")
+        self.assertIn("ShouldSearchNearbyBindableLine(debugger, breakpointInfo)", set_breakpoint)
+        self.assertIn("TryFindNearbyBoundBreakpoint(", set_breakpoint)
+        self.assertIn("ApplyBreakpointOperationVerification(result, breakpointInfo, debugger, requireBoundInActiveSession: true)", set_breakpoint)
+        self.assertIn("breakpoint_binding_verification", function_source(server_py, "debug_capabilities"))
 
     def test_rider_detach_is_explicitly_unsupported(self) -> None:
         rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
@@ -554,7 +1149,7 @@ class ContractTests(unittest.TestCase):
         self.assertIn("return await vs_bridge.call_pipe(selected_pipe, method, params, timeout)", ide_bridge_py)
         self.assertIn("return await rider_bridge.call_pipe(selected_pipe, method, params, timeout)", ide_bridge_py)
         self.assertIn("return await vs_bridge.call_pipe(selected.pipe_name, method, params, timeout)", ide_bridge_py)
-        self.assertIn("instances = await self.discover_instances()", ide_bridge_py)
+        self.assertIn("instances = await self.discover_instances(preferred_ide=preferred)", ide_bridge_py)
 
         self.assertIn("pipe_name = self._selected_pipe", vs_bridge_py)
         self.assertIn("async def call_pipe", vs_bridge_py)
@@ -607,6 +1202,11 @@ class ContractTests(unittest.TestCase):
         ide_bridge_py = read("mcp_server/ide_bridge.py")
 
         self.assertIn("async def discover_instances(self, preferred_ide: Optional[str] = None)", ide_bridge_py)
+        self.assertIn("preferred_ide: Optional[str] = None", ide_bridge_py)
+        self.assertIn("preferred_ide must be 'vs' or 'rider'", ide_bridge_py)
+        self.assertIn("requires {preferred.upper()}", ide_bridge_py)
+        self.assertIn("requires {requested_preferred.upper()}", ide_bridge_py)
+        self.assertIn("bridge.call(method, params, timeout, preferred_ide=preferred_ide)", ide_bridge_py)
         self.assertIn('if preferred in (None, "vs"):', ide_bridge_py)
         self.assertIn('if preferred in (None, "rider"):', ide_bridge_py)
         self.assertIn("async def discover_instances(preferred_ide: Optional[str] = None)", ide_bridge_py)

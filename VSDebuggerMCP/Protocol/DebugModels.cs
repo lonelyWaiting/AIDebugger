@@ -265,11 +265,635 @@ namespace VSDebuggerMCP.Protocol
         [DataMember(Name = "size")]
         public string Size { get; set; }
 
+        [DataMember(Name = "sizeBytes")]
+        public ulong SizeBytes { get; set; }
+
         [DataMember(Name = "is64Bit")]
         public bool Is64Bit { get; set; }
 
         [DataMember(Name = "isSystemModule")]
         public bool IsSystemModule { get; set; }
+    }
+
+    #endregion
+
+    #region Native Debugging
+
+    [DataContract]
+    public class NativeAddressInfo
+    {
+        [DataMember(Name = "expression")]
+        public string Expression { get; set; }
+
+        [DataMember(Name = "status")]
+        public string Status { get; set; } = "unavailable";
+
+        [DataMember(Name = "virtualAddress")]
+        public string VirtualAddress { get; set; }
+
+        [DataMember(Name = "addressValue")]
+        public ulong AddressValue { get; set; }
+
+        [DataMember(Name = "moduleName")]
+        public string ModuleName { get; set; }
+
+        [DataMember(Name = "modulePath")]
+        public string ModulePath { get; set; }
+
+        [DataMember(Name = "moduleBase")]
+        public string ModuleBase { get; set; }
+
+        [DataMember(Name = "moduleBaseValue")]
+        public ulong ModuleBaseValue { get; set; }
+
+        [DataMember(Name = "moduleSizeBytes")]
+        public ulong ModuleSizeBytes { get; set; }
+
+        [DataMember(Name = "rva")]
+        public string Rva { get; set; }
+
+        [DataMember(Name = "rvaValue")]
+        public ulong RvaValue { get; set; }
+
+        [DataMember(Name = "sectionName")]
+        public string SectionName { get; set; }
+
+        [DataMember(Name = "sectionRva")]
+        public string SectionRva { get; set; }
+
+        [DataMember(Name = "sectionOffset")]
+        public string SectionOffset { get; set; }
+
+        [DataMember(Name = "nearestSymbol")]
+        public string NearestSymbol { get; set; }
+
+        [DataMember(Name = "function")]
+        public NativeFunctionInfo Function { get; set; }
+
+        [DataMember(Name = "functionStatus")]
+        public string FunctionStatus { get; set; } = "missing";
+
+        [DataMember(Name = "functionError")]
+        public string FunctionError { get; set; }
+
+        [DataMember(Name = "error")]
+        public string Error { get; set; }
+    }
+
+    [DataContract]
+    public class NativeFunctionInfo
+    {
+        [DataMember(Name = "startAddress")]
+        public string StartAddress { get; set; }
+
+        [DataMember(Name = "startAddressValue")]
+        public ulong StartAddressValue { get; set; }
+
+        [DataMember(Name = "startRva")]
+        public string StartRva { get; set; }
+
+        [DataMember(Name = "endAddress")]
+        public string EndAddress { get; set; }
+
+        [DataMember(Name = "endAddressValue")]
+        public ulong EndAddressValue { get; set; }
+
+        [DataMember(Name = "endRva")]
+        public string EndRva { get; set; }
+
+        [DataMember(Name = "sizeBytes")]
+        public ulong SizeBytes { get; set; }
+
+        [DataMember(Name = "addressOffset")]
+        public string AddressOffset { get; set; }
+
+        [DataMember(Name = "nearestSymbol")]
+        public string NearestSymbol { get; set; }
+
+        [DataMember(Name = "confidence")]
+        public string Confidence { get; set; }
+
+        [DataMember(Name = "reason")]
+        public string Reason { get; set; }
+    }
+
+    [DataContract]
+    public class ModuleLayoutResult
+    {
+        [DataMember(Name = "module")]
+        public ModuleInfo Module { get; set; }
+
+        [DataMember(Name = "status")]
+        public string Status { get; set; } = "unavailable";
+
+        [DataMember(Name = "is64Bit")]
+        public bool Is64Bit { get; set; }
+
+        [DataMember(Name = "entryPointRva")]
+        public string EntryPointRva { get; set; }
+
+        [DataMember(Name = "entryPointVa")]
+        public string EntryPointVa { get; set; }
+
+        [DataMember(Name = "imageBase")]
+        public string ImageBase { get; set; }
+
+        [DataMember(Name = "imageSizeBytes")]
+        public ulong ImageSizeBytes { get; set; }
+
+        [DataMember(Name = "sections")]
+        public List<ModuleSectionInfo> Sections { get; set; } = new List<ModuleSectionInfo>();
+
+        [DataMember(Name = "imports")]
+        public List<ImportedModuleInfo> Imports { get; set; } = new List<ImportedModuleInfo>();
+
+        [DataMember(Name = "exports")]
+        public List<ExportInfo> Exports { get; set; } = new List<ExportInfo>();
+
+        [DataMember(Name = "truncated")]
+        public bool Truncated { get; set; }
+
+        [DataMember(Name = "error")]
+        public string Error { get; set; }
+    }
+
+    [DataContract]
+    public class ModuleSectionInfo
+    {
+        [DataMember(Name = "name")]
+        public string Name { get; set; }
+
+        [DataMember(Name = "rva")]
+        public string Rva { get; set; }
+
+        [DataMember(Name = "virtualAddress")]
+        public string VirtualAddress { get; set; }
+
+        [DataMember(Name = "virtualSize")]
+        public ulong VirtualSize { get; set; }
+
+        [DataMember(Name = "rawSize")]
+        public ulong RawSize { get; set; }
+
+        [DataMember(Name = "rawPointer")]
+        public string RawPointer { get; set; }
+
+        [DataMember(Name = "characteristics")]
+        public string Characteristics { get; set; }
+    }
+
+    [DataContract]
+    public class ImportedModuleInfo
+    {
+        [DataMember(Name = "moduleName")]
+        public string ModuleName { get; set; }
+
+        [DataMember(Name = "functions")]
+        public List<ImportFunctionInfo> Functions { get; set; } = new List<ImportFunctionInfo>();
+
+        [DataMember(Name = "truncated")]
+        public bool Truncated { get; set; }
+    }
+
+    [DataContract]
+    public class ImportFunctionInfo
+    {
+        [DataMember(Name = "name")]
+        public string Name { get; set; }
+
+        [DataMember(Name = "ordinal")]
+        public ulong Ordinal { get; set; }
+
+        [DataMember(Name = "thunkRva")]
+        public string ThunkRva { get; set; }
+    }
+
+    [DataContract]
+    public class ExportInfo
+    {
+        [DataMember(Name = "name")]
+        public string Name { get; set; }
+
+        [DataMember(Name = "ordinal")]
+        public int Ordinal { get; set; }
+
+        [DataMember(Name = "rva")]
+        public string Rva { get; set; }
+
+        [DataMember(Name = "virtualAddress")]
+        public string VirtualAddress { get; set; }
+    }
+
+    [DataContract]
+    public class NativeContextResult
+    {
+        [DataMember(Name = "snapshotId")]
+        public string SnapshotId { get; set; }
+
+        [DataMember(Name = "capturedAt")]
+        public string CapturedAt { get; set; }
+
+        [DataMember(Name = "status")]
+        public DebugStatusResult Status { get; set; }
+
+        [DataMember(Name = "currentAddress")]
+        public NativeAddressInfo CurrentAddress { get; set; }
+
+        [DataMember(Name = "stackPointer")]
+        public NativeAddressInfo StackPointer { get; set; }
+
+        [DataMember(Name = "registers")]
+        public RegistersResult Registers { get; set; }
+
+        [DataMember(Name = "callstack")]
+        public CallStackResult Callstack { get; set; }
+
+        [DataMember(Name = "disassembly")]
+        public DisassemblyResult Disassembly { get; set; }
+
+        [DataMember(Name = "stackMemory")]
+        public MemoryResult StackMemory { get; set; }
+
+        [DataMember(Name = "modules")]
+        public ModulesResult Modules { get; set; }
+
+        [DataMember(Name = "partial")]
+        public bool Partial { get; set; }
+
+        [DataMember(Name = "error")]
+        public string Error { get; set; }
+    }
+
+    [DataContract]
+    public class NativeContinueResult
+    {
+        [DataMember(Name = "action")]
+        public string Action { get; set; } = "ContinueAndCaptureNative";
+
+        [DataMember(Name = "success")]
+        public bool Success { get; set; }
+
+        [DataMember(Name = "message")]
+        public string Message { get; set; }
+
+        [DataMember(Name = "waitTimeoutMs")]
+        public int WaitTimeoutMs { get; set; }
+
+        [DataMember(Name = "pollIntervalMs")]
+        public int PollIntervalMs { get; set; }
+
+        [DataMember(Name = "waitedMs")]
+        public int WaitedMs { get; set; }
+
+        [DataMember(Name = "issuedContinue")]
+        public bool IssuedContinue { get; set; }
+
+        [DataMember(Name = "timedOut")]
+        public bool TimedOut { get; set; }
+
+        [DataMember(Name = "breakDetected")]
+        public bool BreakDetected { get; set; }
+
+        [DataMember(Name = "status")]
+        public DebugStatusResult Status { get; set; }
+
+        [DataMember(Name = "context")]
+        public NativeContextResult Context { get; set; }
+    }
+
+    [DataContract]
+    public class ManagedAssemblyResult
+    {
+        [DataMember(Name = "capability")]
+        public string Capability { get; set; } = "managed_metadata_and_il_read_only";
+
+        [DataMember(Name = "assemblyPath")]
+        public string AssemblyPath { get; set; }
+
+        [DataMember(Name = "assemblyFullName")]
+        public string AssemblyFullName { get; set; }
+
+        [DataMember(Name = "moduleVersionId")]
+        public string ModuleVersionId { get; set; }
+
+        [DataMember(Name = "typeFilter")]
+        public string TypeFilter { get; set; }
+
+        [DataMember(Name = "totalTypeCount")]
+        public int TotalTypeCount { get; set; }
+
+        [DataMember(Name = "matchedTypeCount")]
+        public int MatchedTypeCount { get; set; }
+
+        [DataMember(Name = "types")]
+        public List<ManagedTypeInfo> Types { get; set; } = new List<ManagedTypeInfo>();
+
+        [DataMember(Name = "partial")]
+        public bool Partial { get; set; }
+
+        [DataMember(Name = "error")]
+        public string Error { get; set; }
+    }
+
+    [DataContract]
+    public class ManagedTypeResult
+    {
+        [DataMember(Name = "capability")]
+        public string Capability { get; set; } = "managed_metadata_and_il_read_only";
+
+        [DataMember(Name = "assemblyPath")]
+        public string AssemblyPath { get; set; }
+
+        [DataMember(Name = "typeName")]
+        public string TypeName { get; set; }
+
+        [DataMember(Name = "type")]
+        public ManagedTypeInfo Type { get; set; }
+
+        [DataMember(Name = "error")]
+        public string Error { get; set; }
+    }
+
+    [DataContract]
+    public class ManagedTypeInfo
+    {
+        [DataMember(Name = "name")]
+        public string Name { get; set; }
+
+        [DataMember(Name = "fullName")]
+        public string FullName { get; set; }
+
+        [DataMember(Name = "namespaceName")]
+        public string NamespaceName { get; set; }
+
+        [DataMember(Name = "assemblyQualifiedName")]
+        public string AssemblyQualifiedName { get; set; }
+
+        [DataMember(Name = "baseType")]
+        public string BaseType { get; set; }
+
+        [DataMember(Name = "isPublic")]
+        public bool IsPublic { get; set; }
+
+        [DataMember(Name = "isInterface")]
+        public bool IsInterface { get; set; }
+
+        [DataMember(Name = "isEnum")]
+        public bool IsEnum { get; set; }
+
+        [DataMember(Name = "isValueType")]
+        public bool IsValueType { get; set; }
+
+        [DataMember(Name = "methods")]
+        public List<ManagedMethodInfo> Methods { get; set; } = new List<ManagedMethodInfo>();
+
+        [DataMember(Name = "partial")]
+        public bool Partial { get; set; }
+    }
+
+    [DataContract]
+    public class ManagedMethodInfo
+    {
+        [DataMember(Name = "name")]
+        public string Name { get; set; }
+
+        [DataMember(Name = "signature")]
+        public string Signature { get; set; }
+
+        [DataMember(Name = "declaringType")]
+        public string DeclaringType { get; set; }
+
+        [DataMember(Name = "returnType")]
+        public string ReturnType { get; set; }
+
+        [DataMember(Name = "metadataToken")]
+        public int MetadataToken { get; set; }
+
+        [DataMember(Name = "metadataTokenHex")]
+        public string MetadataTokenHex { get; set; }
+
+        [DataMember(Name = "isPublic")]
+        public bool IsPublic { get; set; }
+
+        [DataMember(Name = "isStatic")]
+        public bool IsStatic { get; set; }
+
+        [DataMember(Name = "isConstructor")]
+        public bool IsConstructor { get; set; }
+
+        [DataMember(Name = "parameters")]
+        public List<ManagedParameterInfo> Parameters { get; set; } = new List<ManagedParameterInfo>();
+    }
+
+    [DataContract]
+    public class ManagedParameterInfo
+    {
+        [DataMember(Name = "name")]
+        public string Name { get; set; }
+
+        [DataMember(Name = "type")]
+        public string Type { get; set; }
+
+        [DataMember(Name = "position")]
+        public int Position { get; set; }
+    }
+
+    [DataContract]
+    public class ManagedLocalInfo
+    {
+        [DataMember(Name = "index")]
+        public int Index { get; set; }
+
+        [DataMember(Name = "type")]
+        public string Type { get; set; }
+
+        [DataMember(Name = "isPinned")]
+        public bool IsPinned { get; set; }
+    }
+
+    [DataContract]
+    public class ManagedMethodIlResult
+    {
+        [DataMember(Name = "capability")]
+        public string Capability { get; set; } = "managed_metadata_and_il_read_only";
+
+        [DataMember(Name = "assemblyPath")]
+        public string AssemblyPath { get; set; }
+
+        [DataMember(Name = "typeName")]
+        public string TypeName { get; set; }
+
+        [DataMember(Name = "methodName")]
+        public string MethodName { get; set; }
+
+        [DataMember(Name = "overloadIndex")]
+        public int OverloadIndex { get; set; }
+
+        [DataMember(Name = "matchedOverloadCount")]
+        public int MatchedOverloadCount { get; set; }
+
+        [DataMember(Name = "method")]
+        public ManagedMethodInfo Method { get; set; }
+
+        [DataMember(Name = "locals")]
+        public List<ManagedLocalInfo> Locals { get; set; } = new List<ManagedLocalInfo>();
+
+        [DataMember(Name = "instructions")]
+        public List<ManagedIlInstructionInfo> Instructions { get; set; } = new List<ManagedIlInstructionInfo>();
+
+        [DataMember(Name = "totalInstructionCount")]
+        public int TotalInstructionCount { get; set; }
+
+        [DataMember(Name = "partial")]
+        public bool Partial { get; set; }
+
+        [DataMember(Name = "error")]
+        public string Error { get; set; }
+    }
+
+    [DataContract]
+    public class ManagedIlInstructionInfo
+    {
+        [DataMember(Name = "offset")]
+        public int Offset { get; set; }
+
+        [DataMember(Name = "offsetHex")]
+        public string OffsetHex { get; set; }
+
+        [DataMember(Name = "opcode")]
+        public string Opcode { get; set; }
+
+        [DataMember(Name = "operandType")]
+        public string OperandType { get; set; }
+
+        [DataMember(Name = "operand")]
+        public string Operand { get; set; }
+
+        [DataMember(Name = "token")]
+        public int Token { get; set; }
+
+        [DataMember(Name = "tokenHex")]
+        public string TokenHex { get; set; }
+
+        [DataMember(Name = "resolvedMember")]
+        public string ResolvedMember { get; set; }
+
+        [DataMember(Name = "branchTarget")]
+        public string BranchTarget { get; set; }
+
+        [DataMember(Name = "switchTargets")]
+        public List<string> SwitchTargets { get; set; }
+    }
+
+    [DataContract]
+    public class HybridContextResult
+    {
+        [DataMember(Name = "snapshotId")]
+        public string SnapshotId { get; set; }
+
+        [DataMember(Name = "capturedAt")]
+        public string CapturedAt { get; set; }
+
+        [DataMember(Name = "status")]
+        public DebugStatusResult Status { get; set; }
+
+        [DataMember(Name = "currentThreadId")]
+        public int CurrentThreadId { get; set; }
+
+        [DataMember(Name = "selectedStackFrameIndex")]
+        public int SelectedStackFrameIndex { get; set; }
+
+        [DataMember(Name = "nativeContext")]
+        public NativeContextResult NativeContext { get; set; }
+
+        [DataMember(Name = "threads")]
+        public ThreadsResult Threads { get; set; }
+
+        [DataMember(Name = "breakpoints")]
+        public BreakpointsResult Breakpoints { get; set; }
+
+        [DataMember(Name = "partial")]
+        public bool Partial { get; set; }
+
+        [DataMember(Name = "error")]
+        public string Error { get; set; }
+    }
+
+    [DataContract]
+    public class BreakpointCaptureResult
+    {
+        [DataMember(Name = "action")]
+        public string Action { get; set; } = "ContinueAndCaptureBreakpoint";
+
+        [DataMember(Name = "success")]
+        public bool Success { get; set; }
+
+        [DataMember(Name = "message")]
+        public string Message { get; set; }
+
+        [DataMember(Name = "waitTimeoutMs")]
+        public int WaitTimeoutMs { get; set; }
+
+        [DataMember(Name = "pollIntervalMs")]
+        public int PollIntervalMs { get; set; }
+
+        [DataMember(Name = "waitedMs")]
+        public int WaitedMs { get; set; }
+
+        [DataMember(Name = "issuedContinue")]
+        public bool IssuedContinue { get; set; }
+
+        [DataMember(Name = "timedOut")]
+        public bool TimedOut { get; set; }
+
+        [DataMember(Name = "breakDetected")]
+        public bool BreakDetected { get; set; }
+
+        [DataMember(Name = "stopReason")]
+        public string StopReason { get; set; }
+
+        [DataMember(Name = "status")]
+        public DebugStatusResult Status { get; set; }
+
+        [DataMember(Name = "continueResult")]
+        public ContinueAndWaitResult ContinueResult { get; set; }
+
+        [DataMember(Name = "breakpoints")]
+        public BreakpointsResult Breakpoints { get; set; }
+
+        [DataMember(Name = "hybridContext")]
+        public HybridContextResult HybridContext { get; set; }
+
+        [DataMember(Name = "hitAttributionStatus")]
+        public string HitAttributionStatus { get; set; } = "missing";
+
+        [DataMember(Name = "hitAttributionError")]
+        public string HitAttributionError { get; set; }
+
+        [DataMember(Name = "hitVerificationStatus")]
+        public string HitVerificationStatus { get; set; } = "not_checked";
+
+        [DataMember(Name = "hitVerificationMessage")]
+        public string HitVerificationMessage { get; set; }
+
+        [DataMember(Name = "hitBreakpoint")]
+        public BreakpointHitInfo HitBreakpoint { get; set; }
+    }
+
+    [DataContract]
+    public class BreakpointHitInfo
+    {
+        [DataMember(Name = "confidence")]
+        public string Confidence { get; set; }
+
+        [DataMember(Name = "reason")]
+        public string Reason { get; set; }
+
+        [DataMember(Name = "currentAddress")]
+        public NativeAddressInfo CurrentAddress { get; set; }
+
+        [DataMember(Name = "breakpoint")]
+        public BreakpointInfo Breakpoint { get; set; }
     }
 
     #endregion
@@ -862,6 +1486,12 @@ namespace VSDebuggerMCP.Protocol
         [DataMember(Name = "resolvedFunctionName")]
         public string ResolvedFunctionName { get; set; }
 
+        [DataMember(Name = "trackedAddress")]
+        public NativeAddressInfo TrackedAddress { get; set; }
+
+        [DataMember(Name = "trackedAddresses")]
+        public List<NativeAddressInfo> TrackedAddresses { get; set; } = new List<NativeAddressInfo>();
+
         [DataMember(Name = "bindingStatus")]
         public string BindingStatus { get; set; }
 
@@ -870,6 +1500,24 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "isBound")]
         public bool IsBound { get; set; }
+
+        [DataMember(Name = "bindingVerificationStatus")]
+        public string BindingVerificationStatus { get; set; }
+
+        [DataMember(Name = "bindingWarning")]
+        public string BindingWarning { get; set; }
+
+        [DataMember(Name = "isRelocated")]
+        public bool IsRelocated { get; set; }
+
+        [DataMember(Name = "nearbyProbeAttempted")]
+        public bool NearbyProbeAttempted { get; set; }
+
+        [DataMember(Name = "nearbyProbeSucceeded")]
+        public bool NearbyProbeSucceeded { get; set; }
+
+        [DataMember(Name = "optimizedCodeSuspected")]
+        public bool OptimizedCodeSuspected { get; set; }
 
         [DataMember(Name = "conditionApplied")]
         public bool ConditionApplied { get; set; }
@@ -887,8 +1535,17 @@ namespace VSDebuggerMCP.Protocol
         [DataMember(Name = "message")]
         public string Message { get; set; }
 
+        [DataMember(Name = "verificationStatus")]
+        public string VerificationStatus { get; set; }
+
+        [DataMember(Name = "verificationMessage")]
+        public string VerificationMessage { get; set; }
+
         [DataMember(Name = "breakpointInfo")]
         public BreakpointInfo BreakpointInfo { get; set; }
+
+        [DataMember(Name = "address")]
+        public NativeAddressInfo Address { get; set; }
     }
 
     #endregion
