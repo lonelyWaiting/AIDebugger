@@ -60,6 +60,8 @@ class RiderInstance:
         self.current_process = ""
         self.ide_name = ""
         self.ide_version = ""
+        self.connection_status = "ok"
+        self.last_error = ""
         
         if info:
             self.process_id = info.get("processId", 0)
@@ -71,6 +73,8 @@ class RiderInstance:
             self.current_process = info.get("currentProcess", "")
             self.ide_name = info.get("ideName", info.get("riderName", "Rider"))
             self.ide_version = info.get("ideVersion", info.get("riderVersion", ""))
+            self.connection_status = info.get("connectionStatus", self.connection_status)
+            self.last_error = info.get("lastError", self.last_error)
         
         # If process_id is still 0, try to extract from pipe name
         if self.process_id == 0 and pipe_name.startswith("AIDebuggerRider_"):
@@ -90,7 +94,9 @@ class RiderInstance:
             "debugMode": self.debug_mode,
             "currentProcess": self.current_process,
             "ideName": self.ide_name,
-            "ideVersion": self.ide_version
+            "ideVersion": self.ide_version,
+            "connectionStatus": self.connection_status,
+            "lastError": self.last_error
         }
     
     def __repr__(self):
@@ -551,8 +557,11 @@ class RiderBridge:
                 logger.warning(f"Failed to get info from {pipe_name}: {e}")
                 import traceback
                 logger.warning(f"Traceback: {traceback.format_exc()}")
-                # Still add instance with minimal info
-                instances.append(RiderInstance(pipe_name))
+                # Keep the pipe visible for diagnostics, but exclude it from auto-selection.
+                instances.append(RiderInstance(pipe_name, {
+                    "connectionStatus": "unreachable",
+                    "lastError": str(e),
+                }))
         
         return instances
     
@@ -561,15 +570,15 @@ class RiderBridge:
         Discover all available Rider instances.
         Returns list of RiderInstance objects with their current state.
         """
+        loop = asyncio.get_event_loop()
+        _, _, guard_timeout = self._compute_timeouts(DEFAULT_TIMEOUT)
+        instances = await asyncio.wait_for(
+            loop.run_in_executor(self._executor, self._sync_discover_instances),
+            timeout=guard_timeout,
+        )
         async with self._lock:
-            loop = asyncio.get_event_loop()
-            _, _, guard_timeout = self._compute_timeouts(DEFAULT_TIMEOUT)
-            instances = await asyncio.wait_for(
-                loop.run_in_executor(self._executor, self._sync_discover_instances),
-                timeout=guard_timeout,
-            )
             self._cached_instances = instances
-            return instances
+        return instances
     
     def select_instance(self, pipe_name: Optional[str] = None, process_id: Optional[int] = None):
         """
@@ -601,6 +610,10 @@ class RiderBridge:
         """
         if not instances:
             return None
+
+        instances = [i for i in instances if i.connection_status == "ok"]
+        if not instances:
+            return None
         
         # If only one instance, use it
         if len(instances) == 1:
@@ -622,6 +635,32 @@ class RiderBridge:
     def _sync_call(self, pipe_name: str, method: str, params: Optional[Dict[str, Any]], timeout: float) -> Any:
         """Synchronous call to the specified pipe."""
         return _sync_call_to_pipe(pipe_name, method, params, timeout=timeout)
+
+    async def call_pipe(self, pipe_name: str, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
+        """Call a method on a specific Rider pipe without reading mutable global selection."""
+        if not pipe_name:
+            raise RiderBridgeError("No Rider pipe selected")
+
+        request_timeout, sync_timeout, guard_timeout = self._compute_timeouts(timeout)
+        try:
+            loop = asyncio.get_event_loop()
+            future = loop.run_in_executor(
+                self._executor,
+                self._sync_call,
+                pipe_name,
+                method,
+                params,
+                sync_timeout,
+            )
+            return await asyncio.wait_for(future, timeout=guard_timeout)
+        except asyncio.TimeoutError:
+            raise RiderBridgeError(
+                f"Timeout waiting for response from Rider extension (method: {method}, timeout={request_timeout:.1f}s)"
+            )
+        except RiderBridgeError:
+            raise
+        except Exception as e:
+            raise RiderBridgeError(f"Error calling Rider extension: {e}")
     
     async def call(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
         """
@@ -641,61 +680,41 @@ class RiderBridge:
         Raises:
             RiderBridgeError: If communication fails or no suitable instance found
         """
+        _, _, guard_timeout = self._compute_timeouts(timeout)
         async with self._lock:
-            request_timeout, sync_timeout, guard_timeout = self._compute_timeouts(timeout)
             pipe_name = self._selected_pipe
-            
-            # If no specific instance selected, auto-discover and select
-            if pipe_name is None:
-                loop = asyncio.get_event_loop()
-                instances = await asyncio.wait_for(
-                    loop.run_in_executor(self._executor, self._sync_discover_instances),
-                    timeout=guard_timeout
-                )
+
+        # If no specific instance selected, auto-discover and select.
+        if pipe_name is None:
+            loop = asyncio.get_event_loop()
+            instances = await asyncio.wait_for(
+                loop.run_in_executor(self._executor, self._sync_discover_instances),
+                timeout=guard_timeout
+            )
+            async with self._lock:
                 self._cached_instances = instances
-                
-                if not instances:
-                    raise RiderBridgeError(
-                        "No Rider instances found. Please ensure:\n"
-                        "1. Rider is running\n"
-                        "2. AIDebuggerRider plugin is installed and enabled\n"
-                        "3. The plugin has loaded (may need to restart Rider)"
-                    )
-                
-                pipe_name = self._find_best_instance(instances)
-                
-                if pipe_name is None:
-                    # Multiple instances, can't auto-select
-                    instance_list = "\n".join([
-                        f"  - PID {i.process_id}: {i.solution_name} ({i.debug_mode})"
-                        for i in instances
-                    ])
-                    raise RiderBridgeError(
-                        f"Multiple Rider instances found. Please use 'list_ide_instances' to see all instances "
-                        f"and 'select_ide_instance' to choose one.\n\nAvailable instances:\n{instance_list}"
-                    )
-            
-            try:
-                # Run synchronous call in thread pool
-                loop = asyncio.get_event_loop()
-                future = loop.run_in_executor(
-                    self._executor,
-                    self._sync_call,
-                    pipe_name,
-                    method,
-                    params,
-                    sync_timeout,
-                )
-                result = await asyncio.wait_for(future, timeout=guard_timeout)
-                return result
-            except asyncio.TimeoutError:
+
+            if not instances:
                 raise RiderBridgeError(
-                    f"Timeout waiting for response from Rider extension (method: {method}, timeout={request_timeout:.1f}s)"
+                    "No Rider instances found. Please ensure:\n"
+                    "1. Rider is running\n"
+                    "2. AIDebuggerRider plugin is installed and enabled\n"
+                    "3. The plugin has loaded (may need to restart Rider)"
                 )
-            except RiderBridgeError:
-                raise
-            except Exception as e:
-                raise RiderBridgeError(f"Error calling Rider extension: {e}")
+
+            pipe_name = self._find_best_instance(instances)
+
+            if pipe_name is None:
+                instance_list = "\n".join([
+                    f"  - PID {i.process_id}: {i.solution_name} ({i.debug_mode})"
+                    for i in instances
+                ])
+                raise RiderBridgeError(
+                    f"Multiple Rider instances found. Please use 'list_ide_instances' to see all instances "
+                    f"and 'select_ide_instance' to choose one.\n\nAvailable instances:\n{instance_list}"
+                )
+
+        return await self.call_pipe(pipe_name, method, params, timeout)
 
 
 # Global bridge instance
@@ -724,6 +743,12 @@ async def call(method: str, params: Optional[Dict[str, Any]] = None, timeout: fl
     """
     bridge = get_bridge()
     return await bridge.call(method, params, timeout)
+
+
+async def call_pipe(pipe_name: str, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
+    """Convenience function to call a specific Rider pipe without using global selection."""
+    bridge = get_bridge()
+    return await bridge.call_pipe(pipe_name, method, params, timeout)
 
 
 async def discover_instances() -> List[RiderInstance]:
@@ -759,7 +784,7 @@ async def is_rider_available() -> bool:
     """Check if any Rider plugin instance is available."""
     try:
         instances = await discover_instances()
-        return len(instances) > 0
+        return any(i.connection_status == "ok" for i in instances)
     except:
         return False
 

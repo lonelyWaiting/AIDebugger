@@ -28,6 +28,8 @@ class IDEInstance:
         self.current_process = instance.current_process
         self.ide_version = getattr(instance, "ide_version", "") or getattr(instance, "vs_version", "")
         self.ide_name = getattr(instance, "ide_name", "") or ("Visual Studio" if ide == "vs" else "Rider")
+        self.connection_status = getattr(instance, "connection_status", "ok")
+        self.last_error = getattr(instance, "last_error", "")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -42,6 +44,8 @@ class IDEInstance:
             "currentProcess": self.current_process,
             "ideName": self.ide_name,
             "ideVersion": self.ide_version,
+            "connectionStatus": self.connection_status,
+            "lastError": self.last_error,
         }
 
     def __repr__(self) -> str:
@@ -90,12 +94,29 @@ class IDEBridge:
             return candidates, preferred
         return instances, None
 
-    async def discover_instances(self) -> List[IDEInstance]:
-        vs_instances = await vs_bridge.discover_instances()
-        rider_instances = await rider_bridge.discover_instances()
+    async def discover_instances(self, preferred_ide: Optional[str] = None) -> List[IDEInstance]:
+        preferred = self._resolve_preferred_ide(preferred_ide)
         result: List[IDEInstance] = []
-        result.extend([IDEInstance("vs", inst) for inst in vs_instances])
-        result.extend([IDEInstance("rider", inst) for inst in rider_instances])
+        tasks = []
+        labels = []
+
+        if preferred in (None, "vs"):
+            tasks.append(vs_bridge.discover_instances())
+            labels.append("vs")
+        if preferred in (None, "rider"):
+            tasks.append(rider_bridge.discover_instances())
+            labels.append("rider")
+
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        errors = []
+        for label, outcome in zip(labels, outcomes):
+            if isinstance(outcome, Exception):
+                errors.append(f"{label}: {outcome}")
+                continue
+            result.extend([IDEInstance(label, inst) for inst in outcome])
+
+        if not result and errors:
+            raise IDEBridgeError("IDE discovery failed: " + "; ".join(errors))
         return result
 
     def select_instance(self, ide: Optional[str] = None, process_id: Optional[int] = None, pipe_name: Optional[str] = None):
@@ -106,6 +127,12 @@ class IDEBridge:
                 f"Preferred IDE '{self._preferred_ide}' is locked for this MCP server. "
                 f"Cannot select '{ide}'."
             )
+        if pipe_name is None and process_id is not None:
+            if ide == "vs":
+                pipe_name = f"AIDebuggerVS_{process_id}"
+            elif ide == "rider":
+                pipe_name = f"AIDebuggerRider_{process_id}"
+
         self._selected_ide = ide
         self._selected_pipe = pipe_name
 
@@ -127,60 +154,94 @@ class IDEBridge:
 
     def _is_stale_selected_instance_error(self, error: Exception) -> bool:
         message = str(error).lower()
+        non_stale_markers = (
+            "access denied",
+            "permission",
+            "running as admin",
+        )
+        if any(marker in message for marker in non_stale_markers):
+            return False
+
         stale_markers = (
-            "not found",
             "broken pipe",
             "no data received from pipe",
             "empty response received from pipe",
+            "pipe disconnected",
+            "timeout waiting to connect",
+            "cannot find the file specified",
+            "failed to connect",
             "error: 109",
+            "error: 2",
+            "error: 232",
         )
         return any(marker in message for marker in stale_markers)
 
     async def call(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 10.0) -> Any:
         async with self._lock:
-            if self._selected_ide == "vs":
-                try:
-                    return await vs_bridge.call(method, params, timeout)
-                except vs_bridge.VSBridgeError as e:
-                    if not self._is_stale_selected_instance_error(e):
-                        raise IDEBridgeError(str(e))
-                    self.clear_selection()
-            elif self._selected_ide == "rider":
-                try:
-                    return await rider_bridge.call(method, params, timeout)
-                except rider_bridge.RiderBridgeError as e:
-                    if not self._is_stale_selected_instance_error(e):
-                        raise IDEBridgeError(str(e))
-                    self.clear_selection()
+            selected_ide = self._selected_ide
+            selected_pipe = self._selected_pipe
 
-            instances = await self.discover_instances()
-            if not instances:
-                raise IDEBridgeError(
-                    "No IDE instances found. Please ensure VS or Rider is running with the MCP plugin installed."
-                )
-
-            candidates, preferred = self.get_candidate_instances(instances)
-            selected = self._auto_select_core(candidates)
-            if selected is None:
-                instance_list = "\n".join([
-                    f"  - {i.ide.upper()} PID {i.process_id}: {i.solution_name} ({i.debug_mode})"
-                    for i in candidates
-                ])
-                scope = f"{preferred.upper()} " if preferred else ""
-                raise IDEBridgeError(
-                    f"Multiple {scope}IDE instances found. Please use 'list_ide_instances' to see all instances "
-                    "and 'select_ide_instance' to choose one.\n\nAvailable instances:\n" + instance_list
-                )
-
-            self.select_instance(selected.ide, process_id=selected.process_id, pipe_name=selected.pipe_name)
+        if selected_ide == "vs":
             try:
-                if selected.ide == "vs":
-                    return await vs_bridge.call(method, params, timeout)
+                if selected_pipe:
+                    return await vs_bridge.call_pipe(selected_pipe, method, params, timeout)
+                return await vs_bridge.call(method, params, timeout)
+            except vs_bridge.VSBridgeError as e:
+                if not self._is_stale_selected_instance_error(e):
+                    raise IDEBridgeError(str(e))
+                async with self._lock:
+                    if self._selected_ide == "vs" and self._selected_pipe == selected_pipe:
+                        self.clear_selection()
+        elif selected_ide == "rider":
+            try:
+                if selected_pipe:
+                    return await rider_bridge.call_pipe(selected_pipe, method, params, timeout)
                 return await rider_bridge.call(method, params, timeout)
-            except (vs_bridge.VSBridgeError, rider_bridge.RiderBridgeError) as e:
-                raise IDEBridgeError(str(e))
+            except rider_bridge.RiderBridgeError as e:
+                if not self._is_stale_selected_instance_error(e):
+                    raise IDEBridgeError(str(e))
+                async with self._lock:
+                    if self._selected_ide == "rider" and self._selected_pipe == selected_pipe:
+                        self.clear_selection()
+
+        instances = await self.discover_instances()
+        if not instances:
+            raise IDEBridgeError(
+                "No IDE instances found. Please ensure VS or Rider is running with the MCP plugin installed."
+            )
+
+        candidates, preferred = self.get_candidate_instances(instances)
+        selected = self._auto_select_core(candidates)
+        if selected is None:
+            instance_list = "\n".join([
+                f"  - {i.ide.upper()} PID {i.process_id}: {i.solution_name} ({i.debug_mode})"
+                for i in candidates
+            ])
+            scope = f"{preferred.upper()} " if preferred else ""
+            raise IDEBridgeError(
+                f"Multiple {scope}IDE instances found. Please use 'list_ide_instances' to see all instances "
+                "and 'select_ide_instance' to choose one.\n\nAvailable instances:\n" + instance_list
+            )
+
+        async with self._lock:
+            self.select_instance(selected.ide, process_id=selected.process_id, pipe_name=selected.pipe_name)
+
+        try:
+            if selected.ide == "vs":
+                return await vs_bridge.call_pipe(selected.pipe_name, method, params, timeout)
+            return await rider_bridge.call_pipe(selected.pipe_name, method, params, timeout)
+        except (vs_bridge.VSBridgeError, rider_bridge.RiderBridgeError) as e:
+            if self._is_stale_selected_instance_error(e):
+                async with self._lock:
+                    if self._selected_ide == selected.ide and self._selected_pipe == selected.pipe_name:
+                        self.clear_selection()
+            raise IDEBridgeError(str(e))
 
     def _auto_select_core(self, instances: List[IDEInstance]) -> Optional[IDEInstance]:
+        instances = [i for i in instances if i.connection_status == "ok"]
+        if not instances:
+            return None
+
         if len(instances) == 1:
             return instances[0]
 
@@ -217,9 +278,9 @@ async def call(method: str, params: Optional[Dict[str, Any]] = None, timeout: fl
     return await bridge.call(method, params, timeout)
 
 
-async def discover_instances() -> List[IDEInstance]:
+async def discover_instances(preferred_ide: Optional[str] = None) -> List[IDEInstance]:
     bridge = get_bridge()
-    return await bridge.discover_instances()
+    return await bridge.discover_instances(preferred_ide=preferred_ide)
 
 
 def select_instance(ide: Optional[str] = None, process_id: Optional[int] = None, pipe_name: Optional[str] = None):
@@ -235,6 +296,6 @@ def clear_selection():
 async def is_any_available() -> bool:
     try:
         instances = await discover_instances()
-        return len(instances) > 0
+        return any(i.connection_status == "ok" for i in instances)
     except Exception:
         return False

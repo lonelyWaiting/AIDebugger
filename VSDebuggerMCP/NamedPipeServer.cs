@@ -649,7 +649,9 @@ namespace VSDebuggerMCP
                         string pattern = GetParam<string>(request.Params, "pattern", "");
                         int maxResults = GetParam<int>(request.Params, "maxResults", 100);
                         int searchSize = GetParam<int>(request.Params, "searchSize", 0x10000);
-                        return _debuggerService.SearchMemory(startAddress, pattern, maxResults, searchSize);
+                        string patternFormat = GetParam<string>(request.Params, "patternFormat", "auto");
+                        long startOffset = GetParam<long>(request.Params, "startOffset", 0);
+                        return _debuggerService.SearchMemory(startAddress, pattern, maxResults, searchSize, patternFormat, startOffset);
                     }
 
                 // Stack Frame Navigation
@@ -707,6 +709,10 @@ namespace VSDebuggerMCP
                 if (typeof(T) == typeof(int))
                 {
                     return (T)(object)Convert.ToInt32(value);
+                }
+                if (typeof(T) == typeof(long))
+                {
+                    return (T)(object)Convert.ToInt64(value);
                 }
                 if (typeof(T) == typeof(bool))
                 {

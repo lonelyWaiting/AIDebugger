@@ -26,7 +26,6 @@ namespace VSDebuggerMCP
         private readonly Dictionary<string, DateTime> _sourceFileByClassMissCache = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         private string _sourceLookupSolutionKey = string.Empty;
         private int _selectedStackFrameIndex;
-        private System.Threading.Tasks.Task _lastDumpDebugStartTask;
         private string _activeDumpFilePath;
         private const int SnapshotMaxAttempts = 2;
         private const int SnapshotRetryDelayMs = 40;
@@ -48,6 +47,8 @@ namespace VSDebuggerMCP
         private const int BreakpointBindWaitMs = 250;
         private const int BreakpointBindPollMs = 25;
         private const int BreakpointProbeMaxDistance = 25;
+        private const int DumpDebugStartTimeoutMs = 3000;
+        private const int DumpDebugStartPollMs = 100;
         private static readonly TimeSpan SourceLookupMissCacheTtl = TimeSpan.FromSeconds(30);
 
         private const uint PROCESS_VM_READ = 0x0010;
@@ -275,7 +276,7 @@ namespace VSDebuggerMCP
                 var bestEffort = new CallStackResult
                 {
                     SnapshotStatus = "unavailable",
-                    Capability = "full_frame_metadata"
+                    Capability = "best_effort_frame_metadata"
                 };
 
                 for (int attempt = 1; attempt <= SnapshotMaxAttempts; attempt++)
@@ -331,7 +332,7 @@ namespace VSDebuggerMCP
             ThreadHelper.ThrowIfNotOnUIThread();
             var result = new CallStackResult
             {
-                Capability = "full_frame_metadata"
+                Capability = "best_effort_frame_metadata"
             };
 
             var currentThread = debugger.CurrentThread;
@@ -631,7 +632,7 @@ namespace VSDebuggerMCP
                 var bestEffort = new ThreadsResult
                 {
                     SnapshotStatus = "unavailable",
-                    Capability = "full_thread_metadata"
+                    Capability = "best_effort_thread_metadata"
                 };
 
                 for (int attempt = 1; attempt <= SnapshotMaxAttempts; attempt++)
@@ -685,7 +686,7 @@ namespace VSDebuggerMCP
             ThreadHelper.ThrowIfNotOnUIThread();
             var result = new ThreadsResult
             {
-                Capability = "full_thread_metadata"
+                Capability = "best_effort_thread_metadata"
             };
             var currentThread = debugger.CurrentThread;
             result.CurrentThreadId = currentThread?.ID ?? 0;
@@ -954,7 +955,7 @@ namespace VSDebuggerMCP
             ThreadHelper.ThrowIfNotOnUIThread();
             var result = new ModulesResult
             {
-                Capability = "multi_source"
+                Capability = "multi_source_best_effort"
             };
 
             if (debugger == null || debugger.CurrentMode == dbgDebugMode.dbgDesignMode)
@@ -1566,7 +1567,7 @@ namespace VSDebuggerMCP
             var result = new ExceptionResult
             {
                 HasException = false,
-                Capability = "full_exception_details"
+                Capability = "managed_exception_best_effort"
             };
 
             if (debugger == null || debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
@@ -1602,7 +1603,7 @@ namespace VSDebuggerMCP
                             StackTrace = GetExpressionMemberValue(innerExpr, "StackTrace"),
                             Source = GetExpressionMemberValue(innerExpr, "Source"),
                             HResult = GetExpressionMemberValue(innerExpr, "HResult"),
-                            Capability = "full_exception_details"
+                            Capability = "managed_exception_best_effort"
                         };
                         currentResult.InnerException = innerResult;
                         currentResult = innerResult;
@@ -3457,7 +3458,7 @@ namespace VSDebuggerMCP
                 componentErrors.Add($"callstack: {ex.Message}");
                 bundle.Callstack = new CallStackResult
                 {
-                    Capability = "full_frame_metadata",
+                    Capability = "best_effort_frame_metadata",
                     SnapshotStatus = "unavailable"
                 };
             }
@@ -3494,7 +3495,7 @@ namespace VSDebuggerMCP
                     componentErrors.Add($"exception: {ex.Message}");
                     bundle.Exception = new ExceptionResult
                     {
-                        Capability = "full_exception_details",
+                        Capability = "managed_exception_best_effort",
                         HasException = false
                     };
                 }
@@ -3519,7 +3520,7 @@ namespace VSDebuggerMCP
                     componentErrors.Add($"threads: {ex.Message}");
                     bundle.Threads = new ThreadsResult
                     {
-                        Capability = "full_thread_metadata",
+                        Capability = "best_effort_thread_metadata",
                         SnapshotStatus = "unavailable"
                     };
                 }
@@ -3540,7 +3541,7 @@ namespace VSDebuggerMCP
                     componentErrors.Add($"modules: {ex.Message}");
                     bundle.Modules = new ModulesResult
                     {
-                        Capability = "multi_source",
+                        Capability = "multi_source_best_effort",
                         Error = ex.Message
                     };
                 }
@@ -3561,7 +3562,7 @@ namespace VSDebuggerMCP
                     componentErrors.Add($"registers: {ex.Message}");
                     bundle.Registers = new RegistersResult
                     {
-                        Capability = "general_segment_sse",
+                        Capability = "x86_x64_general_segment_sse_best_effort",
                         Error = ex.Message
                     };
                 }
@@ -3889,6 +3890,11 @@ namespace VSDebuggerMCP
                     }
 
                     string normalizedExe = System.IO.Path.GetFullPath(executablePath);
+                    if (IsDumpFilePath(normalizedExe))
+                    {
+                        return StartDumpDebuggingFromPath(debugger, result, normalizedExe);
+                    }
+
                     if (!System.IO.File.Exists(normalizedExe))
                     {
                         result.Success = false;
@@ -3967,6 +3973,47 @@ namespace VSDebuggerMCP
             }, HeavyMainThreadTimeoutMs);
         }
 
+        private ProcessDebugResult StartDumpDebuggingFromPath(Debugger5 debugger, ProcessDebugResult result, string dumpPath)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            result.ExecutablePath = dumpPath;
+
+            if (!System.IO.File.Exists(dumpPath))
+            {
+                result.Success = false;
+                result.Message = $"Dump file not found: {dumpPath}";
+                result.Status = BuildDebugStatus(debugger);
+                return result;
+            }
+
+            try
+            {
+                _activeDumpFilePath = dumpPath;
+                _dte.ItemOperations.OpenFile(dumpPath);
+                if (!TryStartActiveDumpNativeOnlyDebugging(out string startError))
+                {
+                    _activeDumpFilePath = null;
+                    result.Success = false;
+                    result.Message = startError;
+                    result.Status = BuildDebugStatus(debugger);
+                    return result;
+                }
+
+                result.Success = true;
+                result.Message = "Requested Visual Studio to start native debugging for dump file";
+                result.Status = BuildDebugStatus(debugger);
+            }
+            catch (Exception ex)
+            {
+                _activeDumpFilePath = null;
+                result.Success = false;
+                result.Message = ex.Message;
+                result.Status = BuildDebugStatus(debugger);
+            }
+
+            return result;
+        }
+
         private bool TryStartActiveDumpDebugging(Debugger5 debugger, ProcessDebugResult result)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
@@ -3992,13 +4039,22 @@ namespace VSDebuggerMCP
 
             try
             {
-                QueueActiveDumpNativeOnlyDebugging();
+                if (!TryStartActiveDumpNativeOnlyDebugging(out string startError))
+                {
+                    _activeDumpFilePath = null;
+                    result.Success = false;
+                    result.Message = startError;
+                    result.Status = BuildDebugStatus(debugger);
+                    return true;
+                }
+
                 result.Success = true;
                 result.Message = "Requested Visual Studio to start native debugging for active dump file";
                 result.Status = BuildDebugStatus(debugger);
             }
             catch (Exception ex)
             {
+                _activeDumpFilePath = null;
                 result.Success = false;
                 result.Message = ex.Message;
                 result.Status = BuildDebugStatus(debugger);
@@ -4007,24 +4063,55 @@ namespace VSDebuggerMCP
             return true;
         }
 
-        private void QueueActiveDumpNativeOnlyDebugging()
+        private bool TryStartActiveDumpNativeOnlyDebugging(out string error)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            _lastDumpDebugStartTask = System.Threading.Tasks.Task.Run(async () =>
+            error = null;
+
+            try
             {
-                await System.Threading.Tasks.Task.Delay(100);
-                try
+                var result = ThreadHelper.JoinableTaskFactory.Run(async () =>
                 {
-                    if (!TryInvokeVisualStudioControl("Debug with Native Only"))
+                    Exception lastException = null;
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    while (sw.ElapsedMilliseconds < DumpDebugStartTimeoutMs)
                     {
-                        _log("Failed to find Visual Studio control: Debug with Native Only");
+                        await System.Threading.Tasks.Task.Delay(DumpDebugStartPollMs);
+                        await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                        try
+                        {
+                            if (TryInvokeVisualStudioControl("Debug with Native Only"))
+                            {
+                                return Tuple.Create(true, (string)null);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            lastException = ex;
+                        }
                     }
-                }
-                catch (Exception ex)
-                {
-                    _log($"Failed to invoke Debug with Native Only: {ex.Message}");
-                }
-            });
+
+                    string message = lastException != null
+                        ? $"Failed to invoke Debug with Native Only: {lastException.Message}"
+                        : "Failed to find Visual Studio control: Debug with Native Only";
+                    _log(message);
+                    return Tuple.Create(false, message);
+                });
+                error = result.Item2;
+                return result.Item1;
+            }
+            catch (AggregateException ae)
+            {
+                error = ae.InnerException?.Message ?? ae.Message;
+                _log($"Failed to invoke Debug with Native Only: {error}");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                _log($"Failed to invoke Debug with Native Only: {error}");
+                return false;
+            }
         }
 
         private bool TryInvokeVisualStudioControl(string automationName)
@@ -5719,7 +5806,7 @@ namespace VSDebuggerMCP
             ThreadHelper.ThrowIfNotOnUIThread();
             var result = new RegistersResult
             {
-                Capability = "general_segment_sse",
+                Capability = "x86_x64_general_segment_sse_best_effort",
                 AvailableCategories = new List<string> { "General Purpose", "Instruction Pointer", "Stack", "Flags", "Segment", "SSE" }
             };
 
@@ -5897,7 +5984,7 @@ namespace VSDebuggerMCP
         /// Performance: Reads memory in chunks instead of byte-by-byte, reducing IPC calls from O(n) to O(n/4).
         /// Automatically handles thread context issues by trying to switch to user code thread if needed.
         /// </summary>
-        public MemorySearchResult SearchMemory(string startAddress, string pattern, int maxResults = 100, int searchSize = 0x10000)
+        public MemorySearchResult SearchMemory(string startAddress, string pattern, int maxResults = 100, int searchSize = 0x10000, string patternFormat = "auto", long startOffset = 0)
         {
             return ExecuteOnMainThread(() =>
             {
@@ -5926,7 +6013,9 @@ namespace VSDebuggerMCP
                             startAddress,
                             pattern,
                             maxResults,
-                            searchSize);
+                            searchSize,
+                            patternFormat,
+                            startOffset);
                         string tokenAfter = CreateDebuggerSnapshotToken(debugger);
                         bool stable = !string.IsNullOrEmpty(tokenBefore) && tokenBefore == tokenAfter;
 
@@ -5972,7 +6061,9 @@ namespace VSDebuggerMCP
             string startAddress,
             string pattern,
             int maxResults,
-            int searchSize)
+            int searchSize,
+            string patternFormat,
+            long startOffset)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             var result = CreateUnavailableMemorySearchResult(pattern, searchSize);
@@ -5983,7 +6074,7 @@ namespace VSDebuggerMCP
 
             try
             {
-                result = ExecuteSearchMemory(debugger, startAddress, pattern, maxResults, searchSize, result);
+                result = ExecuteSearchMemory(debugger, startAddress, pattern, maxResults, searchSize, patternFormat, startOffset, result);
 
                 // If first attempt could not obtain bytes, try switching to a user-code thread once.
                 if (result.BytesSearched == 0)
@@ -6001,6 +6092,8 @@ namespace VSDebuggerMCP
                             pattern,
                             maxResults,
                             searchSize,
+                            patternFormat,
+                            startOffset,
                             CreateUnavailableMemorySearchResult(pattern, searchSize));
                     }
                 }
@@ -6033,7 +6126,7 @@ namespace VSDebuggerMCP
         /// <summary>
         /// Internal method to execute memory search.
         /// </summary>
-        private MemorySearchResult ExecuteSearchMemory(Debugger5 debugger, string startAddress, string pattern, int maxResults, int searchSize, MemorySearchResult result)
+        private MemorySearchResult ExecuteSearchMemory(Debugger5 debugger, string startAddress, string pattern, int maxResults, int searchSize, string patternFormat, long startOffset, MemorySearchResult result)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             int requestedBytes = Math.Max(1, Math.Min(searchSize, 0x100000));
@@ -6046,16 +6139,27 @@ namespace VSDebuggerMCP
             result.Partial = false;
             result.Status = "unavailable";
 
+            if (string.IsNullOrWhiteSpace(pattern))
+            {
+                result.Error = "Pattern cannot be empty";
+                return result;
+            }
+
             // Parse pattern (hex bytes like "4D 5A" or string)
             byte[] patternBytes;
-            // Hex pattern: contains spaces between byte pairs (e.g., "4D 5A 90 00")
-            // or is exactly 2 hex chars (a single byte like "4D")
-            if (pattern.Contains(" ") && pattern.Replace(" ", "").All(c => "0123456789ABCDEFabcdef".Contains(c)))
+            string normalizedPatternFormat = (patternFormat ?? "auto").Trim().ToLowerInvariant();
+            bool forceHex = normalizedPatternFormat == "hex" || normalizedPatternFormat == "bytes";
+            bool forceText = normalizedPatternFormat == "text" || normalizedPatternFormat == "ascii" || normalizedPatternFormat == "string";
+            bool looksLikeSpacedHex = pattern.Contains(" ") &&
+                pattern.Replace(" ", "").All(c => "0123456789ABCDEFabcdef".Contains(c));
+
+            if (forceHex || (!forceText && looksLikeSpacedHex))
             {
-                // Space-separated hex bytes
+                // Hex bytes. In auto mode this requires spaces, so "41" remains literal ASCII text.
                 var hexBytes = pattern.Replace(" ", "").Trim();
                 if (hexBytes.Length % 2 != 0)
                 {
+                    result.Error = "Hex pattern must contain complete byte pairs";
                     return result;
                 }
                 patternBytes = Enumerable.Range(0, hexBytes.Length / 2)
@@ -6064,7 +6168,7 @@ namespace VSDebuggerMCP
             }
             else
             {
-                // String pattern (ASCII) — treat non-space-separated input as literal text
+                // String pattern (ASCII): treat non-space-separated input as literal text.
                 patternBytes = System.Text.Encoding.ASCII.GetBytes(pattern);
             }
 
@@ -6083,6 +6187,16 @@ namespace VSDebuggerMCP
             }
 
             ulong addr = ParseAddress(addrExpr.Value);
+            ulong byteOffset = startOffset > 0 ? (ulong)startOffset : 0UL;
+            if (byteOffset > 0)
+            {
+                if (addr > ulong.MaxValue - byteOffset)
+                {
+                    result.Error = "Start offset overflows resolved address";
+                    return result;
+                }
+                addr += byteOffset;
+            }
 
             byte[] memoryBlock = ReadProcessMemoryContiguous(debugger, addr, requestedBytes);
             if ((memoryBlock == null || memoryBlock.Length == 0) && requestedBytes > 0)
@@ -6104,12 +6218,13 @@ namespace VSDebuggerMCP
             // Search for pattern in the local memory block
             int found = 0;
             int searchLimit = memoryBlock.Length - patternBytes.Length + 1;
+            int nextSearchOffset = -1;
 
             // Determine if 64-bit once, not in the loop
             var ripExpr = debugger.GetExpression("@rip");
             bool is64Bit = ripExpr != null && ripExpr.IsValidValue;
 
-            for (int i = 0; i < searchLimit && found < maxResults; i++)
+            for (int i = 0; i < searchLimit; i++)
             {
                 bool match = true;
 
@@ -6131,10 +6246,24 @@ namespace VSDebuggerMCP
 
                     result.Matches.Add(matchAddr);
                     found++;
+                    if (found >= maxResults)
+                    {
+                        nextSearchOffset = i + 1;
+                        break;
+                    }
                 }
             }
 
             result.TotalFound = found;
+            if (nextSearchOffset >= 0 && nextSearchOffset < searchLimit)
+            {
+                ulong nextAddress = addr + (ulong)nextSearchOffset;
+                result.Truncated = true;
+                result.Partial = true;
+                result.Status = "partial";
+                result.NextStartAddress = is64Bit ? $"0x{nextAddress:X16}" : $"0x{nextAddress:X8}";
+                result.Error = "Search stopped after reaching maxResults";
+            }
 
             return result;
         }
@@ -6692,7 +6821,7 @@ namespace VSDebuggerMCP
                         {
                             // The debugger.CurrentStackFrame is the authoritative source for the execution line.
                             // We attempt to read it via the context below (Method 3 fallback).
-                            // ActiveDocument cursor position is NOT reliable — user may have scrolled/clicked elsewhere.
+                            // ActiveDocument cursor position is NOT reliable 鈥?user may have scrolled/clicked elsewhere.
                         }
                     }
                     catch (Exception ex)

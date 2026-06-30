@@ -59,6 +59,8 @@ class VSInstance:
         self.debug_mode = ""
         self.current_process = ""
         self.vs_version = ""
+        self.connection_status = "ok"
+        self.last_error = ""
         
         if info:
             self.process_id = info.get("processId", 0)
@@ -69,6 +71,8 @@ class VSInstance:
             self.debug_mode = info.get("debugMode", "")
             self.current_process = info.get("currentProcess", "")
             self.vs_version = info.get("vsVersion", "")
+            self.connection_status = info.get("connectionStatus", self.connection_status)
+            self.last_error = info.get("lastError", self.last_error)
         
         # If process_id is still 0, try to extract from pipe name
         if self.process_id == 0 and pipe_name.startswith("AIDebuggerVS_"):
@@ -87,7 +91,9 @@ class VSInstance:
             "isPaused": self.is_paused,
             "debugMode": self.debug_mode,
             "currentProcess": self.current_process,
-            "vsVersion": self.vs_version
+            "vsVersion": self.vs_version,
+            "connectionStatus": self.connection_status,
+            "lastError": self.last_error
         }
     
     def __repr__(self):
@@ -548,8 +554,11 @@ class VSBridge:
                 logger.warning(f"Failed to get info from {pipe_name}: {e}")
                 import traceback
                 logger.warning(f"Traceback: {traceback.format_exc()}")
-                # Still add instance with minimal info
-                instances.append(VSInstance(pipe_name))
+                # Keep the pipe visible for diagnostics, but exclude it from auto-selection.
+                instances.append(VSInstance(pipe_name, {
+                    "connectionStatus": "unreachable",
+                    "lastError": str(e),
+                }))
         
         return instances
     
@@ -558,15 +567,15 @@ class VSBridge:
         Discover all available VS instances.
         Returns list of VSInstance objects with their current state.
         """
+        loop = asyncio.get_event_loop()
+        _, _, guard_timeout = self._compute_timeouts(DEFAULT_TIMEOUT)
+        instances = await asyncio.wait_for(
+            loop.run_in_executor(self._executor, self._sync_discover_instances),
+            timeout=guard_timeout,
+        )
         async with self._lock:
-            loop = asyncio.get_event_loop()
-            _, _, guard_timeout = self._compute_timeouts(DEFAULT_TIMEOUT)
-            instances = await asyncio.wait_for(
-                loop.run_in_executor(self._executor, self._sync_discover_instances),
-                timeout=guard_timeout,
-            )
             self._cached_instances = instances
-            return instances
+        return instances
     
     def select_instance(self, pipe_name: Optional[str] = None, process_id: Optional[int] = None):
         """
@@ -598,6 +607,10 @@ class VSBridge:
         """
         if not instances:
             return None
+
+        instances = [i for i in instances if i.connection_status == "ok"]
+        if not instances:
+            return None
         
         # If only one instance, use it
         if len(instances) == 1:
@@ -619,6 +632,32 @@ class VSBridge:
     def _sync_call(self, pipe_name: str, method: str, params: Optional[Dict[str, Any]], timeout: float) -> Any:
         """Synchronous call to the specified pipe."""
         return _sync_call_to_pipe(pipe_name, method, params, timeout=timeout)
+
+    async def call_pipe(self, pipe_name: str, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
+        """Call a method on a specific VS pipe without reading mutable global selection."""
+        if not pipe_name:
+            raise VSBridgeError("No Visual Studio pipe selected")
+
+        request_timeout, sync_timeout, guard_timeout = self._compute_timeouts(timeout)
+        try:
+            loop = asyncio.get_event_loop()
+            future = loop.run_in_executor(
+                self._executor,
+                self._sync_call,
+                pipe_name,
+                method,
+                params,
+                sync_timeout,
+            )
+            return await asyncio.wait_for(future, timeout=guard_timeout)
+        except asyncio.TimeoutError:
+            raise VSBridgeError(
+                f"Timeout waiting for response from VS extension (method: {method}, timeout={request_timeout:.1f}s)"
+            )
+        except VSBridgeError:
+            raise
+        except Exception as e:
+            raise VSBridgeError(f"Error calling VS extension: {e}")
     
     async def call(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
         """
@@ -638,61 +677,43 @@ class VSBridge:
         Raises:
             VSBridgeError: If communication fails or no suitable instance found
         """
+        request_timeout, sync_timeout, guard_timeout = self._compute_timeouts(timeout)
         async with self._lock:
-            request_timeout, sync_timeout, guard_timeout = self._compute_timeouts(timeout)
             pipe_name = self._selected_pipe
-            
-            # If no specific instance selected, auto-discover and select
-            if pipe_name is None:
-                loop = asyncio.get_event_loop()
-                instances = await asyncio.wait_for(
-                    loop.run_in_executor(self._executor, self._sync_discover_instances),
-                    timeout=guard_timeout
-                )
+
+        # If no specific instance selected, auto-discover and select.
+        if pipe_name is None:
+            loop = asyncio.get_event_loop()
+            instances = await asyncio.wait_for(
+                loop.run_in_executor(self._executor, self._sync_discover_instances),
+                timeout=guard_timeout
+            )
+            async with self._lock:
                 self._cached_instances = instances
-                
-                if not instances:
-                    raise VSBridgeError(
-                        "No Visual Studio instances found. Please ensure:\n"
-                        "1. Visual Studio is running\n"
-                        "2. AIDebuggerVS extension is installed and enabled\n"
-                        "3. The extension has loaded (may need to restart VS)"
-                    )
-                
-                pipe_name = self._find_best_instance(instances)
-                
-                if pipe_name is None:
-                    # Multiple instances, can't auto-select
-                    instance_list = "\n".join([
-                        f"  - PID {i.process_id}: {i.solution_name} ({i.debug_mode})"
-                        for i in instances
-                    ])
-                    raise VSBridgeError(
-                        f"Multiple VS instances found. Please use 'list_vs_instances' to see all instances "
-                        f"and 'select_vs_instance' to choose one.\n\nAvailable instances:\n{instance_list}"
-                    )
-            
-            try:
-                # Run synchronous call in thread pool
-                loop = asyncio.get_event_loop()
-                future = loop.run_in_executor(
-                    self._executor,
-                    self._sync_call,
-                    pipe_name,
-                    method,
-                    params,
-                    sync_timeout,
-                )
-                result = await asyncio.wait_for(future, timeout=guard_timeout)
-                return result
-            except asyncio.TimeoutError:
+
+            if not instances:
                 raise VSBridgeError(
-                    f"Timeout waiting for response from VS extension (method: {method}, timeout={request_timeout:.1f}s)"
+                    "No Visual Studio instances found. Please ensure:\n"
+                    "1. Visual Studio is running\n"
+                    "2. AIDebuggerVS extension is installed and enabled\n"
+                    "3. The extension has loaded (may need to restart VS)"
                 )
-            except VSBridgeError:
-                raise
-            except Exception as e:
-                raise VSBridgeError(f"Error calling VS extension: {e}")
+
+            pipe_name = self._find_best_instance(instances)
+
+            if pipe_name is None:
+                instance_list = "\n".join([
+                    f"  - PID {i.process_id}: {i.solution_name} ({i.debug_mode}) "
+                    f"[{i.connection_status}{': ' + i.last_error if i.last_error else ''}]"
+                    for i in instances
+                ])
+                raise VSBridgeError(
+                    f"Multiple VS instances found or no reachable instance could be auto-selected. "
+                    f"Please use 'list_vs_instances' to see all instances and "
+                    f"'select_vs_instance' to choose one.\n\nAvailable instances:\n{instance_list}"
+                )
+
+        return await self.call_pipe(pipe_name, method, params, timeout)
 
 
 # Global bridge instance
@@ -721,6 +742,12 @@ async def call(method: str, params: Optional[Dict[str, Any]] = None, timeout: fl
     """
     bridge = get_bridge()
     return await bridge.call(method, params, timeout)
+
+
+async def call_pipe(pipe_name: str, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
+    """Convenience function to call a specific VS pipe without using global selection."""
+    bridge = get_bridge()
+    return await bridge.call_pipe(pipe_name, method, params, timeout)
 
 
 async def discover_instances() -> List[VSInstance]:
@@ -756,6 +783,6 @@ async def is_vs_available() -> bool:
     """Check if any VS extension is available."""
     try:
         instances = await discover_instances()
-        return len(instances) > 0
+        return any(i.connection_status == "ok" for i in instances)
     except:
         return False

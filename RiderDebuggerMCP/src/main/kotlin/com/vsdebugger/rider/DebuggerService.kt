@@ -253,7 +253,9 @@ class DebuggerService {
                 val pattern = getParam(request.params, "pattern", "")
                 val maxResults = getParam(request.params, "maxResults", 100)
                 val searchSize = getParam(request.params, "searchSize", 0x10000)
-                searchMemory(startAddress, pattern, maxResults, searchSize)
+                val patternFormat = getParam(request.params, "patternFormat", "auto")
+                val startOffset = getParam(request.params, "startOffset", 0L)
+                searchMemory(startAddress, pattern, maxResults, searchSize, patternFormat, startOffset)
             }
             "switch_stack_frame" -> {
                 val frameIndex = getParam(request.params, "frameIndex", 0)
@@ -1660,7 +1662,7 @@ class DebuggerService {
         )
     }
 
-    private fun searchMemory(startAddress: String, pattern: String, maxResults: Int, searchSize: Int): MemorySearchResult {
+    private fun searchMemory(startAddress: String, pattern: String, maxResults: Int, searchSize: Int, patternFormat: String, startOffset: Long): MemorySearchResult {
         val bytesToScan = searchSize.coerceIn(1, 0x100000)
         val normalizedMaxResults = maxResults.coerceIn(1, 10000)
         var bestEffort = buildUnavailableMemorySearchResult(pattern, bytesToScan)
@@ -1679,7 +1681,9 @@ class DebuggerService {
                     pattern = pattern,
                     maxResults = normalizedMaxResults,
                     bytesToScan = bytesToScan,
-                    session = session
+                    session = session,
+                    patternFormat = patternFormat,
+                    startOffset = startOffset
                 )
                 val currentContext = session.suspendContext
                 val stable = currentContext != null &&
@@ -1721,17 +1725,20 @@ class DebuggerService {
         pattern: String,
         maxResults: Int,
         bytesToScan: Int,
-        session: XDebugSession
+        session: XDebugSession,
+        patternFormat: String,
+        startOffset: Long
     ): MemorySearchResult {
         val evaluator = getEvaluator(session) ?: return buildUnavailableMemorySearchResult(pattern, bytesToScan)
         val addressExpr = resolveAddressExpression(startAddress, evaluator, session.currentPosition)
             ?: return buildUnavailableMemorySearchResult(pattern, bytesToScan)
-        val baseAddress = parseNumber(addressExpr)
+        val resolvedAddress = parseNumber(addressExpr)
             ?: return buildUnavailableMemorySearchResult(pattern, bytesToScan)
+        val baseAddress = resolvedAddress + startOffset.coerceAtLeast(0L)
 
-        val patternBytes = parsePattern(pattern)
+        val patternBytes = parsePattern(pattern, patternFormat)
         if (patternBytes.isEmpty()) {
-            return buildUnavailableMemorySearchResult(pattern, bytesToScan)
+            return buildUnavailableMemorySearchResult(pattern, bytesToScan).copy(error = "Pattern cannot be empty")
         }
         val formattedPattern = patternBytes.map { String.format("%02X", it.toInt() and 0xFF) }.toTypedArray()
 
@@ -1743,7 +1750,9 @@ class DebuggerService {
 
         val matches = mutableListOf<String>()
         var i = 0
-        while (i <= bytes.size - patternBytes.size && matches.size < maxResults) {
+        var truncated = false
+        var nextStartAddress: String? = null
+        while (i <= bytes.size - patternBytes.size) {
             var match = true
             for (j in patternBytes.indices) {
                 if (bytes[i + j] != patternBytes[j]) {
@@ -1754,20 +1763,29 @@ class DebuggerService {
             if (match) {
                 val address = baseAddress + i
                 matches.add("0x" + formatAddressValue(address))
+                if (matches.size >= maxResults) {
+                    val nextAddress = baseAddress + i + 1
+                    truncated = i + 1 <= bytes.size - patternBytes.size
+                    nextStartAddress = if (truncated) "0x" + formatAddressValue(nextAddress) else null
+                    break
+                }
             }
             i++
         }
 
         return MemorySearchResult(
             pattern = pattern,
-            status = if (snapshot.partial) "partial" else "ok",
+            status = if (snapshot.partial || truncated) "partial" else "ok",
             patternBytes = formattedPattern,
             matches = matches,
             totalFound = matches.size,
             bytesSearched = bytes.size,
             requestedBytes = bytesToScan,
             failedReads = snapshot.failedReads,
-            partial = snapshot.partial
+            partial = snapshot.partial || truncated,
+            truncated = truncated,
+            nextStartAddress = nextStartAddress,
+            error = if (truncated) "Search stopped after reaching maxResults" else null
         )
     }
 
@@ -2744,12 +2762,26 @@ class DebuggerService {
         return decMatch?.value?.toLongOrNull()
     }
 
-    private fun parsePattern(pattern: String): ByteArray {
+    private fun parsePattern(pattern: String, patternFormat: String = "auto"): ByteArray {
         val trimmed = pattern.trim().trim('"')
         if (trimmed.isBlank()) return byteArrayOf()
 
+        val normalizedFormat = patternFormat.trim().lowercase()
+        val forceHex = normalizedFormat == "hex" || normalizedFormat == "bytes"
+        val forceText = normalizedFormat == "text" || normalizedFormat == "ascii" || normalizedFormat == "string"
         val tokens = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }
-        if (tokens.isNotEmpty() && tokens.all { it.matches(Regex("[0-9a-fA-F]{2}")) }) {
+        if (forceHex) {
+            val hex = trimmed.replace(Regex("\\s+"), "")
+            if (hex.length % 2 != 0 || !hex.matches(Regex("[0-9a-fA-F]+"))) return byteArrayOf()
+            return ByteArray(hex.length / 2) { index ->
+                hex.substring(index * 2, index * 2 + 2).toInt(16).toByte()
+            }
+        }
+
+        val looksLikeSpacedHex = trimmed.contains(Regex("\\s+")) &&
+            tokens.isNotEmpty() &&
+            tokens.all { it.matches(Regex("[0-9a-fA-F]{2}")) }
+        if (!forceText && looksLikeSpacedHex) {
             val bytes = ByteArray(tokens.size)
             tokens.forEachIndexed { index, token ->
                 bytes[index] = token.toInt(16).toByte()

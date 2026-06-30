@@ -365,6 +365,8 @@ data class MemorySearchResult(
     @SerializedName("requestedBytes") val requestedBytes: Int = 0,
     @SerializedName("failedReads") val failedReads: Int = 0,
     @SerializedName("partial") val partial: Boolean = false,
+    @SerializedName("truncated") val truncated: Boolean = false,
+    @SerializedName("nextStartAddress") val nextStartAddress: String? = null,
     @SerializedName("error") val error: String? = null
 )
 

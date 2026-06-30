@@ -47,8 +47,12 @@ MODULES_TIMEOUT_SECONDS = 45.0
 EXCEPTION_TIMEOUT_SECONDS = 20.0
 OUTPUT_TIMEOUT_SECONDS = 20.0
 START_DEBUGGING_TIMEOUT_SECONDS = 60.0
+MEMORY_TIMEOUT_SECONDS = 20.0
+DISASSEMBLY_TIMEOUT_SECONDS = 20.0
 MAX_TOOL_TIMEOUT_SECONDS = 300.0
 MAX_THREAD_BUDGET_SECONDS = 115.0
+MAX_MEMORY_SEARCH_CHUNK_SIZE = 0x100000
+MAX_MEMORY_SEARCH_SIZE = 0x40000000
 
 
 def clamp_tool_timeout(timeout_seconds: Optional[float], default_seconds: float) -> float:
@@ -82,6 +86,13 @@ def tool_timeout_for_budget(
     return min(MAX_TOOL_TIMEOUT_SECONDS, max(default_seconds, budget_seconds + overhead_seconds))
 
 
+def remaining_tool_timeout(deadline: float, default_seconds: float) -> Optional[float]:
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        return None
+    return max(1.0, min(default_seconds, remaining))
+
+
 def add_thread_capture_params(
     params: Dict[str, Any],
     thread_include_frames: bool,
@@ -111,11 +122,13 @@ async def wait_for_debugging_to_start(result: Any, timeout_seconds: float, attac
 
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     last_status = status
+    last_error = None
     while asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(0.5)
         try:
             last_status = await ide_bridge.call("get_debug_status", timeout=5.0)
-        except ide_bridge.IDEBridgeError:
+        except ide_bridge.IDEBridgeError as e:
+            last_error = str(e)
             continue
 
         if isinstance(last_status, dict):
@@ -133,6 +146,8 @@ async def wait_for_debugging_to_start(result: Any, timeout_seconds: float, attac
     )
     if isinstance(last_status, dict):
         result["status"] = last_status
+    if last_error:
+        result["lastPollError"] = last_error
     return result
 
 
@@ -187,6 +202,11 @@ evaluate_expression(expression="obj.Property", expand_children=True)
 | 查看调用链 | get_callstack() |
 | 设置断点 | set_breakpoint(file_path="...", line_number=42) |
 | 单步调试 | debug_step_over() / debug_step_into() / debug_step_out() |
+
+Crash/dump triage: prefer crash_triage() for exception, callstack, modules,
+registers, output tail, nearby disassembly, and stack memory in one pass.
+Step plus snapshot: prefer step_and_capture(action="step_over") when the next
+question depends on the new stop location.
 
 ## 多实例场景
 
@@ -245,7 +265,8 @@ async def debug_capabilities() -> str:
             "set_breakpoint(...) / set_function_breakpoint(...) / set_data_breakpoint(...)",
             "continue_and_wait_for_break(...) or continue()",
             "capture_debug_bundle() for low-blocking status/callstack/exception/threads",
-            "for complete thread frames pass thread_max_frames_per_thread=0, thread_max_nodes=0, thread_budget_ms=0 or a large thread_budget_ms, and enough timeout_seconds",
+            "for complete get_threads frames pass max_frames_per_thread=0, max_nodes=0, budget_ms=0 or a large budget_ms, and enough timeout_seconds",
+            "for capture_debug_bundle/full_context/continue_and_wait thread frames use thread_max_frames_per_thread/thread_max_nodes/thread_budget_ms",
             "opt in to include_locals/include_modules/include_registers/include_output only when needed",
             "evaluate_expressions_batch(...) for multiple values, evaluate_expression(...) for one value; prefer field/address/memory reads when function calls are risky",
             "debug_control(action='stop') or stop_debugging() to stop/terminate the current debug session",
@@ -277,6 +298,7 @@ async def debug_capabilities() -> str:
                 "step_over",
                 "step_into",
                 "step_out",
+                "step_and_capture",
                 "debug_run_to_cursor",
                 "debug_set_next_statement",
                 "debug_stop",
@@ -288,6 +310,7 @@ async def debug_capabilities() -> str:
             ],
             "inspection": [
                 "capture_debug_bundle",
+                "crash_triage",
                 "get_callstack",
                 "get_call_stack",
                 "get_locals",
@@ -319,6 +342,8 @@ async def debug_capabilities() -> str:
         },
         "capabilityNotes": {
             "capture_debug_bundle": "Safe by default: captures status, callstack, exception, and budgeted threads. Locals/modules/registers/output are explicit opt-ins; complete thread frames require thread_max_frames_per_thread=0, thread_max_nodes=0, thread_budget_ms=0 or a large thread_budget_ms, and enough timeout_seconds.",
+            "get_threads": "Direct get_threads uses max_frames_per_thread, max_nodes, and budget_ms. The thread_* names are for bundle/full-context tools.",
+            "crash_triage": "Focused Visual Studio crash/dump first pass: captures exception, callstack, modules, registers, output tail, nearby disassembly, and stack memory when available.",
             "expression_evaluation": "Expressions are attempted by default with bounded IDE timeouts. If a function call is unavailable or unsafe in the debug engine, the IDE result is returned instead of pre-rejecting it.",
             "stop": "Supported. Use debug_stop, stop_debugging, or debug_control(action='stop') to stop debugging / terminate the current debug session.",
             "detach": "Visual Studio detach is supported for the current debugged process via detach_process or debug_control(action='detach'). Rider detach returns an explicit unsupported result because no reliable public detach path is exposed here.",
@@ -337,7 +362,7 @@ async def list_vs_instances() -> str:
     当有多个VS实例时，使用此工具查看所有实例，然后用select_vs_instance选择要操作的实例。
     """
     try:
-        instances = [i for i in await ide_bridge.discover_instances() if i.ide == "vs"]
+        instances = [i for i in await ide_bridge.discover_instances(preferred_ide="vs") if i.ide == "vs"]
         
         if not instances:
             return "未找到任何Visual Studio实例。请确保VS已启动且AIDebugger扩展已加载。"
@@ -345,26 +370,35 @@ async def list_vs_instances() -> str:
         result = {
             "instanceCount": len(instances),
             "instances": [inst.to_dict() for inst in instances],
-            "hint": "使用 select_vs_instance 工具选择要操作的实例（通过 process_id 参数）"
+            "hint": "使用 select_vs_instance 工具选择要操作的实例（通过 process_id 参数）",
+            "selected": False
         }
         
         # Add summary
         paused = [i for i in instances if i.is_paused]
         debugging = [i for i in instances if i.is_debugging and not i.is_paused]
         idle = [i for i in instances if not i.is_debugging]
+        selectable_instances = [i for i in instances if i.connection_status == "ok"]
+        selectable_paused = [i for i in selectable_instances if i.is_paused]
+        selectable_debugging = [i for i in selectable_instances if i.is_debugging and not i.is_paused]
         
         result["summary"] = {
             "paused": len(paused),
             "debugging": len(debugging),
-            "idle": len(idle)
+            "idle": len(idle),
+            "unreachable": len(instances) - len(selectable_instances)
         }
+
+        paused = selectable_paused
+        debugging = selectable_debugging
+        instances = selectable_instances
         
-        if len(paused) == 1:
-            result["autoSelected"] = f"自动选择了唯一处于断点暂停状态的实例 (PID: {paused[0].process_id})"
-        elif len(debugging) == 1 and len(paused) == 0:
-            result["autoSelected"] = f"自动选择了唯一正在调试的实例 (PID: {debugging[0].process_id})"
-        elif len(instances) == 1:
-            result["autoSelected"] = f"自动选择了唯一的实例 (PID: {instances[0].process_id})"
+        if len(selectable_paused) == 1:
+            result["wouldAutoSelect"] = f"自动选择了唯一处于断点暂停状态的实例 (PID: {paused[0].process_id})"
+        elif len(selectable_debugging) == 1 and len(selectable_paused) == 0:
+            result["wouldAutoSelect"] = f"自动选择了唯一正在调试的实例 (PID: {debugging[0].process_id})"
+        elif len(selectable_instances) == 1:
+            result["wouldAutoSelect"] = f"自动选择了唯一的实例 (PID: {instances[0].process_id})"
         
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
@@ -388,26 +422,36 @@ async def list_ide_instances() -> str:
             "hint": "使用 select_ide_instance 选择要操作的实例（通过 ide + process_id 参数）"
         }
 
+        result["selected"] = False
+
         paused = [i for i in instances if i.is_paused]
         debugging = [i for i in instances if i.is_debugging and not i.is_paused]
         idle = [i for i in instances if not i.is_debugging]
+        selectable_instances = [i for i in instances if i.connection_status == "ok"]
+        selectable_paused = [i for i in selectable_instances if i.is_paused]
+        selectable_debugging = [i for i in selectable_instances if i.is_debugging and not i.is_paused]
 
         result["summary"] = {
             "paused": len(paused),
             "debugging": len(debugging),
-            "idle": len(idle)
+            "idle": len(idle),
+            "unreachable": len(instances) - len(selectable_instances)
         }
 
+        paused = selectable_paused
+        debugging = selectable_debugging
+        instances = selectable_instances
+
         if len(paused) == 1:
-            result["autoSelected"] = (
+            result["wouldAutoSelect"] = (
                 f"自动选择了唯一处于断点暂停状态的实例 ({paused[0].ide.upper()} PID: {paused[0].process_id})"
             )
         elif len(debugging) == 1 and len(paused) == 0:
-            result["autoSelected"] = (
+            result["wouldAutoSelect"] = (
                 f"自动选择了唯一正在调试的实例 ({debugging[0].ide.upper()} PID: {debugging[0].process_id})"
             )
         elif len(instances) == 1:
-            result["autoSelected"] = (
+            result["wouldAutoSelect"] = (
                 f"自动选择了唯一的实例 ({instances[0].ide.upper()} PID: {instances[0].process_id})"
             )
 
@@ -433,7 +477,7 @@ async def detect_debug_sessions(prefer_ide: Optional[str] = None, select: bool =
         select: 是否自动选择匹配的实例（默认 True）
     """
     try:
-        instances = await ide_bridge.discover_instances()
+        instances = await ide_bridge.discover_instances(preferred_ide=prefer_ide)
 
         if not instances:
             return "未找到任何IDE实例。请确保 Visual Studio 或 Rider 已启动且扩展已加载。"
@@ -483,7 +527,7 @@ async def select_ide_instance(ide: str, process_id: int) -> str:
         if ide_key not in ("vs", "rider"):
             return "ide 参数必须是 'vs' 或 'rider'"
 
-        instances = [i for i in await ide_bridge.discover_instances() if i.ide == ide_key]
+        instances = [i for i in await ide_bridge.discover_instances(preferred_ide=ide_key) if i.ide == ide_key]
 
         if not instances:
             return f"未找到 {ide} 实例。"
@@ -525,7 +569,7 @@ async def select_vs_instance(process_id: int) -> str:
     """
     try:
         # Discover instances
-        instances = [i for i in await ide_bridge.discover_instances() if i.ide == "vs"]
+        instances = [i for i in await ide_bridge.discover_instances(preferred_ide="vs") if i.ide == "vs"]
         
         # Build pipe name from process_id
         target_pipe = f"AIDebuggerVS_{process_id}"
@@ -602,7 +646,7 @@ async def get_debug_status() -> str:
       "isDebugging": true,
       "isPaused": true,
       "stopReason": "breakpoint",
-      "currentLocation": {"file": "Program.cs", "line": 42, "function": "Main"}
+      "currentLocation": {"filePath": "Program.cs", "lineNumber": 42, "functionName": "Main"}
     }
     ```
     
@@ -628,11 +672,12 @@ async def get_callstack() -> str:
     返回示例:
     ```json
     {
+      "threadId": 1,
+      "snapshotStatus": "ok",
       "frames": [
-        {"index": 0, "function": "DoSomething", "file": "Helper.cs", "line": 25},
-        {"index": 1, "function": "Main", "file": "Program.cs", "line": 42}
-      ],
-      "totalFrames": 2
+        {"index": 0, "functionName": "DoSomething", "filePath": "Helper.cs", "lineNumber": 25},
+        {"index": 1, "functionName": "Main", "filePath": "Program.cs", "lineNumber": 42}
+      ]
     }
     ```
     
@@ -862,7 +907,7 @@ async def get_exception(timeout_seconds: Optional[float] = None) -> str:
 # ============== Memory Tools ==============
 
 @mcp.tool()
-async def read_memory(address: str, size: int = 256) -> str:
+async def read_memory(address: str, size: int = 256, timeout_seconds: Optional[float] = None) -> str:
     """
     读取指定内存地址的原始字节数据。用于分析内存布局、检查数据结构、排查内存损坏问题。
     返回十六进制转储、ASCII视图和格式化的内存视图。地址可以是十六进制或变量表达式。
@@ -872,6 +917,7 @@ async def read_memory(address: str, size: int = 256) -> str:
     Args:
         address: 内存地址，支持十六进制（如0x7ff61234）或表达式（如&myVariable、myPointer）
         size: 要读取的字节数，默认256，最大4096
+        timeout_seconds: 等待 IDE 响应的最长秒数
     """
     # Clamp size
     size = max(1, min(size, 4096))
@@ -880,7 +926,7 @@ async def read_memory(address: str, size: int = 256) -> str:
         result = await ide_bridge.call("read_memory", {
             "address": address,
             "size": size
-        })
+        }, timeout=clamp_tool_timeout(timeout_seconds, MEMORY_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "read_memory")
@@ -889,7 +935,11 @@ async def read_memory(address: str, size: int = 256) -> str:
 # ============== Disassembly Tools ==============
 
 @mcp.tool()
-async def get_disassembly(lines_before: int = 20, lines_after: int = 20) -> str:
+async def get_disassembly(
+    lines_before: int = 20,
+    lines_after: int = 20,
+    timeout_seconds: Optional[float] = None
+) -> str:
     """
     获取当前断点/暂停位置附近的反汇编代码。用于分析底层机器指令、排查优化代码问题、理解编译器生成的代码。
     返回汇编指令、机器码和对应的内存地址。
@@ -899,19 +949,24 @@ async def get_disassembly(lines_before: int = 20, lines_after: int = 20) -> str:
     Args:
         lines_before: 当前指令之前要显示的行数，默认20
         lines_after: 当前指令之后要显示的行数，默认20
+        timeout_seconds: 等待 IDE 响应的最长秒数
     """
     try:
         result = await ide_bridge.call("get_disassembly", {
             "linesBefore": lines_before,
             "linesAfter": lines_after
-        })
+        }, timeout=clamp_tool_timeout(timeout_seconds, DISASSEMBLY_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_disassembly")
 
 
 @mcp.tool()
-async def get_disassembly_at(address: str, count: int = 50) -> str:
+async def get_disassembly_at(
+    address: str,
+    count: int = 50,
+    timeout_seconds: Optional[float] = None
+) -> str:
     """
     获取指定内存地址处的反汇编代码。可以用于查看特定函数或代码段的汇编指令。
     地址可以是十六进制格式（如0x7ff61234）或表达式（如&myFunction）。
@@ -919,12 +974,13 @@ async def get_disassembly_at(address: str, count: int = 50) -> str:
     Args:
         address: 起始内存地址，支持十六进制（如0x7ff61234）或表达式（如&myFunction）
         count: 要获取的指令数量，默认50
+        timeout_seconds: 等待 IDE 响应的最长秒数
     """
     try:
         result = await ide_bridge.call("get_disassembly_at", {
             "address": address,
             "count": count
-        })
+        }, timeout=clamp_tool_timeout(timeout_seconds, DISASSEMBLY_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_disassembly_at")
@@ -1150,6 +1206,170 @@ async def capture_debug_bundle(
         return handle_ide_error(e, "capture_debug_bundle")
 
 
+@mcp.tool()
+async def crash_triage(
+    expressions: Optional[List[str]] = None,
+    output_tail_lines: int = 120,
+    timeout_seconds: Optional[float] = None,
+    thread_max_frames_per_thread: Optional[int] = 32,
+    thread_max_nodes: Optional[int] = 512,
+    thread_budget_ms: Optional[int] = 10000,
+) -> str:
+    """
+    Capture a focused Visual Studio crash/dump triage package.
+
+    Includes status, callstack, exception, modules, registers, Debug output tail,
+    thread frames, nearby disassembly, and best-effort stack memory.
+    """
+    normalized_expressions = expressions or []
+    default_timeout = DEBUG_BUNDLE_TIMEOUT_SECONDS
+    tool_timeout = tool_timeout_for_budget(timeout_seconds, default_timeout, thread_budget_ms)
+    deadline = asyncio.get_running_loop().time() + tool_timeout
+    try:
+        bundle_params = add_thread_capture_params({
+            "expressions": normalized_expressions,
+            "expandChildren": False,
+            "maxDepth": 1,
+            "outputTailLines": max(0, min(output_tail_lines, 500)),
+            "includeLocals": False,
+            "includeModules": True,
+            "includeRegisters": True,
+            "includeOutput": True,
+            "includeThreads": True,
+            "includeException": True,
+            "allowSideEffects": False,
+        }, True, thread_max_frames_per_thread, thread_max_nodes, thread_budget_ms)
+
+        triage: Dict[str, Any] = {
+            "kind": "crash_triage",
+            "bundle": await ide_bridge.call(
+                "capture_debug_bundle",
+                bundle_params,
+                timeout=remaining_tool_timeout(deadline, tool_timeout) or 1.0,
+            ),
+        }
+
+        disassembly_timeout = remaining_tool_timeout(deadline, DISASSEMBLY_TIMEOUT_SECONDS)
+        if disassembly_timeout is None:
+            triage["disassemblyError"] = "Skipped because crash_triage timeout budget was exhausted"
+        else:
+            try:
+                triage["disassembly"] = await ide_bridge.call(
+                    "get_disassembly",
+                    {"linesBefore": 8, "linesAfter": 24},
+                    timeout=disassembly_timeout,
+                )
+            except ide_bridge.IDEBridgeError as e:
+                triage["disassemblyError"] = str(e)
+
+        last_memory_error = None
+        for stack_register in ("@rsp", "@esp"):
+            memory_timeout = remaining_tool_timeout(deadline, MEMORY_TIMEOUT_SECONDS)
+            if memory_timeout is None:
+                last_memory_error = "Skipped because crash_triage timeout budget was exhausted"
+                break
+            try:
+                memory = await ide_bridge.call(
+                    "read_memory",
+                    {"address": stack_register, "size": 256},
+                    timeout=memory_timeout,
+                )
+                if isinstance(memory, dict):
+                    status = str(memory.get("status", "")).lower()
+                    if status not in ("ok", "partial") and not memory.get("bytesRead"):
+                        last_memory_error = memory.get("error") or memory.get("message") or f"{stack_register} unavailable"
+                        continue
+                triage["stackMemory"] = memory
+                triage["stackMemoryAddressExpression"] = stack_register
+                break
+            except ide_bridge.IDEBridgeError as e:
+                last_memory_error = str(e)
+        if "stackMemory" not in triage and last_memory_error:
+            triage["stackMemoryError"] = last_memory_error
+
+        return format_result(triage)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "crash_triage")
+
+
+@mcp.tool()
+async def step_and_capture(
+    action: str = "step_over",
+    expressions: Optional[List[str]] = None,
+    include_locals: bool = False,
+    include_modules: bool = False,
+    include_registers: bool = False,
+    include_output: bool = False,
+    timeout_seconds: Optional[float] = None,
+) -> str:
+    """
+    Execute one step operation and capture a debug bundle at the new stop point.
+
+    action accepts step_over, step_into, or step_out.
+    """
+    normalized = (action or "step_over").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "over": "step_over",
+        "stepover": "step_over",
+        "debug_step_over": "step_over",
+        "into": "step_into",
+        "stepinto": "step_into",
+        "debug_step_into": "step_into",
+        "out": "step_out",
+        "stepout": "step_out",
+        "debug_step_out": "step_out",
+    }
+    normalized = aliases.get(normalized, normalized)
+    method_by_action = {
+        "step_over": "step_over",
+        "step_into": "step_into",
+        "step_out": "step_out",
+    }
+    if normalized not in method_by_action:
+        return format_result({
+            "action": action,
+            "success": False,
+            "message": "Unsupported step_and_capture action. Use step_over, step_into, or step_out.",
+        })
+
+    normalized_expressions = expressions or []
+    tool_timeout = clamp_tool_timeout(timeout_seconds, DEBUG_BUNDLE_TIMEOUT_SECONDS)
+    deadline = asyncio.get_running_loop().time() + tool_timeout
+    try:
+        step_timeout = remaining_tool_timeout(deadline, tool_timeout) or 1.0
+        step_result = await ide_bridge.call(method_by_action[normalized], timeout=step_timeout)
+        bundle = None
+        bundle_error = None
+        if isinstance(step_result, dict) and step_result.get("success"):
+            bundle_timeout = remaining_tool_timeout(deadline, tool_timeout)
+            if bundle_timeout is None:
+                bundle_error = "Skipped because step_and_capture timeout budget was exhausted"
+            else:
+                bundle = await ide_bridge.call("capture_debug_bundle", {
+                    "expressions": normalized_expressions,
+                    "expandChildren": False,
+                    "maxDepth": 1,
+                    "outputTailLines": 80,
+                    "includeLocals": include_locals,
+                    "includeModules": include_modules,
+                    "includeRegisters": include_registers,
+                    "includeOutput": include_output,
+                    "includeThreads": True,
+                    "includeException": True,
+                    "allowSideEffects": False,
+                }, timeout=bundle_timeout)
+        result = {
+            "action": normalized,
+            "step": step_result,
+            "bundle": bundle,
+        }
+        if bundle_error:
+            result["bundleError"] = bundle_error
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "step_and_capture")
+
+
 # ============== Debug Control Tools ==============
 
 @mcp.tool()
@@ -1189,13 +1409,15 @@ async def start_debugging(
     """
     try:
         wait_timeout = clamp_tool_timeout(timeout_seconds, START_DEBUGGING_TIMEOUT_SECONDS)
+        deadline = asyncio.get_running_loop().time() + wait_timeout
         result = await ide_bridge.call("start_debugging", {
             "executablePath": executable_path,
             "workingDirectory": working_dir,
             "arguments": args,
             "attach": attach
         }, timeout=wait_timeout)
-        result = await wait_for_debugging_to_start(result, wait_timeout, attach)
+        remaining_timeout = max(1.0, deadline - asyncio.get_running_loop().time())
+        result = await wait_for_debugging_to_start(result, remaining_timeout, attach)
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "start_debugging")
@@ -1832,7 +2054,10 @@ async def search_memory(
     start_address: str,
     pattern: str,
     max_results: int = 100,
-    search_size: int = 0x10000
+    search_size: int = 0x10000,
+    pattern_format: str = "auto",
+    start_offset: int = 0,
+    timeout_seconds: Optional[float] = None
 ) -> str:
     """
     在内存中搜索指定模式。可用于查找特定数据或字符串。
@@ -1841,19 +2066,164 @@ async def search_memory(
         start_address: 搜索起始地址（十六进制如0x7ff61234或表达式如&myVar）
         pattern: 搜索模式，可以是十六进制字节(如"4D 5A")或ASCII字符串
         max_results: 最大返回结果数，默认100
-        search_size: 搜索范围大小（字节），默认64KB，最大10MB
+        search_size: 搜索范围大小（字节），默认64KB；Visual Studio 单次后端调用最大1MB，较大范围会自动分片覆盖
+        pattern_format: auto/text/hex。auto 仅把带空格的十六进制串当字节，"41" 默认按 ASCII 文本搜索；hex 可显式搜索单字节
+        start_offset: 从 start_address 解析出的基址开始增加的字节偏移，便于从 nextStartOffset 继续搜索
+        timeout_seconds: 等待 IDE 响应的最长秒数
     """
-    # Clamp parameters to safe ranges
-    search_size = max(1, min(search_size, 10 * 1024 * 1024))  # max 10 MB
+    # Clamp parameters to safe ranges. The total requested range is not reduced to
+    # the VSIX per-call limit; larger searches are chunked below.
+    search_size = max(1, min(search_size, MAX_MEMORY_SEARCH_SIZE))
     max_results = max(1, min(max_results, 10000))
+    start_offset = max(0, int(start_offset))
+    tool_timeout = clamp_tool_timeout(
+        timeout_seconds,
+        min(MAX_TOOL_TIMEOUT_SECONDS, max(MEMORY_TIMEOUT_SECONDS, ((search_size + MAX_MEMORY_SEARCH_CHUNK_SIZE - 1) // MAX_MEMORY_SEARCH_CHUNK_SIZE) * MEMORY_TIMEOUT_SECONDS))
+    )
+    deadline = asyncio.get_running_loop().time() + tool_timeout
     
     try:
-        result = await ide_bridge.call("search_memory", {
-            "startAddress": start_address,
+        if search_size <= MAX_MEMORY_SEARCH_CHUNK_SIZE:
+            result = await ide_bridge.call("search_memory", {
+                "startAddress": start_address,
+                "pattern": pattern,
+                "maxResults": max_results,
+                "searchSize": search_size,
+                "patternFormat": pattern_format,
+                "startOffset": start_offset
+            }, timeout=remaining_tool_timeout(deadline, MEMORY_TIMEOUT_SECONDS) or 1.0)
+            return format_result(result)
+
+        matches: List[str] = []
+        seen_matches = set()
+        chunks: List[Dict[str, Any]] = []
+        bytes_searched = 0
+        failed_reads = 0
+        pattern_bytes = None
+        status = "ok"
+        partial = False
+        error = None
+        offset = 0
+        overlap = 0
+        continuation_expression = None
+        continuation_offset = None
+
+        while offset < search_size:
+            remaining_timeout = remaining_tool_timeout(deadline, MEMORY_TIMEOUT_SECONDS)
+            if remaining_timeout is None:
+                partial = True
+                status = "partial"
+                error = "Search stopped because search_memory timeout budget was exhausted"
+                break
+
+            chunk_size = min(MAX_MEMORY_SEARCH_CHUNK_SIZE, search_size - offset)
+            absolute_offset = start_offset + offset
+            chunk_start = start_address if absolute_offset == 0 else f"{start_address} + byte offset 0x{absolute_offset:X}"
+            chunk_result = await ide_bridge.call("search_memory", {
+                "startAddress": start_address,
+                "pattern": pattern,
+                "maxResults": max_results - len(matches),
+                "searchSize": chunk_size,
+                "patternFormat": pattern_format,
+                "startOffset": absolute_offset
+            }, timeout=remaining_timeout)
+
+            if not isinstance(chunk_result, dict):
+                partial = True
+                status = "partial"
+                error = str(chunk_result)
+                break
+
+            if pattern_bytes is None and chunk_result.get("patternBytes"):
+                pattern_bytes = chunk_result.get("patternBytes")
+                overlap = max(0, len(pattern_bytes) - 1)
+
+            chunk_matches = chunk_result.get("matches") or []
+            for match in chunk_matches:
+                if match not in seen_matches:
+                    seen_matches.add(match)
+                    matches.append(match)
+                    if len(matches) >= max_results:
+                        break
+
+            bytes_searched += int(chunk_result.get("bytesSearched") or 0)
+            failed_reads += int(chunk_result.get("failedReads") or 0)
+            chunk_status = str(chunk_result.get("status") or "unavailable").lower()
+            chunk_truncated = bool(chunk_result.get("truncated"))
+            chunk_partial = bool(chunk_result.get("partial")) or chunk_status not in ("ok",)
+            chunk_error = chunk_result.get("error")
+            chunks.append({
+                "startAddress": chunk_start,
+                "requestedBytes": chunk_size,
+                "bytesSearched": chunk_result.get("bytesSearched", 0),
+                "status": chunk_result.get("status", "unavailable"),
+                "partial": bool(chunk_result.get("partial")),
+                "truncated": chunk_truncated,
+                "nextStartAddress": chunk_result.get("nextStartAddress"),
+                "matchCount": len(chunk_matches),
+                "error": chunk_error,
+            })
+
+            if chunk_truncated:
+                partial = True
+                status = "partial"
+                continuation_expression = chunk_result.get("nextStartAddress") or chunk_start
+                continuation_offset = None
+                error = "Search stopped after reaching max_results; continue from nextStartExpression or increase max_results"
+                break
+
+            step = max(1, chunk_size - overlap)
+            next_offset = offset + step
+
+            if chunk_partial:
+                partial = True
+                status = "partial"
+                error = chunk_error or f"Chunk at {chunk_start} was partial"
+                break
+
+            if len(matches) >= max_results:
+                partial = True
+                status = "partial"
+                continuation_expression = chunk_result.get("nextStartAddress") or start_address
+                continuation_offset = None if chunk_result.get("nextStartAddress") else start_offset + next_offset
+                error = "Search stopped after reaching max_results; continue from nextStartExpression or increase max_results"
+                break
+
+            offset = next_offset
+
+        next_start_expression = None
+        next_start_offset = None
+        remaining_bytes = 0
+        if continuation_expression:
+            next_start_expression = continuation_expression
+            next_start_offset = continuation_offset
+            remaining_bytes = None
+        elif offset < search_size:
+            next_start_expression = start_address
+            next_start_offset = start_offset + offset
+            remaining_bytes = search_size - offset
+
+        result = {
             "pattern": pattern,
-            "maxResults": max_results,
-            "searchSize": search_size
-        })
+            "patternFormat": pattern_format,
+            "status": status,
+            "patternBytes": pattern_bytes,
+            "matches": matches,
+            "totalFound": len(matches),
+            "bytesSearched": bytes_searched,
+            "requestedBytes": search_size,
+            "failedReads": failed_reads,
+            "partial": partial,
+            "chunked": True,
+            "chunkSize": MAX_MEMORY_SEARCH_CHUNK_SIZE,
+            "chunkCount": len(chunks),
+            "chunks": chunks,
+            "nextStartExpression": next_start_expression,
+            "nextStartOffset": next_start_offset,
+            "remainingBytes": remaining_bytes,
+        }
+        if error:
+            result["error"] = error
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "search_memory")

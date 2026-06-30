@@ -990,6 +990,12 @@ namespace VSDebuggerMCP.Protocol
         [DataMember(Name = "partial")]
         public bool Partial { get; set; }
 
+        [DataMember(Name = "truncated")]
+        public bool Truncated { get; set; }
+
+        [DataMember(Name = "nextStartAddress")]
+        public string NextStartAddress { get; set; }
+
         [DataMember(Name = "error")]
         public string Error { get; set; }
     }
