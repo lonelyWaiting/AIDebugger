@@ -1,10 +1,32 @@
 import json
+import ast
+import importlib.util
+import os
 import pathlib
+import re
 import subprocess
+import sys
+import tempfile
+import time
 import unittest
+import xml.etree.ElementTree as ET
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+MCP_SERVER_SOURCE_FILES = [
+    "mcp_server/server.py",
+    "mcp_server/mcp_app.py",
+    "mcp_server/tool_context.py",
+    "mcp_server/tool_registry.py",
+    "mcp_server/tool_modules/capability_tools.py",
+    "mcp_server/tool_modules/instance_tools.py",
+    "mcp_server/tool_modules/snapshot_tools.py",
+    "mcp_server/tool_modules/native_managed_tools.py",
+    "mcp_server/tool_modules/control_tools.py",
+    "mcp_server/tool_modules/breakpoint_tools.py",
+    "mcp_server/tool_modules/memory_tools.py",
+]
 
 
 def find_msbuild() -> pathlib.Path | None:
@@ -18,6 +40,8 @@ def find_msbuild() -> pathlib.Path | None:
 
 
 def read(path: str) -> str:
+    if path == "mcp_server/server.py":
+        return "\n".join((ROOT / source_path).read_text(encoding="utf-8") for source_path in MCP_SERVER_SOURCE_FILES)
     return (ROOT / path).read_text(encoding="utf-8")
 
 
@@ -37,6 +61,103 @@ def csharp_slice(source: str, start_marker: str, end_marker: str) -> str:
     start = source.index(start_marker)
     end = source.index(end_marker, start + len(start_marker))
     return source[start:end]
+
+
+def load_tool_registry():
+    module_path = ROOT / "mcp_server/tool_registry.py"
+    spec = importlib.util.spec_from_file_location("aidb_tool_registry_for_tests", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_bootstrap_module():
+    module_path = ROOT / "mcp_server/bootstrap.py"
+    spec = importlib.util.spec_from_file_location("aidb_bootstrap_for_tests", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def registered_tool_module_names() -> list[str]:
+    init_tree = ast.parse((ROOT / "mcp_server/tool_modules/__init__.py").read_text(encoding="utf-8"))
+    registered_modules: list[str] = []
+    for node in ast.walk(init_tree):
+        if not isinstance(node, ast.ImportFrom) or node.level != 1:
+            continue
+        for alias in node.names:
+            if alias.name != "*":
+                registered_modules.append(alias.name)
+    return registered_modules
+
+
+def discover_mcp_tool_names() -> list[str]:
+    names: list[str] = []
+    registered_modules = registered_tool_module_names()
+    for module_name in registered_modules:
+        source_path = f"mcp_server/tool_modules/{module_name}.py"
+        tree = ast.parse((ROOT / source_path).read_text(encoding="utf-8"))
+        for node in tree.body:
+            if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if not (
+                    isinstance(decorator, ast.Call)
+                    and isinstance(decorator.func, ast.Attribute)
+                    and decorator.func.attr == "tool"
+                ):
+                    continue
+                tool_name = node.name
+                for keyword in decorator.keywords:
+                    if keyword.arg == "name" and isinstance(keyword.value, ast.Constant):
+                        tool_name = keyword.value.value
+                names.append(tool_name)
+    return names
+
+
+def discover_rider_dispatch_methods(source: str) -> set[str]:
+    start = source.index("return when (method) {")
+    end = source.index("else -> throw UnsupportedOperationException", start)
+    dispatch_table = source[start:end]
+    return set(re.findall(r'"([^"]+)"\s*->', dispatch_table))
+
+
+def expected_packaged_mcp_files() -> list[str]:
+    files: list[str] = []
+    mcp_root = ROOT / "mcp_server"
+    for path in mcp_root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative_parts = path.relative_to(mcp_root).parts
+        if "vendor" in relative_parts or "__pycache__" in relative_parts:
+            continue
+        if path.suffix == ".py" or path.name == "requirements.txt":
+            files.append(path.relative_to(mcp_root).as_posix())
+    return sorted(files)
+
+
+def rider_base_files(source: str) -> list[str]:
+    match = re.search(r"private\s+val\s+baseFiles\s*=\s*listOf\((.*?)\n\s*\)", source, re.S)
+    if match is None:
+        raise AssertionError("Rider baseFiles list not found")
+    return sorted(re.findall(r'"([^"]+)"', match.group(1)))
+
+
+def vsix_content_items() -> dict[str, dict[str, str]]:
+    tree = ET.parse(ROOT / "VSDebuggerMCP/VSDebuggerMCP.csproj")
+    items: dict[str, dict[str, str]] = {}
+    for content in tree.iter():
+        if content.tag.rsplit("}", 1)[-1] != "Content":
+            continue
+        include = content.attrib.get("Include")
+        if not include:
+            continue
+        metadata = {child.tag.rsplit("}", 1)[-1]: (child.text or "") for child in content}
+        items[include] = metadata
+    return items
 
 
 class ContractTests(unittest.TestCase):
@@ -234,7 +355,7 @@ class ContractTests(unittest.TestCase):
             "debug_control(action='stop')",
             "detach_process",
             "detach_debugger",
-            "Rider detach returns an explicit unsupported result",
+            "Rider is not exposed as a supported detach backend",
         ):
             self.assertIn(keyword, server_py)
 
@@ -918,6 +1039,76 @@ class ContractTests(unittest.TestCase):
         self.assertIn("allowSideEffects", rider_service)
         self.assertIn("Expansion truncated", rider_service)
 
+    def test_bootstrap_pip_fallback_drains_stderr(self) -> None:
+        bootstrap_py = read("mcp_server/bootstrap.py")
+        pip_fallback = function_source(bootstrap_py, "_pip_install_pydantic_core")
+        ensure_deps = function_source(bootstrap_py, "ensure_deps")
+        dependency_stamp = function_source(bootstrap_py, "_dependency_stamp")
+
+        self.assertIn("_DEPS_ENSURED = False", bootstrap_py)
+        self.assertIn("global _DEPS_ENSURED", ensure_deps)
+        self.assertIn("subprocess.run(", pip_fallback)
+        self.assertIn("capture_output=True", pip_fallback)
+        self.assertIn("check=False", pip_fallback)
+        self.assertNotIn("subprocess.check_call(", pip_fallback)
+        self.assertNotIn("stderr=subprocess.PIPE", pip_fallback)
+        self.assertIn("_dependency_stamp(selected, wheels_dir)", ensure_deps)
+        self.assertIn("_get_target_dir(stamp)", ensure_deps)
+        self.assertIn("_target_marker_matches(target_dir, stamp)", ensure_deps)
+        self.assertIn("_find_valid_repair_target_dir(target_dir, stamp)", ensure_deps)
+        self.assertIn("_allocate_repair_target_dir(target_dir, stamp)", ensure_deps)
+        self.assertNotIn("shutil.rmtree(target_dir)", ensure_deps)
+        self.assertIn("_file_sha256(manifest)", dependency_stamp)
+        self.assertIn("_file_sha256(wheel)", dependency_stamp)
+
+    def test_bootstrap_reuses_repair_dir_for_partial_target(self) -> None:
+        bootstrap = load_bootstrap_module()
+        stamp = "deadbeef" * 8
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            target_dir = tmp_path / "cp311_win_amd64_deadbeefdeadbeef"
+            target_dir.mkdir()
+            stale_repair_dir = tmp_path / f"{target_dir.name}_repair_old"
+            stale_repair_dir.mkdir()
+            (stale_repair_dir / ".bundled_deps").write_bytes(b"\xff")
+            old_time = time.time() - bootstrap.REPAIR_TARGET_STALE_SECONDS - 5
+            (stale_repair_dir / ".bundled_deps").touch()
+            os.utime(stale_repair_dir / ".bundled_deps", (old_time, old_time))
+            os.utime(stale_repair_dir, (old_time, old_time))
+            in_progress_repair_dir = tmp_path / f"{target_dir.name}_repair_recent"
+            in_progress_repair_dir.mkdir()
+            (in_progress_repair_dir / "extracting.tmp").write_text("in progress", encoding="utf-8")
+            fake_wheel = tmp_path / "fake-1.0-py3-none-any.whl"
+            fake_wheel.write_bytes(b"fake")
+            extracted_targets = []
+            added_paths = []
+
+            def fake_extract(_wheel, install_dir):
+                extracted_targets.append(install_dir)
+                (install_dir / "installed.txt").write_text("ok", encoding="utf-8")
+
+            bootstrap._select_wheels = lambda _wheels_dir: [fake_wheel]
+            bootstrap._dependency_stamp = lambda _selected, _wheels_dir: stamp
+            bootstrap._get_target_dir = lambda _stamp: target_dir
+            bootstrap._extract_wheel = fake_extract
+            bootstrap._add_sys_path = lambda install_dir: added_paths.append(install_dir)
+
+            for _ in range(2):
+                bootstrap._DEPS_ENSURED = False
+                bootstrap.ensure_deps()
+
+            repair_dirs = sorted(
+                path for path in tmp_path.iterdir()
+                if path.is_dir() and path.name.startswith(f"{target_dir.name}_repair_")
+            )
+            self.assertFalse(stale_repair_dir.exists())
+            self.assertTrue(in_progress_repair_dir.exists())
+            self.assertEqual(2, len(repair_dirs), [path.name for path in tmp_path.iterdir()])
+            self.assertEqual([repair_dirs[0]], extracted_targets)
+            self.assertEqual([repair_dirs[0], repair_dirs[0]], added_paths)
+            self.assertEqual(stamp, (repair_dirs[0] / ".bundled_deps").read_text(encoding="utf-8"))
+
     def test_thread_enumeration_is_budgeted(self) -> None:
         server_py = read("mcp_server/server.py")
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
@@ -1214,6 +1405,182 @@ class ContractTests(unittest.TestCase):
         self.assertIn("discover_instances(preferred_ide=ide_key)", function_source(server_py, "select_ide_instance"))
         self.assertIn('discover_instances(preferred_ide="vs")', function_source(server_py, "select_vs_instance"))
         self.assertIn("discover_instances(preferred_ide=prefer_ide)", function_source(server_py, "detect_debug_sessions"))
+
+    def test_mcp_tools_are_split_into_domain_modules(self) -> None:
+        server_entry = (ROOT / "mcp_server/server.py").read_text(encoding="utf-8")
+        server_py = read("mcp_server/server.py")
+        module_files = sorted(
+            path.stem
+            for path in (ROOT / "mcp_server/tool_modules").glob("*.py")
+            if path.name != "__init__.py"
+        )
+
+        self.assertIn("from .tool_modules import register_all", server_entry)
+        self.assertIn("from tool_modules import register_all", server_entry)
+        self.assertIn("register_all()", server_entry)
+        self.assertNotIn("@mcp.tool", server_entry)
+        self.assertNotIn("async def get_debug_status", server_entry)
+        self.assertEqual(module_files, sorted(registered_tool_module_names()))
+
+        for source_path in (
+            "mcp_server/mcp_app.py",
+            "mcp_server/tool_context.py",
+            "mcp_server/tool_registry.py",
+            "mcp_server/tool_modules/capability_tools.py",
+            "mcp_server/tool_modules/instance_tools.py",
+            "mcp_server/tool_modules/snapshot_tools.py",
+            "mcp_server/tool_modules/native_managed_tools.py",
+            "mcp_server/tool_modules/control_tools.py",
+            "mcp_server/tool_modules/breakpoint_tools.py",
+            "mcp_server/tool_modules/memory_tools.py",
+        ):
+            self.assertTrue((ROOT / source_path).is_file(), source_path)
+
+        self.assertIn("DOMAIN_MODULES", server_py)
+        self.assertIn("ToolSpec", server_py)
+        self.assertIn('"snapshot": "tool_modules.snapshot_tools"', server_py)
+        self.assertIn('"breakpoint": "tool_modules.breakpoint_tools"', server_py)
+        self.assertIn('"memory": "tool_modules.memory_tools"', server_py)
+        tool_context = read("mcp_server/tool_context.py")
+        self.assertIn("__all__ = [", tool_context)
+        self.assertIn('"format_result"', tool_context)
+        self.assertIn('"handle_ide_error"', tool_context)
+
+    def test_split_server_files_are_packaged_for_vsix_and_rider(self) -> None:
+        csproj_items = vsix_content_items()
+        rider_registration = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/McpClientRegistration.kt")
+        expected_files = expected_packaged_mcp_files()
+        wildcard_include = r"..\mcp_server\tool_modules\*.py"
+        self.assertIn(wildcard_include, csproj_items)
+        self.assertEqual("true", csproj_items[wildcard_include].get("IncludeInVSIX"))
+        self.assertEqual("PreserveNewest", csproj_items[wildcard_include].get("CopyToOutputDirectory"))
+        self.assertEqual(r"mcp_server\tool_modules\%(Filename)%(Extension)", csproj_items[wildcard_include].get("Link"))
+
+        for relative_path in expected_files:
+            with self.subTest(target="vsix", file=relative_path):
+                if relative_path.startswith("tool_modules/") and relative_path.count("/") == 1:
+                    self.assertIn(wildcard_include, csproj_items)
+                else:
+                    include_path = r"..\mcp_server" + "\\" + relative_path.replace("/", "\\")
+                    link_path = "mcp_server\\" + relative_path.replace("/", "\\")
+                    self.assertIn(include_path, csproj_items)
+                    self.assertEqual(link_path, csproj_items[include_path].get("Link"))
+                    self.assertEqual("true", csproj_items[include_path].get("IncludeInVSIX"))
+                    self.assertEqual("PreserveNewest", csproj_items[include_path].get("CopyToOutputDirectory"))
+
+        self.assertEqual(expected_files, rider_base_files(rider_registration))
+
+        self.assertIn('val filesToCopy = (baseFiles + "vendor/wheels/manifest.json" + manifestFiles).distinct()', rider_registration)
+        self.assertIn('val seedFiles = (baseFiles + "vendor/wheels/manifest.json" + manifestFiles).distinct()', rider_registration)
+        self.assertIn("digest.update(fileName.toByteArray(StandardCharsets.UTF_8))", rider_registration)
+        self.assertNotIn("manifestFiles.sorted().forEach", rider_registration)
+        self.assertIn("for (fileName in filesToCopy)", rider_registration)
+
+    def test_split_server_supports_script_and_package_import_modes(self) -> None:
+        server_entry = (ROOT / "mcp_server/server.py").read_text(encoding="utf-8")
+        mcp_app_py = read("mcp_server/mcp_app.py")
+        ide_bridge_py = read("mcp_server/ide_bridge.py")
+        tool_modules_init = read("mcp_server/tool_modules/__init__.py")
+
+        self.assertIn("from . import bootstrap", server_entry)
+        self.assertIn("import bootstrap", server_entry)
+        self.assertIn("from .mcp_app import mcp", server_entry)
+        self.assertIn("from mcp_app import mcp", server_entry)
+        self.assertIn("from .tool_modules import register_all", server_entry)
+        self.assertIn("from tool_modules import register_all", server_entry)
+
+        self.assertIn("from . import vs_bridge", ide_bridge_py)
+        self.assertIn("import vs_bridge", ide_bridge_py)
+        self.assertIn("from . import rider_bridge", ide_bridge_py)
+        self.assertIn("import rider_bridge", ide_bridge_py)
+
+        self.assertIn("bootstrap.ensure_deps()", mcp_app_py)
+        self.assertIn("from . import capability_tools", tool_modules_init)
+
+    def test_split_server_import_modes_smoke(self) -> None:
+        commands = [
+            (
+                "script-style",
+                "import sys; sys.path.insert(0, r'mcp_server'); import server; print('script-style import ok')",
+            ),
+            (
+                "package",
+                "import runpy; runpy.run_module('mcp_server.server', run_name='aidb_package_smoke'); print('package import ok')",
+            ),
+            (
+                "package-register-all",
+                "from mcp_server.tool_modules import register_all; register_all(); print('package register_all import ok')",
+            ),
+            (
+                "script-style-register-all",
+                "import sys; sys.path.insert(0, r'mcp_server'); from tool_modules import register_all; register_all(); print('script-style register_all import ok')",
+            ),
+        ]
+        for mode, script in commands:
+            with self.subTest(mode=mode):
+                result = subprocess.run(
+                    [sys.executable, "-c", script],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertIn("import ok", result.stdout)
+
+    def test_github_workflow_does_not_write_actions_cache(self) -> None:
+        workflow = read(".github/workflows/build.yml")
+
+        self.assertNotIn("actions/cache", workflow)
+        self.assertNotIn("Cache NuGet", workflow)
+        self.assertNotIn("Cache Rider SDK", workflow)
+        self.assertNotIn("cache-read-only", workflow)
+        self.assertNotIn("gradle-home-cache-excludes", workflow)
+        self.assertIn("cache-disabled: true", workflow)
+
+    def test_tool_registry_matches_backend_matrix(self) -> None:
+        registry = load_tool_registry()
+        vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
+        rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
+        ide_bridge_py = read("mcp_server/ide_bridge.py")
+
+        vs_methods = set(re.findall(r'case\s+"([^"]+)"\s*:', vs_pipe))
+        rider_methods = discover_rider_dispatch_methods(rider_service)
+        tool_names = discover_mcp_tool_names()
+
+        self.assertEqual([], registry.validate_tool_specs(vs_methods, rider_methods, tool_names))
+        self.assertEqual("vs", registry.preferred_ide_for_backend_method("attach_process"))
+        self.assertEqual("vs", registry.preferred_ide_for_backend_method("start_debugging"))
+        self.assertIsNone(registry.preferred_ide_for_backend_method("delete_breakpoint"))
+        self.assertEqual("delete_breakpoint", registry.TOOLS["clear_breakpoint"].alias_for)
+        self.assertEqual("set_data_breakpoint", registry.TOOLS["set_watchpoint"].alias_for)
+        self.assertIn("_registry_preferred_ide_for_method", ide_bridge_py)
+        self.assertIn("preferred_ide = _registry_preferred_ide_for_method(method)", ide_bridge_py)
+        self.assertNotIn("except Exception:\n        return None", ide_bridge_py)
+
+        summary = registry.tool_registry_summary()
+        self.assertIn("set_watchpoint", summary["vsOnlyTools"])
+        self.assertEqual(["vs"], summary["toolSupport"]["set_watchpoint"]["supportedBackends"])
+        self.assertEqual(["rider"], summary["toolSupport"]["detach_process"]["unsupportedBackends"])
+        self.assertEqual(["vs"], summary["toolSupport"]["detach_process"]["supportedBackends"])
+        self.assertIn("detach_process", summary["vsOnlyTools"])
+
+        from mcp_server.tool_modules import capability_tools
+
+        categories = capability_tools._categories_with_registry_coverage(summary)
+        categorized_tools = {tool for tools in categories.values() for tool in tools}
+        self.assertEqual(set(summary["toolSupport"]), categorized_tools)
+
+    def test_vs_only_active_debugging_tools_do_not_route_to_rider(self) -> None:
+        server_py = read("mcp_server/server.py")
+
+        for tool_name in ("attach_process", "start_debugging", "detach_process"):
+            with self.subTest(tool_name=tool_name):
+                self.assertIn('preferred_ide="vs"', function_source(server_py, tool_name))
+
+        clear_breakpoint = function_source(server_py, "clear_breakpoint")
+        self.assertIn("return await delete_breakpoint(file_path, line_number)", clear_breakpoint)
+        self.assertNotIn("ide_bridge.call", clear_breakpoint)
 
     def test_vs_memory_search_contract_matches_backend_limit(self) -> None:
         server_py = read("mcp_server/server.py")

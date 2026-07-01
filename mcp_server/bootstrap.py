@@ -2,57 +2,170 @@
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import sys
 import sysconfig
+import time
 import zipfile
+import hashlib
+import os
+import shutil
 from pathlib import Path
 from typing import List, Optional
 
 _MIN_PYTHON = (3, 10)
+_DEPS_ENSURED = False
+REPAIR_TARGET_STALE_SECONDS = 15 * 60
 
 
 def ensure_deps() -> None:
+    global _DEPS_ENSURED
+    if _DEPS_ENSURED:
+        return
+
     if sys.version_info < _MIN_PYTHON:
         raise RuntimeError("Python 3.10+ is required to run AIDebugger.")
 
     wheels_dir = Path(__file__).resolve().parent / "vendor" / "wheels"
     if not wheels_dir.exists():
+        _DEPS_ENSURED = True
         return
 
     selected = _select_wheels(wheels_dir)
     if not selected:
+        _DEPS_ENSURED = True
         return
 
-    target_dir = _get_target_dir()
-    marker = target_dir / ".bundled_deps"
-    stamp = "|".join(sorted([wheel.name for wheel in selected]))
+    stamp = _dependency_stamp(selected, wheels_dir)
+    target_dir = _get_target_dir(stamp)
+    canonical_target_dir = target_dir
 
-    if marker.exists():
-        try:
-            existing = marker.read_text(encoding="utf-8")
-            if existing == stamp and target_dir.exists():
-                _add_sys_path(target_dir)
-                return
-        except Exception:
-            pass
+    if _target_marker_matches(target_dir, stamp):
+        _add_sys_path(target_dir)
+        _DEPS_ENSURED = True
+        return
 
+    # A previous run may have been interrupted after creating the content-addressed
+    # directory but before writing its marker. Do not delete that directory because
+    # Windows can keep extracted .pyd files locked; reuse a completed repair dir
+    # instead of allocating a new one on every startup.
     if target_dir.exists():
-        shutil.rmtree(target_dir)
+        repaired_dir = _find_valid_repair_target_dir(target_dir, stamp)
+        if repaired_dir is not None:
+            _cleanup_stale_repair_target_dirs(canonical_target_dir, stamp, keep=repaired_dir)
+            _add_sys_path(repaired_dir)
+            _DEPS_ENSURED = True
+            return
+        target_dir = _allocate_repair_target_dir(target_dir, stamp)
+    marker = target_dir / ".bundled_deps"
     target_dir.mkdir(parents=True, exist_ok=True)
 
     for wheel in selected:
         _extract_wheel(wheel, target_dir)
 
     marker.write_text(stamp, encoding="utf-8")
+    _cleanup_stale_repair_target_dirs(canonical_target_dir, stamp, keep=target_dir)
     _add_sys_path(target_dir)
+    _DEPS_ENSURED = True
 
 
-def _get_target_dir() -> Path:
+def _dependency_stamp(wheels: List[Path], wheels_dir: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"AIDebugger bundled deps v2\n")
+
+    manifest = wheels_dir / "manifest.json"
+    if manifest.exists():
+        digest.update(b"manifest.json\n")
+        digest.update(_file_sha256(manifest).encode("ascii"))
+        digest.update(b"\n")
+
+    for wheel in sorted(wheels, key=lambda path: path.name.lower()):
+        digest.update(wheel.name.encode("utf-8"))
+        digest.update(b"\n")
+        digest.update(str(wheel.stat().st_size).encode("ascii"))
+        digest.update(b"\n")
+        digest.update(_file_sha256(wheel).encode("ascii"))
+        digest.update(b"\n")
+
+    return digest.hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _get_target_dir(stamp: str) -> Path:
     py_tag = _python_tag()
     platform_tag = _platform_tag()
-    return Path.home() / ".ai-debugger" / "pydeps" / f"{py_tag}_{platform_tag}"
+    return Path.home() / ".ai-debugger" / "pydeps" / f"{py_tag}_{platform_tag}_{stamp[:16]}"
+
+
+def _allocate_repair_target_dir(target_dir: Path, stamp: str) -> Path:
+    base = target_dir.parent
+    prefix = f"{target_dir.name}_repair_{os.getpid()}_"
+    for index in range(100):
+        candidate = base / f"{prefix}{index}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Unable to allocate pydeps repair directory for {stamp[:16]}")
+
+
+def _target_marker_matches(target_dir: Path, stamp: str) -> bool:
+    marker = target_dir / ".bundled_deps"
+    if not target_dir.exists() or not marker.exists():
+        return False
+    try:
+        return marker.read_text(encoding="utf-8") == stamp
+    except (OSError, UnicodeError):
+        return False
+
+
+def _repair_target_dirs(target_dir: Path) -> List[Path]:
+    base = target_dir.parent
+    if not base.exists():
+        return []
+    prefix = f"{target_dir.name}_repair_"
+    return sorted(
+        (candidate for candidate in base.glob(f"{prefix}*") if candidate.is_dir()),
+        key=lambda path: path.name.lower(),
+    )
+
+
+def _find_valid_repair_target_dir(target_dir: Path, stamp: str) -> Optional[Path]:
+    for candidate in _repair_target_dirs(target_dir):
+        if _target_marker_matches(candidate, stamp):
+            return candidate
+    return None
+
+
+def _cleanup_stale_repair_target_dirs(target_dir: Path, stamp: str, keep: Path) -> None:
+    for candidate in _repair_target_dirs(target_dir):
+        if candidate == keep or _target_marker_matches(candidate, stamp):
+            continue
+        if not _repair_target_is_stale(candidate):
+            continue
+        try:
+            shutil.rmtree(candidate)
+        except OSError:
+            pass
+
+
+def _repair_target_is_stale(candidate: Path) -> bool:
+    newest_mtime = 0.0
+    try:
+        newest_mtime = max(newest_mtime, candidate.stat().st_mtime)
+        for path in candidate.rglob("*"):
+            try:
+                newest_mtime = max(newest_mtime, path.stat().st_mtime)
+            except OSError:
+                return False
+    except OSError:
+        return False
+    return (time.time() - newest_mtime) >= REPAIR_TARGET_STALE_SECONDS
 
 
 def _select_wheels(wheels_dir: Path) -> List[Path]:
@@ -116,7 +229,7 @@ def _pip_install_pydantic_core(wheels_dir: Path) -> Optional[Path]:
             f"Downloading pydantic-core=={required_version} via pip...",
             file=sys.stderr,
         )
-        subprocess.check_call(
+        completed = subprocess.run(
             [
                 sys.executable, "-m", "pip", "download",
                 f"pydantic-core=={required_version}",
@@ -126,10 +239,16 @@ def _pip_install_pydantic_core(wheels_dir: Path) -> Optional[Path]:
                 f"--platform={platform_tag}",
                 "-d", str(wheels_dir),
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            capture_output=True,
+            text=True,
+            check=False,
             timeout=120,
         )
+        if completed.returncode != 0:
+            details = (completed.stderr or completed.stdout or "").strip()
+            if len(details) > 2000:
+                details = details[-2000:]
+            raise RuntimeError(details or f"pip exited with code {completed.returncode}")
     except Exception as exc:
         print(f"[AIDebugger] pip download failed: {exc}", file=sys.stderr)
         return None

@@ -6,8 +6,12 @@ import asyncio
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
-import vs_bridge
-import rider_bridge
+try:
+    from . import vs_bridge
+    from . import rider_bridge
+except ImportError:
+    import vs_bridge
+    import rider_bridge
 
 
 class IDEBridgeError(Exception):
@@ -51,6 +55,15 @@ class IDEInstance:
     def __repr__(self) -> str:
         status = "Paused" if self.is_paused else ("Debugging" if self.is_debugging else "Idle")
         return f"IDEInstance(ide={self.ide}, pid={self.process_id}, solution='{self.solution_name}', status={status})"
+
+
+def _registry_preferred_ide_for_method(method: str) -> Optional[str]:
+    try:
+        from .tool_registry import preferred_ide_for_backend_method
+    except ImportError:
+        from tool_registry import preferred_ide_for_backend_method
+
+    return preferred_ide_for_backend_method(method)
 
 
 class IDEBridge:
@@ -183,6 +196,8 @@ class IDEBridge:
         timeout: float = 10.0,
         preferred_ide: Optional[str] = None,
     ) -> Any:
+        if preferred_ide is None:
+            preferred_ide = _registry_preferred_ide_for_method(method)
         requested_preferred = self._normalize_ide(preferred_ide)
         if preferred_ide is not None and requested_preferred is None:
             raise IDEBridgeError("preferred_ide must be 'vs' or 'rider'")

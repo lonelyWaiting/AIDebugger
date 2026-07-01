@@ -44,14 +44,6 @@ jobs:
     - name: Setup NuGet
       uses: NuGet/setup-nuget@v2
 
-    - name: Cache NuGet packages
-      uses: actions/cache@v4
-      with:
-        path: ~/.nuget/packages
-        key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
-        restore-keys: |
-          nuget-${{ runner.os }}-
-
     - name: Restore NuGet packages
       run: nuget restore VSDebuggerMCP/VSDebuggerMCP.csproj
 
@@ -87,19 +79,8 @@ jobs:
       uses: gradle/actions/setup-gradle@v4
       with:
         validate-wrappers: true
-        cache-read-only: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
-        # Rider SDK is cached separately below with a more stable key.
-        # Exclude it from setup-gradle's cache to avoid redundant storage.
-        gradle-home-cache-excludes: |
-          caches/modules-2/files-2.1/com.jetbrains.intellij.rider
-
-    - name: Cache Rider SDK
-      uses: actions/cache@v4
-      with:
-        path: ~/.gradle/caches/modules-2/files-2.1/com.jetbrains.intellij.rider
-        key: rider-sdk-${{ hashFiles('RiderDebuggerMCP/gradle.properties') }}
-        restore-keys: |
-          rider-sdk-
+        # Keep GitHub Actions cache usage at zero for this workflow.
+        cache-disabled: true
 
     - name: Build Rider plugin
       run: ./RiderDebuggerMCP/gradlew -p RiderDebuggerMCP buildPlugin --no-daemon

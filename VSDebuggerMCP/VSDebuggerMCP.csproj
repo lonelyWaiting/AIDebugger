@@ -98,6 +98,26 @@
       <IncludeInVSIX>true</IncludeInVSIX>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <Content Include="..\mcp_server\mcp_app.py">
+      <Link>mcp_server\mcp_app.py</Link>
+      <IncludeInVSIX>true</IncludeInVSIX>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\mcp_server\tool_context.py">
+      <Link>mcp_server\tool_context.py</Link>
+      <IncludeInVSIX>true</IncludeInVSIX>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\mcp_server\tool_registry.py">
+      <Link>mcp_server\tool_registry.py</Link>
+      <IncludeInVSIX>true</IncludeInVSIX>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\mcp_server\tool_modules\*.py">
+      <Link>mcp_server\tool_modules\%(Filename)%(Extension)</Link>
+      <IncludeInVSIX>true</IncludeInVSIX>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="..\mcp_server\requirements.txt">
       <Link>mcp_server\requirements.txt</Link>
       <IncludeInVSIX>true</IncludeInVSIX>

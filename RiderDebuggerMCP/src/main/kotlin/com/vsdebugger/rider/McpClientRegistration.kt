@@ -29,6 +29,17 @@ object McpClientRegistration {
         "ide_bridge.py",
         "vs_bridge.py",
         "rider_bridge.py",
+        "mcp_app.py",
+        "tool_context.py",
+        "tool_registry.py",
+        "tool_modules/__init__.py",
+        "tool_modules/breakpoint_tools.py",
+        "tool_modules/capability_tools.py",
+        "tool_modules/control_tools.py",
+        "tool_modules/instance_tools.py",
+        "tool_modules/memory_tools.py",
+        "tool_modules/native_managed_tools.py",
+        "tool_modules/snapshot_tools.py",
         "bootstrap.py",
         "cursor_allowlist_sync.py",
         "requirements.txt"
@@ -362,14 +373,12 @@ object McpClientRegistration {
     private fun computeBundleSignature(manifestFiles: List<String>): String? {
         return try {
             val digest = MessageDigest.getInstance("SHA-256")
-            val seedFiles = (baseFiles + "vendor/wheels/manifest.json").distinct()
+            val seedFiles = (baseFiles + "vendor/wheels/manifest.json" + manifestFiles).distinct()
             for (fileName in seedFiles) {
                 val bytes = readResourceBytes(fileName) ?: return null
+                digest.update(fileName.toByteArray(StandardCharsets.UTF_8))
+                digest.update('\n'.code.toByte())
                 digest.update(bytes)
-            }
-            // Wheel list changes when bundled wheel set changes.
-            manifestFiles.sorted().forEach { file ->
-                digest.update(file.toByteArray(StandardCharsets.UTF_8))
                 digest.update('\n'.code.toByte())
             }
             digest.digest().joinToString("") { "%02x".format(it) }

@@ -1,226 +1,251 @@
 # AIDebugger MCP
 
-A Model Context Protocol (MCP) server that enables Cursor IDE to access Visual Studio and Rider debugging information, including call stacks, local variables, threads, modules, memory inspection, and disassembly.
+AIDebugger exposes Visual Studio and JetBrains Rider debugger state through a
+Model Context Protocol (MCP) server. It is intended for MCP clients such as
+Cursor, Codex, Claude Desktop, Claude Code, and OpenCode.
+
+It supports call stacks, locals, threads, modules, exceptions, build errors,
+debug output, expression evaluation, memory reads/search, disassembly, breakpoints,
+execution control, and Visual Studio-only no-source native/managed workflows.
 
 ## Architecture
 
 ```
-Visual Studio (AIDebuggerVS) -- named pipe --> Python MCP server (AIDebugger) -- stdio --> Cursor
-Rider (AIDebuggerRider) -----^
+Visual Studio VSIX  -- named pipe JSON-RPC --+
+                                             +--> Python FastMCP server -- stdio --> MCP client
+Rider plugin       -- named pipe JSON-RPC --+
 ```
 
+Each IDE instance owns a named pipe:
 
-### Multi-Instance Support
+- Visual Studio: `\\.\pipe\AIDebuggerVS_<PID>`
+- Rider: `\\.\pipe\AIDebuggerRider_<PID>`
 
-The system supports multiple IDE instances (Visual Studio + Rider) running simultaneously:
-
-- **Automatic Selection**: If only one instance is in debugging/paused state, it will be automatically selected
-- **Strict IDE Binding**: `AIDebuggerVS` only connects to Visual Studio; `AIDebuggerRider` only connects to Rider
-- **Proactive Detection**: Use `detect_debug_sessions` to auto-detect and select a session
-- **Manual Selection**: Use `list_ide_instances` and `select_ide_instance` to choose one
-- **Smart Priority**: Paused instances (at breakpoint) have highest priority for auto-selection
+The Python server can discover multiple instances, prefer paused/debugging
+sessions, and pin later calls to a selected IDE instance.
 
 ## Components
 
-### 1. Visual Studio Extension (AIDebugger VS)
+### Visual Studio Extension
 
-A VSIX extension that runs inside Visual Studio and provides access to the debugger API via a Named Pipe server.
+Location: `VSDebuggerMCP/`
 
-**Location:** `VSDebuggerMCP/`
+Important files:
 
-**Features:**
-- Automatic initialization on VS startup
-- Named Pipe server for IPC communication
-- Pipe security allows admin IDE with non-admin Cursor
-- Access to EnvDTE debugger APIs
-- Support for all debugging operations
-- **Auto-registration with Cursor MCP** - registers `AIDebuggerVS` in `mcp.json` on first run
+- `VSDebuggerMCPPackage.cs` - package startup and MCP client registration.
+- `DebuggerService.cs` - debugger operations implemented on top of EnvDTE and VS APIs.
+- `NamedPipeServer.cs` - JSON-RPC request dispatch over named pipes.
+- `McpClientRegistration.cs` - seeds the Python MCP server and registers MCP clients.
+- `Protocol/DebugModels.cs` - response models shared with the bridge contract tests.
 
-### 2. Rider Plugin (AIDebugger Rider)
+Visual Studio has the richest backend. VS-only tools include attach/start,
+detach, data/address breakpoints, native address/module inspection, managed IL
+inspection, and hybrid no-source capture flows.
 
-A Rider plugin that runs inside JetBrains Rider and provides access to the debugger API via a Named Pipe server.
+### Rider Plugin
 
-**Location:** `RiderDebuggerMCP/`
+Location: `RiderDebuggerMCP/`
 
-**Features:**
-- Automatic initialization on Rider startup
-- Named Pipe server for IPC communication
-- Pipe security allows admin IDE with non-admin Cursor
-- Access to Rider debugger APIs
-- Auto-registration with Cursor MCP (`AIDebuggerRider`)
+Important files:
 
-### 3. Python MCP Server
+- `RiderDebuggerPlugin.kt` - plugin startup and MCP client registration.
+- `DebuggerService.kt` - Rider debugger operations.
+- `NamedPipeServer.kt` - JSON-RPC request dispatch over named pipes.
+- `McpClientRegistration.kt` - seeds the Python MCP server and registers MCP clients.
+- `protocol/DebugModels.kt` - response models aligned with the VS contracts.
 
-A Python-based MCP server that connects to the VS extension and Rider plugin and exposes tools to Cursor.
+Rider supports the common snapshot, stepping, breakpoint, memory, disassembly,
+and stop flows. Rider detach and the VS-only no-source/native-managed tools are
+not exposed as supported Rider backends.
 
-**Location:** `mcp_server/`
+### Python MCP Server
 
-**Files:**
-- `server.py` - Main MCP server with tool definitions
-- `vs_bridge.py` - Named Pipe client for VS communication
-- `rider_bridge.py` - Named Pipe client for Rider communication
-- `ide_bridge.py` - Unified bridge with auto-selection logic
-- `bootstrap.py` - Loads bundled Python dependencies on startup
-- `vendor/wheels/` - Bundled Python wheels (no pip required)
-- `vendor/wheels/manifest.json` - Wheel manifest (files + hashes)
-- `requirements.txt` - Python dependencies (dev only)
+Location: `mcp_server/`
 
-## Available Tools
+Important files:
 
-The MCP keeps the low-level tools exposed for client compatibility, but AI agents should use `debug_capabilities` as the progressive-discovery entry point when they are unsure which tool to call. This avoids relying on one large flat tool list while still keeping direct calls available for precise workflows.
+- `server.py` - thin stdio entry point; sets UTF-8, runs bootstrap, registers tool modules.
+- `mcp_app.py` - shared FastMCP application instance.
+- `tool_modules/` - domain modules for capability, instance, snapshot, control,
+  breakpoint, memory, and native/managed tools.
+- `tool_registry.py` - declarative tool/backend matrix, aliases, timeout classes,
+  supported backends, and registry validation.
+- `tool_context.py` - shared formatting, error handling, timeout, and request helpers.
+- `ide_bridge.py` - backend selection and preferred-IDE routing.
+- `vs_bridge.py` / `rider_bridge.py` - named pipe clients.
+- `bootstrap.py` - extracts bundled wheels to a content-addressed
+  `~/.ai-debugger/pydeps/...` directory.
+- `vendor/wheels/` - bundled Python wheels; runtime does not require `pip install`.
 
-### Instance Management
+`debug_capabilities` returns the current categorized tool index and embeds the
+registry summary. Use it as the authoritative discovery entry point instead of
+assuming a fixed flat tool list.
 
-| Tool | Description |
-|------|-------------|
-| `debug_capabilities` | Categorized tool index for progressive discovery |
-| `detect_debug_sessions` | Detect available VS/Rider debug sessions and auto-select one |
-| `list_ide_instances` | List all IDE instances (VS + Rider) with their status |
-| `select_ide_instance` | Select a specific IDE instance by IDE + process ID |
-| `clear_ide_selection` | Clear selection and return to auto-select mode |
-| `list_vs_instances` | List all VS instances with their status (legacy) |
-| `select_vs_instance` | Select a specific VS instance by process ID (legacy) |
-| `clear_vs_selection` | Clear VS selection and return to auto-select mode (legacy) |
+## Tool Domains
 
-### Debug Information
+The server currently exposes 77 MCP tools. The registry in
+`mcp_server/tool_registry.py` is the source of truth for names, aliases, backend
+support, and timeout classes.
 
-| Tool | Description |
-|------|-------------|
-| `get_debug_status` | Get current debugging state (running, paused, etc.) |
-| `get_callstack` | Get complete call stack with file paths and line numbers |
-| `get_locals` | Get local variables and parameters in current scope with bounded expansion |
-| `get_threads` | Get all threads with their states and locations |
-| `get_modules` | Get loaded modules/assemblies |
-| `get_exception` | Get current exception details |
-| `evaluate_expression` | Evaluate expressions in debug context with `timeout_seconds` and bounded child expansion |
-| `evaluate_expressions_batch` | Evaluate multiple expressions in one snapshot to reduce drift |
-| `read_memory` | Read raw memory at specified address |
-| `get_disassembly` | Get disassembly at current location |
-| `get_disassembly_at` | Get disassembly at specified address |
-| `get_build_errors` | Get all build errors and warnings (with error codes like CS0001) |
-| `get_errors_only` | Get only build errors |
-| `get_warnings_only` | Get only build warnings |
-| `get_full_context` | Get all debugging information at once |
-| `capture_debug_bundle` | Capture a stable low-blocking debug bundle with snapshot metadata; locals/modules/registers/output are explicit opt-ins |
+### Capability and Instance Selection
 
-`get_debug_status` and `capture_debug_bundle` include standardized `stopReason` values (`not_paused`, `breakpoint`, `exception`, `step`, `user_break`, `pause_unknown`) so AI prompts can branch on a stable schema.
-By default, `capture_debug_bundle()` captures only status, call stack, exception, and threads. Use `include_locals`, `include_modules`, `include_registers`, or `include_output` only when that heavier data is actually needed.
-Thread frames are budgeted by default. For a complete thread snapshot, pass `thread_max_frames_per_thread=0`, `thread_max_nodes=0`, `thread_budget_ms=0` or a large `thread_budget_ms`, and enough `timeout_seconds`; `partial=false` means the returned thread/frame set was complete within that budget.
-Expression tools attempt the requested expression and return the IDE's explicit value/error/timeout result. When a function call is risky or unavailable in the debug engine, prefer field/address/memory inspection or Unreal-specific value decoding.
+- `debug_capabilities`
+- `detect_debug_sessions`
+- `list_ide_instances`, `select_ide_instance`, `clear_ide_selection`
+- Legacy VS-scoped aliases: `list_vs_instances`, `select_vs_instance`, `clear_vs_selection`
 
-### Debug Control
+### Snapshot and Inspection
 
-| Tool | Description |
-|------|-------------|
-| `attach_process` | Attach Visual Studio to a process by PID or executable name |
-| `start_debugging` | Start the current VS debug profile, or launch an exe and attach |
-| `debug_control` | Unified execution-control entry point (`continue`, `pause`, `stop`, `step_over`, `step_into`, `step_out`, `detach`) |
-| `debug_continue` | Continue execution (F5) |
-| `continue` | Alias for `debug_continue` |
-| `continue_and_wait_for_break` | Continue or wait for the next debug stop, then auto-capture the same low-blocking debug bundle |
-| `debug_step_over` | Step over current line (F10) |
-| `step_over` | Alias for `debug_step_over` |
-| `debug_step_into` | Step into function (F11) |
-| `step_into` | Alias for `debug_step_into` |
-| `debug_step_out` | Step out of function (Shift+F11) |
-| `step_out` | Alias for `debug_step_out` |
-| `debug_break` | Break/pause execution |
-| `pause` | Alias for `debug_break` |
-| `debug_stop` | Stop debugging / terminate current debug session (Shift+F5) |
-| `stop_debugging` | Alias for `debug_stop` |
-| `detach_process` | Detach the Visual Studio debugger from the current process without terminating it |
-| `detach_debugger` | Alias for `detach_process` |
-| `debug_run_to_cursor` | Run to specified file and line |
-| `debug_set_next_statement` | Set next statement to execute (move IP) |
+- `get_debug_status`
+- `get_callstack`, `get_call_stack`
+- `get_locals`
+- `evaluate_expression`, `evaluate_expressions_batch`
+- `get_threads`, `list_threads`
+- `get_modules`, `get_exception`
+- `get_build_errors`, `get_errors_only`, `get_warnings_only`
+- `get_debug_output`, `search_output`
+- `get_full_context`
+- `capture_debug_bundle`
+- `crash_triage`
+- `step_and_capture`
 
-### Breakpoint Management
+`capture_debug_bundle()` is low-blocking by default: it captures status,
+callstack, exception, and budgeted threads. Locals, modules, registers, and
+output are explicit opt-ins. Expression tools attempt the requested expression
+and return the IDE's explicit value/error/timeout result.
 
-| Tool | Description |
-|------|-------------|
-| `get_breakpoints` | Get all breakpoints with conditions and hit counts |
-| `set_breakpoint` | Set breakpoint at file:line (supports conditions and hit counts) |
-| `set_function_breakpoint` | Set breakpoint on function entry (supports conditions and hit counts) |
-| `set_data_breakpoint` | Set a Visual Studio native data breakpoint/watchpoint where supported |
-| `set_watchpoint` | Alias for `set_data_breakpoint` |
-| `delete_breakpoint` | Delete breakpoint at file:line |
-| `clear_breakpoint` | Alias for `delete_breakpoint` |
-| `delete_all_breakpoints` | Delete all breakpoints |
-| `enable_breakpoint` | Enable or disable a breakpoint |
+### Execution Control
 
-Non-breaking Visual Studio tracepoint/logpoint actions are not exposed as MCP tools because EnvDTE has no reliable public action/message API for them.
+- `attach_process` (Visual Studio only)
+- `start_debugging` (Visual Studio only)
+- `debug_control`
+- `debug_continue`, `continue`
+- `continue_and_wait_for_break`
+- `continue_and_capture_native` (Visual Studio only)
+- `debug_step_over`, `step_over`
+- `debug_step_into`, `step_into`
+- `debug_step_out`, `step_out`
+- `debug_break`, `pause`
+- `debug_stop`, `stop_debugging`
+- `detach_process`, `detach_debugger` (Visual Studio only)
+- `debug_run_to_cursor`
+- `debug_set_next_statement`
 
-### Navigation
+For Rider, use stop tools to terminate the current debugging session; detach is
+not advertised as supported.
 
-| Tool | Description |
-|------|-------------|
-| `switch_stack_frame` | Switch to different stack frame |
-| `select_stack_frame` | Alias for `switch_stack_frame` |
-| `switch_thread` | Switch to different thread |
-| `select_thread` | Alias for `switch_thread` |
-| `get_call_stack` | Alias for `get_callstack` |
-| `list_threads` | Alias for `get_threads` |
+### Breakpoints and Navigation
 
-### Advanced
+- `get_breakpoints`
+- `get_breakpoint_bindings` (Visual Studio only)
+- `continue_and_capture_breakpoint` (Visual Studio only)
+- `set_breakpoint`
+- `set_function_breakpoint`
+- `set_data_breakpoint`, `set_watchpoint` (Visual Studio only)
+- `set_address_breakpoint` (Visual Studio only)
+- `delete_breakpoint`, `clear_breakpoint`
+- `delete_all_breakpoints`
+- `enable_breakpoint`
+- `switch_stack_frame`, `select_stack_frame`
+- `switch_thread`, `select_thread`
 
-| Tool | Description |
-|------|-------------|
-| `get_registers` | Get CPU registers (RAX, RBX, RIP, etc.) |
-| `add_watch` | Add expression to watch window |
-| `search_memory` | Search for pattern in memory |
+Non-breaking Visual Studio tracepoint/logpoint actions are not exposed because
+EnvDTE does not provide a reliable public action/message API for them.
+
+### Memory, Disassembly, Registers, Watches
+
+- `read_memory`
+- `search_memory`
+- `get_disassembly`
+- `get_disassembly_at`
+- `get_registers`
+- `add_watch`
+
+No write-memory or patching tool is exposed.
+
+### Visual Studio No-Source Workflows
+
+- Native: `resolve_address`, `get_module_layout`, `capture_native_context`,
+  `continue_and_capture_native`, `set_address_breakpoint`
+- Managed: `inspect_managed_assembly`, `inspect_managed_type`,
+  `inspect_managed_method_il`
+- Hybrid: `capture_hybrid_context`, `continue_and_capture_breakpoint`,
+  `get_breakpoint_bindings`
+
+These tools are Visual Studio only in the current implementation.
 
 ## Installation
 
 ### Prerequisites
 
-- Windows 10/11 (debugger integrations are Windows-only)
-- Visual Studio 2026 (18.0+) recommended (Visual Studio 2022 17.0+ also works)
-- JDK 21+ (for Rider plugin build)
-- Python 3.10-3.13 (x64)
-- Cursor IDE
+- Windows 10/11 for the IDE debugger integrations.
+- Visual Studio 2022 17.0+ or Visual Studio 2026 18.0+.
+- JetBrains Rider for the Rider plugin.
+- JDK 21+ for Rider plugin builds.
+- Python 3.10-3.13 x64 for the MCP server.
+- One or more MCP clients: Cursor, Codex, Claude Desktop, Claude Code, or OpenCode.
 
-### Step 1: Build and Install VS Extension
+### Build Visual Studio VSIX
 
-1. Open `AIDebugger.sln` in Visual Studio
-2. Build the solution in Release mode (builds the VSIX and triggers the Rider plugin build via `RiderBuild.csproj`)
-   - The first build will download Gradle via the wrapper in `RiderDebuggerMCP/`
-3. Install the generated VSIX package for your Visual Studio version:
-   - `VSDebuggerMCP/bin/Release/VSDebuggerMCP.VS2022.vsix` (targets VS 2022 only)
-   - `VSDebuggerMCP/bin/Release/VSDebuggerMCP.VS2026.vsix` (targets VS 2026 only)
-   - The generic `VSDebuggerMCP.vsix` is removed after build to avoid accidentally installing the wrong package.
-   - The VS 2026 package does not target VS 2022, so the installer will not prompt to install it into VS 2022.
-   - Optional scripted install (instance-aware):
-     - `VSDebuggerMCP/Install-VSIX.cmd -Target vs2022`
-     - `VSDebuggerMCP/Install-VSIX.cmd -Target vs2026`
-     - `VSDebuggerMCP/Install-VSIX.cmd -Target all`
-     - This script also seeds MCP server files to `<user-home>/.ai-debugger/mcp_server`.
-4. The Rider plugin ZIP is created in `RiderDebuggerMCP/build-<id>/distributions/` when building via Visual Studio.
-   - When building directly with Gradle, the ZIP is created in `RiderDebuggerMCP/build/distributions/`
-   - Visual Studio builds keep only the most recent Rider build folders by default. Adjust `RiderBuildRetention` in `RiderBuild.csproj` to change the retention count.
-5. Restart Visual Studio
+```powershell
+nuget restore VSDebuggerMCP/VSDebuggerMCP.csproj
+msbuild VSDebuggerMCP/VSDebuggerMCP.csproj /p:Configuration=Release /p:DeployExtension=false
+```
 
-### Step 2: Configure MCP Clients (Automatic!)
+Outputs:
 
-Each extension **registers its own MCP server** on first start:
+- `VSDebuggerMCP/bin/Release/VSDebuggerMCP.VS2022.vsix`
+- `VSDebuggerMCP/bin/Release/VSDebuggerMCP.VS2026.vsix`
 
-- VS extension: `AIDebuggerVS` (strictly Visual Studio)
-- Rider plugin: `AIDebuggerRider` (strictly Rider)
+The intermediate `VSDebuggerMCP.vsix` is deleted at the end of the build to
+avoid installing the wrong target package.
 
-The Python MCP server files and dependencies are **bundled with each extension**, so no manual pip install is required.
-On first run, the MCP server extracts bundled wheels to `<user-home>/.ai-debugger/pydeps`.
+Install examples:
 
-Automatic registration targets:
+```powershell
+VSDebuggerMCP/Install-VSIX.cmd -Target vs2022
+VSDebuggerMCP/Install-VSIX.cmd -Target vs2026
+VSDebuggerMCP/Install-VSIX.cmd -Target all
+```
+
+The install script also seeds MCP server files to
+`<user-home>/.ai-debugger/mcp_server`.
+
+### Build Rider Plugin
+
+```powershell
+cd RiderDebuggerMCP
+./gradlew.bat buildPlugin
+```
+
+Output:
+
+- `RiderDebuggerMCP/build/distributions/*.zip`
+
+Set `RIDER_HOME` to a local Rider installation if you need to build against that
+installation. Otherwise Gradle uses the platform version configured in
+`RiderDebuggerMCP/gradle.properties`.
+
+### Automatic MCP Client Registration
+
+On IDE startup, each extension registers its own strict MCP entry:
+
+- Visual Studio: `AIDebuggerVS` with `AIDB_PREFERRED_IDE=vs`
+- Rider: `AIDebuggerRider` with `AIDB_PREFERRED_IDE=rider`
+
+Supported registration targets:
 
 - Cursor: `~/.cursor/mcp.json`
+- Codex: `$CODEX_HOME/config.toml` or `~/.codex/config.toml`
 - Claude Desktop: `%APPDATA%/Claude/claude_desktop_config.json`
-- Claude Code (including the Claude Code extension used inside Cursor/VS Code): `~/.claude.json`
+- Claude Code: `~/.claude.json`
+- OpenCode: `~/.config/opencode/opencode.json`
 
-After installing the VS extension and restarting Visual Studio, restart the MCP client you want to use so the new server list is picked up.
+Restart the MCP client after installing or updating the IDE extension.
 
-The VS install script and Rider plugin both copy MCP server files to `<user-home>/.ai-debugger/mcp_server` when needed.
+### Manual MCP Configuration
 
-**Manual Configuration (Optional):**
-
-If auto-registration doesn't work, you can manually add the following to your Cursor MCP configuration (`~/.cursor/mcp.json`):
+If automatic registration fails, point the client at the seeded server:
 
 ```json
 {
@@ -239,146 +264,102 @@ If auto-registration doesn't work, you can manually add the following to your Cu
 }
 ```
 
-**Note:** Replace `<user-home>` with your home directory. If your default `python` points to Python 3.14+, use `py -3.13` (or another 3.10-3.13 interpreter).
-If you only use one IDE, you can omit the other MCP entry.
+Use an installed Python 3.10-3.13 interpreter. Runtime dependencies are bundled;
+the server extracts wheels on first run.
 
 ## Usage
 
-### Single IDE Instance (Simple Case)
+1. Start Visual Studio or Rider with the AIDebugger extension installed.
+2. Start or attach to a debug session.
+3. Ask the MCP client to call `detect_debug_sessions`.
+4. Use `debug_capabilities` when unsure which tool is appropriate.
+5. For repro loops, use `continue_and_wait_for_break` or the more focused
+   `continue_and_capture_*` tools.
+6. For first-pass crash/bug diagnosis, prefer `capture_debug_bundle()` in its
+   default low-blocking mode and opt in to heavier data only when needed.
 
-1. Start Visual Studio or Rider with the extension installed
-2. Open your project and start debugging (F5)
-3. When the debugger hits a breakpoint, use Cursor to query debugging information
-4. Or use `continue_and_wait_for_break` to let the program run, reproduce the issue, and auto-capture a bundle on the next stop
-
-### Multiple IDE Instances (VS + Rider)
-
-When you have multiple IDE instances running:
-
-1. **Pick the matching MCP**:
-   - `AIDebuggerVS` only connects to Visual Studio
-   - `AIDebuggerRider` only connects to Rider
-
-2. **Automatic Selection** (most common case):
-   - If only one instance is paused at a breakpoint, it will be automatically selected
-   - Just ask your debugging question directly
-
-3. **Manual Selection** (when needed):
-   - Use `detect_debug_sessions` to auto-detect and select a session
-   - Or use `list_ide_instances` to see all available instances
-   - Use `select_ide_instance` with the IDE + process ID to select one
-   - All subsequent queries will use that instance
-
-### Example Queries in Cursor
-
-**Basic Debugging:**
-- "What's the current call stack?"
-- "Show me the local variables"
-- "What exception was thrown?"
-- "Read 256 bytes of memory at &myVariable"
-- "Get the disassembly of the current function"
-
-**Multi-Instance:**
-- "Detect debug sessions" -> calls `detect_debug_sessions` and auto-selects a paused/debugging instance
-- "List all IDE instances" -> shows all instances with their status
-- "Select VS instance 12345" -> selects the VS instance with PID 12345
-- "Select Rider instance 56789" -> selects the Rider instance with PID 56789
-- "Analyze current call stack" -> analyzes call stack of the selected (or auto-selected) instance
-
-## Troubleshooting
-
-### "Cannot connect to IDE"
-
-1. Ensure Visual Studio or Rider is running
-2. Check that the AIDebugger extensions are installed (VS: Extensions > Manage Extensions, Rider: Settings > Plugins)
-3. Look for "AIDebugger" logs in VS Output window or Rider logs
-4. Try restarting the IDE
-
-### "Not in break mode"
-
-Most debugging tools require the debugger to be paused at a breakpoint. Start debugging and hit a breakpoint first.
-
-### "Preferred IDE not found"
-
-This means the MCP entry does not match the running IDE. For example, `AIDebuggerVS` is running but only Rider is open.
-Start the correct IDE or use the matching MCP entry in Cursor.
-
-### Named Pipe Issues
-
-Each VS/Rider instance creates a unique named pipe:
-
-- VS: `\\.\pipe\AIDebuggerVS_<PID>` (e.g., `AIDebuggerVS_12345`)
-- Rider: `\\.\pipe\AIDebuggerRider_<PID>` (e.g., `AIDebuggerRider_56789`)
-
-If you have connection issues:
-1. Check if pipes exist using PowerShell:
-   - VS: `Get-ChildItem \\.\pipe\ | Where-Object { $_.Name -like "AIDebuggerVS_*" }`
-   - Rider: `Get-ChildItem \\.\pipe\ | Where-Object { $_.Name -like "AIDebuggerRider_*" }`
-2. Ensure no firewall or security software is blocking named pipes
-3. Use `list_ide_instances` in Cursor to see which IDE instances are detected
+When multiple IDE instances are running, use `list_ide_instances` and
+`select_ide_instance` to pin the target. Without a manual selection, the bridge
+prefers paused/debugging instances.
 
 ## Development
 
-### Building the VS Extension
+Run the MCP server directly:
 
-```bash
-cd VSDebuggerMCP
-msbuild /p:Configuration=Release
-```
-
-To build the Rider plugin against a local Rider installation, set `RIDER_HOME` to the Rider install directory before running Gradle.
-Otherwise the build will download the Rider platform defined by `riderPlatformVersion` in `RiderDebuggerMCP/gradle.properties`.
-
-### Running the MCP Server Directly
-
-```bash
+```powershell
 cd mcp_server
 python server.py
 ```
 
-The server will extract bundled dependencies to `<user-home>/.ai-debugger/pydeps` on first run.
+For development-only dependency installation:
 
-### Testing the Named Pipe
+```powershell
+cd mcp_server
+pip install -r requirements.txt
+```
 
-You can test the named pipe connection using the included test script:
+Contract tests:
 
-```bash
+```powershell
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+Named pipe smoke test:
+
+```powershell
 cd mcp_server
 python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_available()))"
 ```
 
+GitHub Actions builds intentionally disable NuGet, Gradle, and Rider SDK cache
+writing to avoid consuming the repository cache quota.
+
+## Troubleshooting
+
+### Cannot connect to IDE
+
+1. Confirm Visual Studio or Rider is running.
+2. Confirm the matching AIDebugger extension/plugin is installed.
+3. Check the AIDebugger output/logs in the IDE.
+4. Use `list_ide_instances` or `detect_debug_sessions` from the MCP client.
+5. Restart the IDE if the named pipe is stale.
+
+### Not in break mode
+
+Most inspection tools require the debugger to be paused. Start debugging and hit
+a breakpoint, break manually, or use `continue_and_wait_for_break`.
+
+### Preferred IDE not found
+
+The MCP entry is strict. `AIDebuggerVS` only routes to Visual Studio and
+`AIDebuggerRider` only routes to Rider. Start the matching IDE or use the other
+MCP entry.
+
+### Check named pipes
+
+```powershell
+Get-ChildItem \\.\pipe\ | Where-Object { $_.Name -like "AIDebuggerVS_*" }
+Get-ChildItem \\.\pipe\ | Where-Object { $_.Name -like "AIDebuggerRider_*" }
+```
+
 ## Protocol
 
-### Named Pipe Protocol
+Named pipe requests use JSON-RPC style messages:
 
-The VS extension and Python server communicate using JSON-RPC style messages over a named pipe:
-
-**Request:**
 ```json
-{
-  "id": "unique-request-id",
-  "method": "get_callstack",
-  "params": {}
-}
+{"id":"request-id","method":"get_callstack","params":{}}
 ```
 
-**Response:**
+Successful response:
+
 ```json
-{
-  "id": "unique-request-id",
-  "result": { ... }
-}
+{"id":"request-id","result":{}}
 ```
 
-**Error:**
+Error response:
+
 ```json
-{
-  "id": "unique-request-id",
-  "error": {
-    "code": "ERROR_CODE",
-    "message": "Error description"
-  }
-}
+{"id":"request-id","error":{"code":"ERROR_CODE","message":"Error description"}}
 ```
 
 ## License
