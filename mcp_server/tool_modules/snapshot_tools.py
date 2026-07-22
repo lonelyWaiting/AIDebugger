@@ -1,14 +1,75 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import asyncio
+import re
 
 try:
-    from .. import ide_bridge
-    from ..mcp_app import mcp
+    from .. import vs_bridge
+    from ..tool_runtime import backend as ide_bridge, mcp
     from ..tool_context import *
 except ImportError:
-    import ide_bridge
-    from mcp_app import mcp
+    import vs_bridge
+    from tool_runtime import backend as ide_bridge, mcp
     from tool_context import *
+
+
+def _normalize_nonzero_address_literal(value: Any) -> Optional[str]:
+    """Return a protocol-safe address literal without evaluating an expression."""
+    if value is None:
+        return None
+    text = str(value).strip().replace("`", "").replace("_", "")
+    match = re.fullmatch(r"(?:0[xX])?([0-9A-Fa-f]+)(?:[hH])?", text)
+    if not match:
+        return None
+    try:
+        parsed = int(match.group(1), 16)
+    except ValueError:
+        return None
+    return f"0x{parsed:X}" if parsed > 0 else None
+
+
+def _stack_pointer_from_bundle(bundle: Any) -> Optional[Tuple[str, str]]:
+    """Extract a stack pointer only from a stable, explicitly available snapshot."""
+    if not isinstance(bundle, dict):
+        return None
+    register_result = bundle.get("registers")
+    if not isinstance(register_result, dict):
+        return None
+    if str(register_result.get("snapshotStatus") or "").strip().lower() != "stable":
+        return None
+    status = str(register_result.get("status") or "").strip().lower()
+    if status not in ("complete", "partial"):
+        return None
+    registers = register_result.get("registers")
+    if not isinstance(registers, list):
+        return None
+    unavailable_values = register_result.get("unavailableRegisters")
+    if not isinstance(unavailable_values, list):
+        return None
+    unavailable = {
+        str(name or "").strip().lower().lstrip("@")
+        for name in unavailable_values
+    }
+    by_name = {
+        str(item.get("name") or "").strip().lower().lstrip("@"): item
+        for item in registers
+        if isinstance(item, dict)
+    }
+    is_64_bit = register_result.get("is64Bit")
+    if is_64_bit is not None and not isinstance(is_64_bit, bool):
+        return None
+    candidates = ("rsp",) if is_64_bit is True else (("esp",) if is_64_bit is False else ("rsp", "esp"))
+    for name in candidates:
+        if name in unavailable:
+            continue
+        item = by_name.get(name)
+        if not item:
+            continue
+        literal = _normalize_nonzero_address_literal(item.get("hexValue"))
+        if literal is None:
+            literal = _normalize_nonzero_address_literal(item.get("value"))
+        if literal is not None:
+            return literal, f"@{name}"
+    return None
 @mcp.tool()
 async def get_debug_status() -> str:
     """
@@ -35,7 +96,11 @@ async def get_debug_status() -> str:
         return handle_ide_error(e, "get_debug_status")
 
 @mcp.tool()
-async def get_callstack() -> str:
+async def get_callstack(
+    start_index: int = 0,
+    max_frames: int = 256,
+    budget_ms: int = 5000,
+) -> str:
     """
     获取当前线程的完整调用堆栈，包含每个栈帧的函数名、文件路径、行号等信息。
     Cursor可以根据返回的文件路径自动读取相关代码。
@@ -57,20 +122,39 @@ async def get_callstack() -> str:
     **触发场景**: 当用户询问"怎么执行到这里的"、"调用链"、"堆栈"、"callstack"、"函数调用顺序"时调用此工具。
     """
     try:
-        result = await ide_bridge.call("get_callstack")
+        result = await ide_bridge.call("get_callstack", {
+            "startIndex": validate_int_range("start_index", start_index, 0, 1_000_000),
+            "maxFrames": validate_int_range("max_frames", max_frames, 0, 4096),
+            "budgetMs": validate_int_range("budget_ms", budget_ms, 0, 120000),
+        })
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_callstack")
 
 @mcp.tool()
-async def get_call_stack() -> str:
+async def get_call_stack(
+    start_index: int = 0,
+    max_frames: int = 256,
+    budget_ms: int = 5000,
+) -> str:
     """
     Alias for get_callstack.
     """
-    return await get_callstack()
+    return await get_callstack(start_index, max_frames, budget_ms)
 
 @mcp.tool()
-async def get_locals(depth: int = 2) -> str:
+async def get_locals(
+    debug_session_generation: int,
+    break_sequence: int,
+    context_epoch: int,
+    process_id: int,
+    thread_id: int,
+    frame_index: int,
+    frame_id: str,
+    depth: int = 2,
+    thread_lookup_budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+) -> str:
     """
     获取当前栈帧的所有局部变量和参数，包含变量名、类型和当前值。
 
@@ -90,7 +174,33 @@ async def get_locals(depth: int = 2) -> str:
     **触发场景**: 当用户询问"变量值是什么"、"参数是多少"、"局部变量"、"当前状态"时调用此工具。
     """
     try:
-        result = await ide_bridge.call("get_locals", {"depth": max(0, min(depth, 4))})
+        params = {
+            "depth": validate_int_range("depth", depth, 0, 4),
+            "frameIndex": validate_int_range("frame_index", frame_index, 0, 4096),
+            "debugSessionGeneration": validate_int_range(
+                "debug_session_generation", debug_session_generation, 0, 0x7FFFFFFFFFFFFFFF
+            ),
+            "breakSequence": validate_int_range(
+                "break_sequence", break_sequence, 0, 0x7FFFFFFFFFFFFFFF
+            ),
+            "contextEpoch": validate_int_range(
+                "context_epoch", context_epoch, 0, 0x7FFFFFFFFFFFFFFF
+            ),
+            "processId": validate_int_range("process_id", process_id, 1, 0x7FFFFFFF),
+            "threadId": validate_int_range("thread_id", thread_id, 1, 0x7FFFFFFF),
+            "frameId": validate_nonempty_string("frame_id", frame_id),
+        }
+        if thread_lookup_budget_ms is not None:
+            params["threadLookupBudgetMs"] = validate_int_range(
+                "thread_lookup_budget_ms", thread_lookup_budget_ms, 0, 120000
+            )
+        result = await ide_bridge.call(
+            "get_locals",
+            params,
+            timeout=tool_timeout_for_budget(
+                timeout_seconds, THREADS_TIMEOUT_SECONDS, thread_lookup_budget_ms
+            ),
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_locals")
@@ -101,7 +211,7 @@ async def evaluate_expression(
     expand_children: bool = False,
     max_depth: int = 2,
     timeout_seconds: Optional[float] = None,
-    allow_side_effects: bool = False
+    evaluation_policy: str = "engine_default",
 ) -> str:
     """
     在当前调试上下文中求值任意表达式。可以获取变量的地址、计算偏移量、访问结构成员等。
@@ -112,7 +222,7 @@ async def evaluate_expression(
         expand_children: 是否展开对象的子成员，默认false
         max_depth: 展开子成员的最大深度，默认2
         timeout_seconds: 等待 IDE 响应的最长秒数，默认30，最大300
-        allow_side_effects: 兼容旧客户端的参数；当前不会因函数调用形态预先拒绝表达式，IDE 会返回实际求值结果/错误/超时
+        evaluation_policy: VS 当前仅支持 engine_default；不承诺无副作用
 
     调用示例:
     ```
@@ -123,12 +233,13 @@ async def evaluate_expression(
 
     **触发场景**: 当用户想查看特定表达式的值、询问"xxx的值是多少"、"计算xxx"、"查看指针"、"展开对象"时调用此工具。
     """
+    max_depth = validate_int_range("max_depth", max_depth, 0, 4)
     try:
         result = await ide_bridge.call("evaluate_expression", {
             "expression": expression,
             "expandChildren": expand_children,
             "maxDepth": max_depth,
-            "allowSideEffects": allow_side_effects,
+            "evaluationPolicy": evaluation_policy,
         }, timeout=clamp_tool_timeout(timeout_seconds, EVALUATION_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
@@ -140,7 +251,7 @@ async def evaluate_expressions_batch(
     expand_children: bool = False,
     max_depth: int = 2,
     timeout_seconds: Optional[float] = None,
-    allow_side_effects: bool = False
+    evaluation_policy: str = "engine_default",
 ) -> str:
     """
     在同一调试快照中批量求值多个表达式，减少逐条请求导致的上下文漂移。
@@ -150,15 +261,16 @@ async def evaluate_expressions_batch(
         expand_children: 是否展开对象子成员，默认False
         max_depth: 子成员展开深度，默认2
         timeout_seconds: 等待 IDE 响应的最长秒数，默认45，最大300
-        allow_side_effects: 兼容旧客户端的参数；当前不会因函数调用形态预先拒绝表达式
+        evaluation_policy: VS 当前仅支持 engine_default；不承诺无副作用
     """
     normalized_expressions = expressions or []
+    max_depth = validate_int_range("max_depth", max_depth, 0, 4)
     try:
         result = await ide_bridge.call("evaluate_expressions_batch", {
             "expressions": normalized_expressions,
             "expandChildren": expand_children,
             "maxDepth": max_depth,
-            "allowSideEffects": allow_side_effects,
+            "evaluationPolicy": evaluation_policy,
         }, timeout=clamp_tool_timeout(timeout_seconds, BATCH_EVALUATION_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
@@ -171,6 +283,8 @@ async def get_threads(
     max_frames_per_thread: Optional[int] = None,
     max_nodes: Optional[int] = None,
     budget_ms: Optional[int] = None,
+    start_thread_index: int = 1,
+    start_frame_index: int = 0,
 ) -> str:
     """
     获取调试进程中所有线程的信息，包括线程ID、名称、状态和当前位置。
@@ -182,13 +296,19 @@ async def get_threads(
     **触发场景**: 当用户提到"线程"、"thread"、"多线程"、"并发"、"死锁"时调用此工具。
     """
     try:
-        params: Dict[str, Any] = {"includeFrames": include_frames}
+        params: Dict[str, Any] = {
+            "includeFrames": include_frames,
+            "startThreadIndex": validate_int_range("start_thread_index", start_thread_index, 1, 4096),
+            "startFrameIndex": validate_int_range("start_frame_index", start_frame_index, 0, 1000000),
+        }
         if max_frames_per_thread is not None:
-            params["maxFramesPerThread"] = int(max_frames_per_thread)
+            params["maxFramesPerThread"] = validate_int_range(
+                "max_frames_per_thread", max_frames_per_thread, 0, 256
+            )
         if max_nodes is not None:
-            params["maxNodes"] = int(max_nodes)
+            params["maxNodes"] = validate_int_range("max_nodes", max_nodes, 0, 4096)
         if budget_ms is not None:
-            params["budgetMs"] = int(budget_ms)
+            params["budgetMs"] = validate_int_range("budget_ms", budget_ms, 0, 120000)
         result = await ide_bridge.call(
             "get_threads",
             params,
@@ -205,14 +325,16 @@ async def list_threads(
     max_frames_per_thread: Optional[int] = None,
     max_nodes: Optional[int] = None,
     budget_ms: Optional[int] = None,
+    start_thread_index: int = 1,
+    start_frame_index: int = 0,
 ) -> str:
     """
     Get debugger thread metadata. Defaults are low-blocking and may return partial=true.
 
-    For a complete thread snapshot, raise max_frames_per_thread, max_nodes,
-    budget_ms, and timeout_seconds. Use max_frames_per_thread=0, max_nodes=0,
-    or budget_ms=0 to use the maximum bounded capture budget for an explicit full capture. partial=false means the
-    returned thread/frame set was complete within the requested budget.
+    For the broadest bounded thread snapshot, raise max_frames_per_thread,
+    max_nodes, budget_ms, and timeout_seconds. Use max_frames_per_thread=0,
+    max_nodes=0, or budget_ms=0 to select the server hard caps. partial=false
+    means the returned thread/frame set was complete within those bounds.
 
     Alias for get_threads.
     """
@@ -222,15 +344,56 @@ async def list_threads(
         max_frames_per_thread=max_frames_per_thread,
         max_nodes=max_nodes,
         budget_ms=budget_ms,
+        start_thread_index=start_thread_index,
+        start_frame_index=start_frame_index,
     )
 
 @mcp.tool()
-async def get_modules(timeout_seconds: Optional[float] = None) -> str:
+async def get_modules(
+    timeout_seconds: Optional[float] = None,
+    max_nodes: Optional[int] = None,
+    budget_ms: Optional[int] = None,
+    start_module_index: int = 0,
+    max_frames_scanned: Optional[int] = None,
+    module_snapshot_id: Optional[str] = None,
+    scan_continuation_token: Optional[str] = None,
+) -> str:
     """
     获取调试进程中已加载的所有模块/程序集信息。
     """
     try:
-        result = await ide_bridge.call("get_modules", timeout=clamp_tool_timeout(timeout_seconds, MODULES_TIMEOUT_SECONDS))
+        params = add_bounded_collection_params({}, None, max_nodes, budget_ms)
+        params["startModuleIndex"] = validate_int_range(
+            "start_module_index", start_module_index, 0, 1_000_000
+        )
+        if max_frames_scanned is not None:
+            params["maxFramesScanned"] = validate_int_range(
+                "max_frames_scanned", max_frames_scanned, 0, 4096
+            )
+        if module_snapshot_id is not None:
+            if not module_snapshot_id.strip() or len(module_snapshot_id) > 128:
+                raise ide_bridge.IDEBridgeError(
+                    "module_snapshot_id must be a non-empty snapshot identifier",
+                    code="INVALID_ARGUMENT",
+                )
+            params["moduleSnapshotId"] = module_snapshot_id
+        if scan_continuation_token is not None:
+            if not scan_continuation_token.strip() or len(scan_continuation_token) > 128:
+                raise ide_bridge.IDEBridgeError(
+                    "scan_continuation_token must be a non-empty snapshot identifier",
+                    code="INVALID_ARGUMENT",
+                )
+            if module_snapshot_id is not None:
+                raise ide_bridge.IDEBridgeError(
+                    "module_snapshot_id and scan_continuation_token are mutually exclusive",
+                    code="INVALID_ARGUMENT",
+                )
+            params["scanContinuationToken"] = scan_continuation_token
+        result = await ide_bridge.call(
+            "get_modules",
+            params,
+            timeout=tool_timeout_for_budget(timeout_seconds, MODULES_TIMEOUT_SECONDS, budget_ms),
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_modules")
@@ -261,7 +424,12 @@ async def get_exception(timeout_seconds: Optional[float] = None) -> str:
         return handle_ide_error(e, "get_exception")
 
 @mcp.tool()
-async def get_build_errors() -> str:
+async def get_build_errors(
+    start_index: int = 0,
+    max_nodes: Optional[int] = None,
+    budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+) -> str:
     """
     获取Visual Studio Error List中的所有编译错误和警告，包含错误代码（如CS0001）、文件路径、行号和详细描述。
     Cursor可以根据返回的文件路径自动读取相关代码并帮助修复。
@@ -269,29 +437,51 @@ async def get_build_errors() -> str:
     **触发场景**: 当用户提到"编译错误"、"build error"、"构建失败"、"无法编译"、"语法错误"、"红色波浪线"时，优先调用此工具。
     """
     try:
-        result = await ide_bridge.call("get_build_errors")
+        params = add_bounded_collection_params({}, start_index, max_nodes, budget_ms)
+        result = await ide_bridge.call(
+            "get_build_errors", params,
+            timeout=tool_timeout_for_budget(timeout_seconds, THREADS_TIMEOUT_SECONDS, budget_ms),
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_build_errors")
 
 @mcp.tool()
-async def get_errors_only() -> str:
+async def get_errors_only(
+    start_index: int = 0,
+    max_nodes: Optional[int] = None,
+    budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+) -> str:
     """
     仅获取编译错误（不包括警告）。
     """
     try:
-        result = await ide_bridge.call("get_errors_only")
+        params = add_bounded_collection_params({}, start_index, max_nodes, budget_ms)
+        result = await ide_bridge.call(
+            "get_errors_only", params,
+            timeout=tool_timeout_for_budget(timeout_seconds, THREADS_TIMEOUT_SECONDS, budget_ms),
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_errors_only")
 
 @mcp.tool()
-async def get_warnings_only() -> str:
+async def get_warnings_only(
+    start_index: int = 0,
+    max_nodes: Optional[int] = None,
+    budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+) -> str:
     """
     仅获取编译警告（不包括错误）。
     """
     try:
-        result = await ide_bridge.call("get_warnings_only")
+        params = add_bounded_collection_params({}, start_index, max_nodes, budget_ms)
+        result = await ide_bridge.call(
+            "get_warnings_only", params,
+            timeout=tool_timeout_for_budget(timeout_seconds, THREADS_TIMEOUT_SECONDS, budget_ms),
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_warnings_only")
@@ -300,6 +490,8 @@ async def get_warnings_only() -> str:
 async def get_debug_output(
     pane: str = "Debug",
     tail_lines: int = 50,
+    end_character: int = -1,
+    max_bytes: int = 3 * 1024 * 1024,
     timeout_seconds: Optional[float] = None
 ) -> str:
     """
@@ -313,9 +505,14 @@ async def get_debug_output(
         tail_lines: 返回最后N行，0表示返回全部。默认50行
     """
     try:
+        tail_lines = validate_int_range("tail_lines", tail_lines, 0, 10000)
+        end_character = validate_int_range("end_character", end_character, -1, 0x7FFFFFFF)
+        max_bytes = validate_int_range("max_bytes", max_bytes, 4 * 1024, 3 * 1024 * 1024)
         result = await ide_bridge.call("get_output_window", {
             "pane": pane,
-            "tailLines": tail_lines
+            "tailLines": tail_lines,
+            "endCharacter": end_character,
+            "maxBytes": max_bytes,
         }, timeout=clamp_tool_timeout(timeout_seconds, OUTPUT_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
@@ -328,6 +525,9 @@ async def search_output(
     is_regex: bool = False,
     context_lines: int = 2,
     max_matches: int = 20,
+    start_line: int = 0,
+    end_character: int = -1,
+    expected_capture_start_character: int = -1,
     timeout_seconds: Optional[float] = None
 ) -> str:
     """
@@ -341,12 +541,25 @@ async def search_output(
         max_matches: 最大返回匹配数，默认20
     """
     try:
+        context_lines = validate_int_range("context_lines", context_lines, 0, 100)
+        max_matches = validate_int_range("max_matches", max_matches, 1, 10000)
+        start_line = validate_int_range("start_line", start_line, 0, 1_000_000)
+        end_character = validate_int_range("end_character", end_character, -1, 2_147_483_647)
+        expected_capture_start_character = validate_int_range(
+            "expected_capture_start_character",
+            expected_capture_start_character,
+            -1,
+            2_147_483_647,
+        )
         result = await ide_bridge.call("search_output", {
             "pattern": pattern,
             "pane": pane,
             "isRegex": is_regex,
             "contextLines": context_lines,
-            "maxMatches": max_matches
+            "maxMatches": max_matches,
+            "startLine": start_line,
+            "endCharacter": end_character,
+            "expectedCaptureStartCharacter": expected_capture_start_character,
         }, timeout=clamp_tool_timeout(timeout_seconds, OUTPUT_TIMEOUT_SECONDS))
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
@@ -396,8 +609,8 @@ async def capture_debug_bundle(
     include_registers: bool = False,
     include_output: bool = False,
     include_threads: bool = True,
-    include_exception: bool = True,
-    allow_side_effects: bool = False,
+    include_exception: bool = False,
+    evaluation_policy: str = "engine_default",
     thread_include_frames: bool = True,
     thread_max_frames_per_thread: Optional[int] = None,
     thread_max_nodes: Optional[int] = None,
@@ -407,7 +620,7 @@ async def capture_debug_bundle(
     抓取可分析调试快照包。
     返回 snapshotId/capturedAt/snapshotStatus/partial，可直接用于AI诊断。
 
-    默认低阻塞：只抓 status/callstack/exception/threads，避免 locals/modules/registers/output 在 VS UI 线程上拖住整次请求。
+    默认低阻塞：只抓 status/callstack/threads，避免 exception/locals/modules/registers/output 在 VS UI 线程上拖住整次请求。
     需要完整包时显式打开 include_locals/include_modules/include_registers/include_output。
 
     Args:
@@ -421,8 +634,8 @@ async def capture_debug_bundle(
         include_registers: 是否抓取寄存器，默认False
         include_output: 是否读取 Debug Output，默认False
         include_threads: 是否抓取线程列表，默认True
-        include_exception: 是否抓取异常信息，默认True
-        allow_side_effects: 兼容旧客户端的参数；当前不会因函数调用形态预先拒绝表达式
+        include_exception: 是否通过调试表达式抓取异常信息，默认False；启用时需要 unsafe evaluation capability
+        evaluation_policy: VS 当前仅支持 engine_default；不承诺无副作用
         thread_include_frames: 是否在 threads 中包含 stack frames，默认True
         thread_max_frames_per_thread/thread_max_nodes/thread_budget_ms: 线程帧抓取预算；0 表示使用最大受控抓取预算
 
@@ -439,6 +652,8 @@ async def capture_debug_bundle(
     ```
     """
     normalized_expressions = expressions or []
+    max_depth = validate_int_range("max_depth", max_depth, 0, 4)
+    output_tail_lines = validate_int_range("output_tail_lines", output_tail_lines, 0, 500)
     heavy_components_requested = (
         include_locals or include_modules or include_registers or include_output or bool(normalized_expressions)
     )
@@ -456,10 +671,22 @@ async def capture_debug_bundle(
             "includeOutput": include_output,
             "includeThreads": include_threads,
             "includeException": include_exception,
-            "allowSideEffects": allow_side_effects,
+            "evaluationPolicy": evaluation_policy,
         }, thread_include_frames, thread_max_frames_per_thread, thread_max_nodes, thread_budget_ms)
+        backend_method = "capture_debug_bundle_safe" if use_vs_safe_backend(
+            normalized_expressions,
+            include_locals=include_locals,
+            include_registers=include_registers,
+            include_exception=include_exception,
+        ) else "capture_debug_bundle"
+        if backend_method == "capture_debug_bundle_safe":
+            for unsafe_parameter in (
+                "expressions", "expandChildren", "maxDepth", "evaluationPolicy",
+                "includeLocals", "includeRegisters", "includeException",
+            ):
+                params.pop(unsafe_parameter, None)
         result = await ide_bridge.call(
-            "capture_debug_bundle",
+            backend_method,
             params,
             timeout=tool_timeout_for_budget(timeout_seconds, default_timeout, thread_budget_ms),
         )
@@ -491,23 +718,42 @@ async def crash_triage(
             "expressions": normalized_expressions,
             "expandChildren": False,
             "maxDepth": 1,
-            "outputTailLines": max(0, min(output_tail_lines, 500)),
+            "outputTailLines": validate_int_range("output_tail_lines", output_tail_lines, 0, 500),
             "includeLocals": False,
             "includeModules": True,
             "includeRegisters": True,
             "includeOutput": True,
             "includeThreads": True,
             "includeException": True,
-            "allowSideEffects": False,
+            "evaluationPolicy": "engine_default",
         }, True, thread_max_frames_per_thread, thread_max_nodes, thread_budget_ms)
 
+        bundle_method = "capture_debug_bundle_safe" if use_vs_safe_backend(
+            normalized_expressions,
+            include_registers=True,
+            include_exception=True,
+        ) else "capture_debug_bundle"
+        if bundle_method == "capture_debug_bundle_safe":
+            for unsafe_parameter in ("expressions", "expandChildren", "maxDepth", "evaluationPolicy"):
+                bundle_params.pop(unsafe_parameter, None)
+
+        bundle_timeout = remaining_tool_timeout(deadline, tool_timeout)
+        if bundle_timeout is None:
+            return handle_ide_error(
+                ide_bridge.IDEBridgeError(
+                    "Crash triage was not started because its timeout budget was exhausted",
+                    code="DEADLINE_EXCEEDED_NOT_STARTED",
+                ),
+                "crash_triage",
+            )
+        bundle, target = await ide_bridge.call_with_target(
+            bundle_method,
+            bundle_params,
+            timeout=bundle_timeout,
+        )
         triage: Dict[str, Any] = {
             "kind": "crash_triage",
-            "bundle": await ide_bridge.call(
-                "capture_debug_bundle",
-                bundle_params,
-                timeout=remaining_tool_timeout(deadline, tool_timeout) or 1.0,
-            ),
+            "bundle": bundle,
         }
 
         disassembly_timeout = remaining_tool_timeout(deadline, DISASSEMBLY_TIMEOUT_SECONDS)
@@ -515,41 +761,78 @@ async def crash_triage(
             triage["disassemblyError"] = "Skipped because crash_triage timeout budget was exhausted"
         else:
             try:
-                triage["disassembly"] = await ide_bridge.call(
+                triage["disassembly"] = await vs_bridge.call_pipe_exact(
+                    target,
                     "get_disassembly",
                     {"linesBefore": 8, "linesAfter": 24},
                     timeout=disassembly_timeout,
                 )
-            except ide_bridge.IDEBridgeError as e:
+            except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as e:
                 triage["disassemblyError"] = str(e)
 
         last_memory_error = None
-        for stack_register in ("@rsp", "@esp"):
+        stack_pointer = _stack_pointer_from_bundle(bundle)
+        if stack_pointer is None:
+            # Register capture can be unavailable for some debug engines. Resolve
+            # the expression once, then pin the subsequent literal read to the
+            # response context because resolve_address is an unsafe command.
+            for stack_register in ("@rsp", "@esp"):
+                resolve_timeout = remaining_tool_timeout(deadline, NATIVE_CONTEXT_TIMEOUT_SECONDS)
+                if resolve_timeout is None:
+                    last_memory_error = "Skipped because crash_triage timeout budget was exhausted"
+                    break
+                try:
+                    resolved, target = await vs_bridge.call_pipe_exact(
+                        target,
+                        "resolve_address",
+                        {"address": stack_register},
+                        timeout=resolve_timeout,
+                        include_target=True,
+                    )
+                    literal = _normalize_nonzero_address_literal(
+                        resolved.get("virtualAddress") if isinstance(resolved, dict) else None
+                    )
+                    if literal is not None:
+                        stack_pointer = (literal, stack_register)
+                        break
+                    last_memory_error = (
+                        resolved.get("error") if isinstance(resolved, dict) else None
+                    ) or f"{stack_register} unavailable"
+                except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as e:
+                    last_memory_error = str(e)
+
+        if stack_pointer is not None:
+            stack_address, stack_register = stack_pointer
             memory_timeout = remaining_tool_timeout(deadline, MEMORY_TIMEOUT_SECONDS)
             if memory_timeout is None:
                 last_memory_error = "Skipped because crash_triage timeout budget was exhausted"
-                break
-            try:
-                memory = await ide_bridge.call(
-                    "read_memory",
-                    {"address": stack_register, "size": 256},
-                    timeout=memory_timeout,
-                )
-                if isinstance(memory, dict):
-                    status = str(memory.get("status", "")).lower()
-                    if status not in ("ok", "partial") and not memory.get("bytesRead"):
-                        last_memory_error = memory.get("error") or memory.get("message") or f"{stack_register} unavailable"
-                        continue
-                triage["stackMemory"] = memory
-                triage["stackMemoryAddressExpression"] = stack_register
-                break
-            except ide_bridge.IDEBridgeError as e:
-                last_memory_error = str(e)
+            else:
+                try:
+                    memory = await vs_bridge.call_pipe_exact(
+                        target,
+                        "read_memory",
+                        {"address": stack_address, "size": 256},
+                        timeout=memory_timeout,
+                    )
+                    if isinstance(memory, dict):
+                        status = str(memory.get("status", "")).lower()
+                        if status not in ("ok", "partial") and not memory.get("bytesRead"):
+                            last_memory_error = memory.get("error") or memory.get("message") or f"{stack_register} unavailable"
+                        else:
+                            triage["stackMemory"] = memory
+                            triage["stackMemoryAddressExpression"] = stack_register
+                            triage["stackMemoryAddress"] = stack_address
+                    else:
+                        triage["stackMemory"] = memory
+                        triage["stackMemoryAddressExpression"] = stack_register
+                        triage["stackMemoryAddress"] = stack_address
+                except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as e:
+                    last_memory_error = str(e)
         if "stackMemory" not in triage and last_memory_error:
             triage["stackMemoryError"] = last_memory_error
 
         return format_result(triage)
-    except ide_bridge.IDEBridgeError as e:
+    except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as e:
         return handle_ide_error(e, "crash_triage")
 
 @mcp.tool()
@@ -560,12 +843,14 @@ async def step_and_capture(
     include_modules: bool = False,
     include_registers: bool = False,
     include_output: bool = False,
+    include_exception: bool = False,
     timeout_seconds: Optional[float] = None,
 ) -> str:
     """
     Execute one step operation and capture a debug bundle at the new stop point.
 
-    action accepts step_over, step_into, or step_out.
+    action accepts step_over, step_into, or step_out. Exception inspection is
+    opt-in because the Visual Studio backend may evaluate exception expressions.
     """
     normalized = (action or "step_over").strip().lower().replace("-", "_").replace(" ", "_")
     aliases = {
@@ -585,27 +870,47 @@ async def step_and_capture(
         "step_into": "step_into",
         "step_out": "step_out",
     }
-    if normalized not in method_by_action:
-        return format_result({
-            "action": action,
-            "success": False,
-            "message": "Unsupported step_and_capture action. Use step_over, step_into, or step_out.",
-        })
+    normalized = validate_enum("action", normalized, tuple(method_by_action))
 
     normalized_expressions = expressions or []
     tool_timeout = clamp_tool_timeout(timeout_seconds, DEBUG_BUNDLE_TIMEOUT_SECONDS)
     deadline = asyncio.get_running_loop().time() + tool_timeout
     try:
-        step_timeout = remaining_tool_timeout(deadline, tool_timeout) or 1.0
-        step_result = await ide_bridge.call(method_by_action[normalized], timeout=step_timeout)
-        bundle = None
-        bundle_error = None
-        if isinstance(step_result, dict) and step_result.get("success"):
+        step_timeout = remaining_tool_timeout(deadline, tool_timeout)
+        if step_timeout is None:
+            return handle_ide_error(
+                ide_bridge.IDEBridgeError(
+                    "Step was not started because the step_and_capture timeout budget was exhausted",
+                    code="DEADLINE_EXCEEDED_NOT_STARTED",
+                ),
+                "step_and_capture",
+            )
+        step_result, target = await ide_bridge.call_with_target(
+            method_by_action[normalized],
+            {
+                "waitTimeoutMs": max(
+                    2000,
+                    min(300000, int(max(0.1, step_timeout - 5.0) * 1000)),
+                ),
+            },
+            timeout=step_timeout,
+        )
+    except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as e:
+        return handle_ide_error(e, "step_and_capture")
+
+    bundle = None
+    bundle_error = None
+    bundle_error_code = None
+    bundle_request_id = None
+    bundle_outcome_unknown = False
+    if isinstance(step_result, dict) and step_result.get("success"):
+        try:
             bundle_timeout = remaining_tool_timeout(deadline, tool_timeout)
             if bundle_timeout is None:
                 bundle_error = "Skipped because step_and_capture timeout budget was exhausted"
+                bundle_error_code = "DEADLINE_EXCEEDED_NOT_STARTED"
             else:
-                bundle = await ide_bridge.call("capture_debug_bundle", {
+                bundle_params = {
                     "expressions": normalized_expressions,
                     "expandChildren": False,
                     "maxDepth": 1,
@@ -615,16 +920,44 @@ async def step_and_capture(
                     "includeRegisters": include_registers,
                     "includeOutput": include_output,
                     "includeThreads": True,
-                    "includeException": True,
-                    "allowSideEffects": False,
-                }, timeout=bundle_timeout)
-        result = {
-            "action": normalized,
-            "step": step_result,
-            "bundle": bundle,
-        }
-        if bundle_error:
-            result["bundleError"] = bundle_error
-        return format_result(result)
-    except ide_bridge.IDEBridgeError as e:
-        return handle_ide_error(e, "step_and_capture")
+                    "includeException": include_exception,
+                    "evaluationPolicy": "engine_default",
+                }
+                bundle_method = "capture_debug_bundle_safe" if use_vs_safe_backend(
+                    normalized_expressions,
+                    include_locals=include_locals,
+                    include_registers=include_registers,
+                    include_exception=include_exception,
+                ) else "capture_debug_bundle"
+                if bundle_method == "capture_debug_bundle_safe":
+                    for unsafe_parameter in (
+                        "expressions", "expandChildren", "maxDepth", "evaluationPolicy",
+                        "includeLocals", "includeRegisters", "includeException",
+                    ):
+                        bundle_params.pop(unsafe_parameter, None)
+                bundle = await vs_bridge.call_pipe_exact(
+                    target,
+                    bundle_method,
+                    bundle_params,
+                    timeout=bundle_timeout,
+                )
+        except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as e:
+            # The step already completed. Preserve that definitive result and report
+            # snapshot capture failure separately so the caller never replays the step.
+            bundle_error = str(e)
+            bundle_error_code = getattr(e, "code", "IDE_BRIDGE_ERROR")
+            bundle_request_id = getattr(e, "request_id", None)
+            bundle_outcome_unknown = bool(getattr(e, "outcome_unknown", False))
+
+    result = {
+        "action": normalized,
+        "step": step_result,
+        "bundle": bundle,
+    }
+    if bundle_error:
+        result["bundleError"] = bundle_error
+        result["bundleErrorCode"] = bundle_error_code
+        result["bundleOutcomeUnknown"] = bundle_outcome_unknown
+        if bundle_request_id:
+            result["bundleRequestId"] = bundle_request_id
+    return format_result(result)

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 VS = "vs"
@@ -66,13 +69,17 @@ COMMON_BACKEND_METHODS = frozenset({
 
 VS_ONLY_BACKEND_METHODS = frozenset({
     "attach_process",
+    "capture_debug_bundle_safe",
     "capture_hybrid_context",
     "capture_native_context",
     "clear_breakpoint",
     "continue_and_capture_breakpoint",
     "continue_and_capture_native",
+    "continue_and_wait_for_break_safe",
     "get_breakpoint_bindings",
     "get_module_layout",
+    "get_request_status",
+    "cancel_request",
     "inspect_managed_assembly",
     "inspect_managed_method_il",
     "inspect_managed_type",
@@ -87,6 +94,90 @@ METHOD_BACKENDS: Dict[str, Tuple[str, ...]] = {
     **{method: COMMON_BACKENDS for method in COMMON_BACKEND_METHODS},
     **{method: VS_ONLY_BACKENDS for method in VS_ONLY_BACKEND_METHODS},
 }
+
+def _load_debug_method_manifest() -> Dict[str, Dict[str, object]]:
+    path = Path(__file__).with_name("debug_method_manifest.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("protocol") != "aidb/2" or not isinstance(payload.get("methods"), dict):
+        raise RuntimeError("Invalid AIDebugger debug method manifest")
+    methods = payload["methods"]
+    if set(methods) != set(METHOD_BACKENDS):
+        missing = sorted(set(METHOD_BACKENDS) - set(methods))
+        extra = sorted(set(methods) - set(METHOD_BACKENDS))
+        raise RuntimeError(f"Debug method manifest mismatch (missing={missing}, extra={extra})")
+    for name, entry in methods.items():
+        if entry.get("kind") not in {"query", "command"}:
+            raise RuntimeError(f"Debug method manifest has invalid kind for {name}")
+        capabilities = entry.get("capabilities")
+        if not isinstance(capabilities, list) or not capabilities or not all(
+            isinstance(value, str) and value for value in capabilities
+        ) or len(capabilities) != len(set(capabilities)):
+            raise RuntimeError(f"Debug method manifest has invalid capabilities for {name}")
+        conditions = entry.get("conditionalCapabilities", [])
+        if not isinstance(conditions, list):
+            raise RuntimeError(f"Debug method manifest has invalid conditional capabilities for {name}")
+        for condition in conditions:
+            if (
+                not isinstance(condition, dict)
+                or not isinstance(condition.get("parameter"), str)
+                or not condition["parameter"]
+                or not isinstance(condition.get("capability"), str)
+                or not condition["capability"]
+                or (("equals" in condition) == (condition.get("presentNonBlank") is True))
+            ):
+                raise RuntimeError(f"Debug method manifest has invalid conditional capability for {name}")
+    return methods
+
+
+DEBUG_METHOD_MANIFEST = _load_debug_method_manifest()
+MUTATING_BACKEND_METHODS = frozenset(
+    name for name, entry in DEBUG_METHOD_MANIFEST.items() if entry["kind"] == "command"
+)
+
+
+def backend_method_kind(method: str) -> str:
+    """Return command for methods that must never be transport-retried."""
+    entry = DEBUG_METHOD_MANIFEST.get(method)
+    return str(entry["kind"]) if entry is not None else "query"
+
+
+def backend_method_session_refresh(method: str) -> bool:
+    """Return whether a method may legitimately advance the pinned debug context."""
+    entry = DEBUG_METHOD_MANIFEST.get(method)
+    return bool(entry and entry.get("sessionRefresh") is True)
+
+
+def backend_method_capability(method: str) -> str:
+    """Return the AIDB/2 capability that must be declared for a backend method."""
+    return backend_method_capabilities(method)[0]
+
+
+def backend_method_capabilities(method: str, params: Optional[Dict[str, object]] = None) -> Tuple[str, ...]:
+    """Return every capability required by a backend method, in wire-priority order."""
+    entry = DEBUG_METHOD_MANIFEST.get(method)
+    if entry is None:
+        return ("debug.read",)
+    capabilities = list(entry["capabilities"])
+    for condition in entry.get("conditionalCapabilities", []):
+        actual = params.get(condition["parameter"]) if params else None
+        matches = (
+            isinstance(actual, str) and bool(actual.strip())
+            if condition.get("presentNonBlank") is True
+            else params is not None and type(actual) is type(condition["equals"]) and actual == condition["equals"]
+        )
+        if matches and condition["capability"] not in capabilities:
+            capabilities.append(condition["capability"])
+    return tuple(capabilities)
+
+
+def all_vs_capabilities() -> Tuple[str, ...]:
+    """Return the exact capability set required to expose every VS backend method."""
+    return tuple(sorted({
+        capability
+        for method, backends in METHOD_BACKENDS.items()
+        if VS in backends
+        for capability in backend_method_capabilities(method)
+    }))
 
 
 @dataclass(frozen=True)
@@ -140,14 +231,16 @@ def _spec(
 TOOLS: Dict[str, ToolSpec] = {
     # Capability / discovery
     "debug_capabilities": _spec("debug_capabilities", "capability"),
+    "get_command_status": _spec("get_command_status", "control", "get_request_status"),
+    "cancel_debug_request": _spec("cancel_debug_request", "control", "cancel_request"),
 
     # Instance management
-    "list_vs_instances": _spec("list_vs_instances", "instance"),
-    "list_ide_instances": _spec("list_ide_instances", "instance"),
-    "detect_debug_sessions": _spec("detect_debug_sessions", "instance"),
-    "select_ide_instance": _spec("select_ide_instance", "instance"),
+    "list_vs_instances": _spec("list_vs_instances", "instance", "ping", "get_instance_info"),
+    "list_ide_instances": _spec("list_ide_instances", "instance", "ping", "get_instance_info"),
+    "detect_debug_sessions": _spec("detect_debug_sessions", "instance", "ping", "get_instance_info", "get_debug_status"),
+    "select_ide_instance": _spec("select_ide_instance", "instance", "ping", "get_instance_info"),
     "clear_ide_selection": _spec("clear_ide_selection", "instance"),
-    "select_vs_instance": _spec("select_vs_instance", "instance"),
+    "select_vs_instance": _spec("select_vs_instance", "instance", "ping", "get_instance_info"),
     "clear_vs_selection": _spec("clear_vs_selection", "instance"),
 
     # Snapshot and inspection
@@ -183,7 +276,7 @@ TOOLS: Dict[str, ToolSpec] = {
     # Execution control
     "attach_process": _spec("attach_process", "control", "attach_process", timeout_class="control"),
     "start_debugging": _spec("start_debugging", "control", "start_debugging", timeout_class="start_debugging"),
-    "debug_control": _spec("debug_control", "control"),
+    "debug_control": _spec("debug_control", "control", "continue", "step_over", "step_into", "step_out", "break", "stop", "detach"),
     "debug_continue": _spec("debug_continue", "control", "continue"),
     "continue": _spec("continue", "control", "continue", alias_for="debug_continue"),
     "continue_and_wait_for_break": _spec("continue_and_wait_for_break", "control", "continue_and_wait_for_break", timeout_class="continue_wait"),
@@ -241,11 +334,16 @@ def supported_backends_for_tool(spec: ToolSpec) -> Tuple[str, ...]:
 
 
 def tool_registry_summary() -> Dict[str, object]:
+    preferred = (os.environ.get("AIDB_PREFERRED_IDE") or "").strip().lower()
+    expose_aliases = os.environ.get("AIDB_ENABLE_LEGACY_ALIASES") == "1"
+    suppress_aliases = preferred in {"vs", "visualstudio", "visual-studio", "visual_studio"} and not expose_aliases
     domains: Dict[str, List[str]] = {domain: [] for domain in DOMAIN_MODULES}
     vs_only: List[str] = []
     aliases: Dict[str, str] = {}
     tool_support: Dict[str, Dict[str, object]] = {}
     for name, spec in sorted(TOOLS.items()):
+        if suppress_aliases and spec.alias_for:
+            continue
         domains.setdefault(spec.domain, []).append(name)
         supported_backends = supported_backends_for_tool(spec)
         if supported_backends == VS_ONLY_BACKENDS:
@@ -261,8 +359,22 @@ def tool_registry_summary() -> Dict[str, object]:
             "preferredIde": spec.preferred_ide,
             "timeoutClass": spec.timeout_class,
             "aliasFor": spec.alias_for,
+            "requiredCapabilities": sorted({
+                capability
+                for method in spec.backend_methods
+                for capability in backend_method_capabilities(method)
+            }),
+            "conditionalCapabilities": [
+                dict(condition, backendMethod=method)
+                for method in spec.backend_methods
+                for condition in DEBUG_METHOD_MANIFEST.get(method, {}).get("conditionalCapabilities", [])
+            ],
+            "implementation": "backend_composite" if len(spec.backend_methods) > 1 else (
+                "local_only" if not spec.backend_methods else "backend_direct"
+            ),
         }
     return {
+        "legacyAliasesEnabled": not suppress_aliases,
         "domains": domains,
         "vsOnlyTools": vs_only,
         "aliases": aliases,

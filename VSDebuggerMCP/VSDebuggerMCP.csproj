@@ -22,10 +22,10 @@
     <IncludeDebugSymbolsInLocalVSIXDeployment>false</IncludeDebugSymbolsInLocalVSIXDeployment>
     <CopyBuildOutputToOutputDirectory>true</CopyBuildOutputToOutputDirectory>
     <CopyOutputSymbolsToOutputDirectory>true</CopyOutputSymbolsToOutputDirectory>
-    <NoWarn>$(NoWarn);VSTHRD010;VSTHRD110;VSTHRD002</NoWarn>
     <StartAction>Program</StartAction>
     <StartProgram Condition="'$(DevEnvDir)' != ''">$(DevEnvDir)devenv.exe</StartProgram>
     <StartArguments>/rootsuffix Exp</StartArguments>
+    <WarningsAsErrors>$(WarningsAsErrors);VSTHRD002;VSTHRD003;VSTHRD010;VSTHRD103;VSTHRD110</WarningsAsErrors>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugSymbols>true</DebugSymbols>
@@ -49,37 +49,122 @@
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="VSDebuggerMCPPackage.cs" />
     <Compile Include="DebuggerService.cs" />
+    <Compile Include="Services\DebuggerService.Inspection.cs" />
+    <Compile Include="Services\DebuggerService.VariableSlices.cs" />
+    <Compile Include="Services\DebuggerService.EvaluationMemory.cs" />
+    <Compile Include="Services\DebuggerService.Disassembly.cs" />
+    <Compile Include="Services\DebuggerService.Native.cs" />
+    <Compile Include="Services\DebuggerService.Context.cs" />
+    <Compile Include="Services\DebuggerService.Execution.cs" />
+    <Compile Include="Services\DebuggerService.Breakpoints.cs" />
+    <Compile Include="Services\DebuggerService.SecondaryInspection.cs" />
+    <Compile Include="Services\DebuggerService.Navigation.cs" />
+    <Compile Include="Services\ManagedInspectionJob.cs" />
+    <Compile Include="Services\ManagedInspectionProcess.cs" />
+    <Compile Include="Services\ManagedInspectionService.cs" />
+    <Compile Include="Services\ProcessLaunchBoundary.cs" />
+    <Compile Include="DebugSessionTracker.cs" />
+    <Compile Include="DebuggerRequestContext.cs" />
     <Compile Include="DisassemblyService.cs" />
+    <Compile Include="Services\BuildErrorService.cs" />
+    <Compile Include="Services\BuildErrorCodeParser.cs" />
+    <Compile Include="Services\BuildErrorCaptureBudget.cs" />
+    <Compile Include="Services\BreakpointCaptureBudget.cs" />
+    <Compile Include="Services\CancelableSingleFlight.cs" />
+    <Compile Include="Services\OutputWindowService.cs" />
+    <Compile Include="Services\OutputContentBudget.cs" />
+    <Compile Include="Services\OutputSearchBudget.cs" />
+    <Compile Include="Services\CallStackCaptureBudget.cs" />
+    <Compile Include="Services\CompositeCaptureBudget.cs" />
+    <Compile Include="Services\VariableCaptureBudget.cs" />
+    <Compile Include="Services\ThreadCaptureBudget.cs" />
+    <Compile Include="Services\TargetArchitecture.cs" />
+    <Compile Include="Services\RegisterCapturePolicy.cs" />
+    <Compile Include="Services\SnapshotCompletenessPolicy.cs" />
+    <Compile Include="Services\ModuleCaptureBudget.cs" />
+    <Compile Include="Services\ModuleSnapshotPager.cs" />
+    <Compile Include="Services\ExceptionCaptureBudget.cs" />
+    <Compile Include="Services\VisualStudioSourceLocationAdapter.cs" />
+    <Compile Include="Services\VisualStudioDebuggerAdapter.cs" />
+    <Compile Include="Services\UiOperationAdmission.cs" />
     <Compile Include="NamedPipeServer.cs" />
+    <Compile Include="Ipc\LengthPrefixedFrameCodec.cs" />
+    <Compile Include="Ipc\LongRunningDebugOperationGate.cs" />
+    <Compile Include="Ipc\ClientLaneRecovery.cs" />
+    <Compile Include="Ipc\NamedPipeMethodRouter.cs" />
+    <Compile Include="Ipc\NamedPipeProtocolValidator.cs" />
+    <Compile Include="Ipc\DebugRequestSchemaValidator.cs" />
+    <Compile Include="Ipc\DebuggerParameterValidationException.cs" />
+    <Compile Include="Ipc\DebuggerExceptions.cs" />
+    <Compile Include="Ipc\SearchPatternParser.cs" />
+    <Compile Include="Ipc\StrictJsonRequestValidator.cs" />
+    <Compile Include="Ipc\DebugSessionActor.cs" />
+    <Compile Include="Ipc\RequestOutcomePolicy.cs" />
+    <Compile Include="Ipc\NamedPipeRequestProcessor.cs" />
+    <Compile Include="Ipc\PipeSecurityFactory.cs" />
+    <Compile Include="Ipc\ProcessIntegrityValidator.cs" />
+    <Compile Include="Ipc\AuthenticodeTrustValidator.cs" />
+    <Compile Include="Ipc\CommandResultStore.cs" />
+    <Compile Include="Ipc\ActiveRequest.cs" />
+    <Compile Include="Ipc\OperationResultPolicy.cs" />
+    <Compile Include="Ipc\CommandResponseCompactor.cs" />
+    <Compile Include="Ipc\ControlRequestValidator.cs" />
+    <Compile Include="InstanceRegistration.cs" />
     <Compile Include="Protocol\DebugRequest.cs" />
     <Compile Include="Protocol\DebugResponse.cs" />
+    <Compile Include="Protocol\DebugResponseJsonSerializer.cs" />
     <Compile Include="Protocol\DebugModels.cs" />
+    <Compile Include="Protocol\DebugMethodCatalog.cs" />
+    <Compile Include="Protocol\CanonicalJson.cs" />
     <Compile Include="McpClientRegistration.cs" />
+    <Compile Include="Registration\BundlePathPolicy.cs" />
+    <Compile Include="Registration\BundleSignature.cs" />
+    <Compile Include="Registration\ConfigPathPolicy.cs" />
+    <Compile Include="Registration\McpClientRegistration.ClientWriters.cs" />
+    <Compile Include="Registration\McpClientRegistration.Utilities.cs" />
+    <Compile Include="Registration\TomlConfigEditor.cs" />
+    <Compile Include="JsonConfigEditor.cs" />
   </ItemGroup>
   <ItemGroup>
+    <EmbeddedResource Include="..\mcp_server\debug_method_manifest.json">
+      <Link>Protocol\DebugMethodManifest.json</Link>
+      <LogicalName>VSDebuggerMCP.Protocol.DebugMethodManifest.json</LogicalName>
+    </EmbeddedResource>
     <Content Include="ManagedInspectionHelper\bin\$(Configuration)\ManagedInspectionHelper.exe">
       <Link>ManagedInspectionHelper.exe</Link>
+      <IncludeInVSIX>true</IncludeInVSIX>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="ManagedInspectionHelper\bin\$(Configuration)\Mono.Cecil.dll">
+      <Link>Mono.Cecil.dll</Link>
       <IncludeInVSIX>true</IncludeInVSIX>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
   <ItemGroup>
     <Reference Include="System" />
+    <Reference Include="System.Design" />
     <Reference Include="System.Xml" />
     <Reference Include="System.Web.Extensions" />
     <Reference Include="System.Runtime.Serialization" />
-    <Reference Include="UIAutomationClient" />
-    <Reference Include="UIAutomationTypes" />
   </ItemGroup>
   <ItemGroup>
+    <VSCTCompile Include="AIDebugger.vsct">
+      <ResourceName>Menus.ctmenu</ResourceName>
+    </VSCTCompile>
     <None Include="source.extension.vsixmanifest">
       <SubType>Designer</SubType>
     </None>
     <Content Include="LICENSE.txt">
       <IncludeInVSIX>true</IncludeInVSIX>
     </Content>
-    <Content Include="..\mcp_server\server.py">
-      <Link>mcp_server\server.py</Link>
+    <Content Include="..\mcp_server\vs_server.py">
+      <Link>mcp_server\vs_server.py</Link>
+      <IncludeInVSIX>true</IncludeInVSIX>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\mcp_server\vs_launcher.py">
+      <Link>mcp_server\vs_launcher.py</Link>
       <IncludeInVSIX>true</IncludeInVSIX>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
@@ -88,18 +173,23 @@
       <IncludeInVSIX>true</IncludeInVSIX>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="..\mcp_server\rider_bridge.py">
-      <Link>mcp_server\rider_bridge.py</Link>
+    <Content Include="..\mcp_server\vs_session.py">
+      <Link>mcp_server\vs_session.py</Link>
       <IncludeInVSIX>true</IncludeInVSIX>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="..\mcp_server\ide_bridge.py">
-      <Link>mcp_server\ide_bridge.py</Link>
+    <Content Include="..\mcp_server\vs_errors.py">
+      <Link>mcp_server\vs_errors.py</Link>
       <IncludeInVSIX>true</IncludeInVSIX>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="..\mcp_server\mcp_app.py">
-      <Link>mcp_server\mcp_app.py</Link>
+    <Content Include="..\mcp_server\vs_trust.py">
+      <Link>mcp_server\vs_trust.py</Link>
+      <IncludeInVSIX>true</IncludeInVSIX>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\mcp_server\vs_mcp_app.py">
+      <Link>mcp_server\vs_mcp_app.py</Link>
       <IncludeInVSIX>true</IncludeInVSIX>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
@@ -108,12 +198,27 @@
       <IncludeInVSIX>true</IncludeInVSIX>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="..\mcp_server\tool_registry.py">
-      <Link>mcp_server\tool_registry.py</Link>
+    <Content Include="..\mcp_server\tool_runtime.py">
+      <Link>mcp_server\tool_runtime.py</Link>
       <IncludeInVSIX>true</IncludeInVSIX>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="..\mcp_server\tool_modules\*.py">
+    <Content Include="..\mcp_server\vs_tool_registry.py">
+      <Link>mcp_server\vs_tool_registry.py</Link>
+      <IncludeInVSIX>true</IncludeInVSIX>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\mcp_server\debug_method_manifest.json">
+      <Link>mcp_server\debug_method_manifest.json</Link>
+      <IncludeInVSIX>true</IncludeInVSIX>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\mcp_server\output_models.py">
+      <Link>mcp_server\output_models.py</Link>
+      <IncludeInVSIX>true</IncludeInVSIX>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\mcp_server\tool_modules\__init__.py;..\mcp_server\tool_modules\capability_tools.py;..\mcp_server\tool_modules\vs_instance_tools.py;..\mcp_server\tool_modules\snapshot_tools.py;..\mcp_server\tool_modules\native_managed_tools.py;..\mcp_server\tool_modules\control_tools.py;..\mcp_server\tool_modules\breakpoint_tools.py;..\mcp_server\tool_modules\memory_tools.py">
       <Link>mcp_server\tool_modules\%(Filename)%(Extension)</Link>
       <IncludeInVSIX>true</IncludeInVSIX>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
@@ -125,11 +230,6 @@
     </Content>
     <Content Include="..\mcp_server\bootstrap.py">
       <Link>mcp_server\bootstrap.py</Link>
-      <IncludeInVSIX>true</IncludeInVSIX>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
-    <Content Include="..\mcp_server\cursor_allowlist_sync.py">
-      <Link>mcp_server\cursor_allowlist_sync.py</Link>
       <IncludeInVSIX>true</IncludeInVSIX>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
@@ -154,7 +254,7 @@
 
   <!-- Auto-stamp version from git before every real build (skipped during IntelliSense) -->
   <Target Name="StampVersion" BeforeTargets="BeforeBuild" Condition="'$(DesignTimeBuild)' != 'true'">
-    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\..\tools\Stamp-Version.ps1&quot;" IgnoreExitCode="true" />
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\..\tools\Stamp-Version.ps1&quot; -Target VS" />
   </Target>
 
   <Target Name="BuildManagedInspectionHelper" BeforeTargets="BeforeBuild" Condition="'$(DesignTimeBuild)' != 'true'">

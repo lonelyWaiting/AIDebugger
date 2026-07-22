@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Runtime.Serialization;
 
 namespace VSDebuggerMCP.Protocol
@@ -51,10 +52,20 @@ namespace VSDebuggerMCP.Protocol
     [KnownType(typeof(BatchEvaluateResult))]
     [KnownType(typeof(DebugBundleResult))]
     [KnownType(typeof(ContinueAndWaitResult))]
+    [KnownType(typeof(CommandRequestStatusResult))]
     public class DebugResponse
     {
+        [DataMember(Name = "protocol")]
+        public string Protocol { get; set; }
+
         [DataMember(Name = "id")]
         public string Id { get; set; }
+
+        [DataMember(Name = "status")]
+        public string Status { get; set; }
+
+        [DataMember(Name = "server")]
+        public DebugServerIdentity Server { get; set; }
 
         [DataMember(Name = "result")]
         public object Result { get; set; }
@@ -78,6 +89,28 @@ namespace VSDebuggerMCP.Protocol
     }
 
     [DataContract]
+    public class DebugServerIdentity
+    {
+        [DataMember(Name = "processId")]
+        public int ProcessId { get; set; }
+
+        [DataMember(Name = "processStartTimeUtcTicks")]
+        public long ProcessStartTimeUtcTicks { get; set; }
+
+        [DataMember(Name = "serverInstanceId")]
+        public string ServerInstanceId { get; set; }
+
+        [DataMember(Name = "debugSessionGeneration")]
+        public long DebugSessionGeneration { get; set; }
+
+        [DataMember(Name = "breakSequence")]
+        public long BreakSequence { get; set; }
+
+        [DataMember(Name = "contextEpoch")]
+        public long ContextEpoch { get; set; }
+    }
+
+    [DataContract]
     public class ErrorInfo
     {
         [DataMember(Name = "code")]
@@ -85,5 +118,14 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "message")]
         public string Message { get; set; }
+
+        [DataMember(Name = "outcomeUnknown", EmitDefaultValue = false)]
+        public bool OutcomeUnknown { get; set; }
+
+        [DataMember(Name = "requestId", EmitDefaultValue = false)]
+        public string RequestId { get; set; }
+
+        [DataMember(Name = "details", EmitDefaultValue = false)]
+        public Dictionary<string, object> Details { get; set; }
     }
 }

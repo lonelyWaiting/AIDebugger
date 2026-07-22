@@ -1,0 +1,429 @@
+{
+  "methods": {
+    "add_watch": {
+      "capabilities": [
+        "debug.evaluate.unsafe"
+      ],
+      "kind": "command"
+    },
+    "attach_process": {
+      "capabilities": [
+        "debug.session.write"
+      ],
+      "kind": "command"
+    },
+    "break": {
+      "capabilities": [
+        "debug.execution.control"
+      ],
+      "kind": "command"
+    },
+    "cancel_request": {
+      "capabilities": [
+        "server.control"
+      ],
+      "kind": "command",
+      "controlPlane": true,
+      "sessionRefresh": true
+    },
+    "capture_debug_bundle": {
+      "capabilities": [
+        "debug.evaluate.unsafe",
+        "debug.read"
+      ],
+      "conditionalCapabilities": [
+        {
+          "capability": "debug.memory.read",
+          "equals": true,
+          "parameter": "includeRegisters"
+        }
+      ],
+      "kind": "command"
+    },
+    "capture_debug_bundle_safe": {
+      "capabilities": [
+        "debug.read"
+      ],
+      "kind": "query"
+    },
+    "capture_hybrid_context": {
+      "capabilities": [
+        "debug.memory.read",
+        "debug.read"
+      ],
+      "kind": "query"
+    },
+    "capture_native_context": {
+      "capabilities": [
+        "debug.memory.read",
+        "debug.read"
+      ],
+      "kind": "query"
+    },
+    "clear_breakpoint": {
+      "capabilities": [
+        "debug.breakpoint.write"
+      ],
+      "kind": "command"
+    },
+    "continue": {
+      "capabilities": [
+        "debug.execution.control"
+      ],
+      "kind": "command"
+    },
+    "continue_and_capture_breakpoint": {
+      "capabilities": [
+        "debug.execution.control",
+        "debug.memory.read",
+        "debug.read"
+      ],
+      "kind": "command"
+    },
+    "continue_and_capture_native": {
+      "capabilities": [
+        "debug.execution.control",
+        "debug.memory.read",
+        "debug.read"
+      ],
+      "kind": "command"
+    },
+    "continue_and_wait_for_break": {
+      "capabilities": [
+        "debug.execution.control",
+        "debug.evaluate.unsafe",
+        "debug.read"
+      ],
+      "conditionalCapabilities": [
+        {
+          "capability": "debug.memory.read",
+          "equals": true,
+          "parameter": "includeRegisters"
+        }
+      ],
+      "kind": "command"
+    },
+    "continue_and_wait_for_break_safe": {
+      "capabilities": [
+        "debug.execution.control",
+        "debug.read"
+      ],
+      "kind": "command"
+    },
+    "delete_all_breakpoints": {
+      "capabilities": [
+        "debug.breakpoint.write"
+      ],
+      "kind": "command"
+    },
+    "delete_breakpoint": {
+      "capabilities": [
+        "debug.breakpoint.write"
+      ],
+      "kind": "command"
+    },
+    "detach": {
+      "capabilities": [
+        "debug.execution.control"
+      ],
+      "kind": "command"
+    },
+    "enable_breakpoint": {
+      "capabilities": [
+        "debug.breakpoint.write"
+      ],
+      "kind": "command"
+    },
+    "evaluate_expression": {
+      "capabilities": [
+        "debug.evaluate.unsafe"
+      ],
+      "kind": "command"
+    },
+    "evaluate_expressions_batch": {
+      "capabilities": [
+        "debug.evaluate.unsafe"
+      ],
+      "kind": "command"
+    },
+    "get_breakpoint_bindings": {
+      "capabilities": [
+        "debug.read"
+      ],
+      "kind": "query"
+    },
+    "get_breakpoints": {
+      "capabilities": [
+        "debug.read"
+      ],
+      "kind": "query"
+    },
+    "get_build_errors": {
+      "capabilities": [
+        "debug.read"
+      ],
+      "kind": "query"
+    },
+    "get_callstack": {
+      "capabilities": [
+        "debug.read"
+      ],
+      "kind": "query"
+    },
+    "get_debug_status": {
+      "capabilities": [
+        "debug.read"
+      ],
+      "kind": "query",
+      "sessionRefresh": true
+    },
+    "get_disassembly": {
+      "capabilities": [
+        "debug.memory.read"
+      ],
+      "kind": "query"
+    },
+    "get_disassembly_at": {
+      "capabilities": [
+        "debug.memory.read"
+      ],
+      "kind": "query"
+    },
+    "get_errors_only": {
+      "capabilities": [
+        "debug.read"
+      ],
+      "kind": "query"
+    },
+    "get_exception": {
+      "capabilities": [
+        "debug.evaluate.unsafe"
+      ],
+      "kind": "command"
+    },
+    "get_full_context": {
+      "capabilities": [
+        "debug.evaluate.unsafe",
+        "debug.read"
+      ],
+      "kind": "command"
+    },
+    "get_instance_info": {
+      "capabilities": [
+        "server.control"
+      ],
+      "kind": "query",
+      "sessionRefresh": true
+    },
+    "get_locals": {
+      "capabilities": [
+        "debug.evaluate.unsafe",
+        "debug.read"
+      ],
+      "kind": "command"
+    },
+    "get_module_layout": {
+      "capabilities": [
+        "debug.read"
+      ],
+      "kind": "query"
+    },
+    "get_modules": {
+      "capabilities": [
+        "debug.read"
+      ],
+      "kind": "query"
+    },
+    "get_output_window": {
+      "capabilities": [
+        "debug.read"
+      ],
+      "kind": "query"
+    },
+    "get_registers": {
+      "capabilities": [
+        "debug.memory.read"
+      ],
+      "kind": "query"
+    },
+    "get_request_status": {
+      "capabilities": [
+        "server.control"
+      ],
+      "kind": "query",
+      "controlPlane": true,
+      "sessionRefresh": true
+    },
+    "get_threads": {
+      "capabilities": [
+        "debug.read"
+      ],
+      "kind": "query"
+    },
+    "get_warnings_only": {
+      "capabilities": [
+        "debug.read"
+      ],
+      "kind": "query"
+    },
+    "inspect_managed_assembly": {
+      "capabilities": [
+        "debug.binary.inspect"
+      ],
+      "kind": "query"
+    },
+    "inspect_managed_method_il": {
+      "capabilities": [
+        "debug.binary.inspect"
+      ],
+      "kind": "query"
+    },
+    "inspect_managed_type": {
+      "capabilities": [
+        "debug.binary.inspect"
+      ],
+      "kind": "query"
+    },
+    "ping": {
+      "capabilities": [
+        "server.control"
+      ],
+      "kind": "query",
+      "controlPlane": true,
+      "sessionRefresh": true
+    },
+    "read_memory": {
+      "capabilities": [
+        "debug.memory.read"
+      ],
+      "kind": "query"
+    },
+    "resolve_address": {
+      "capabilities": [
+        "debug.evaluate.unsafe"
+      ],
+      "kind": "command"
+    },
+    "run_to_cursor": {
+      "capabilities": [
+        "debug.execution.control"
+      ],
+      "kind": "command"
+    },
+    "search_memory": {
+      "capabilities": [
+        "debug.memory.read"
+      ],
+      "kind": "query"
+    },
+    "search_output": {
+      "capabilities": [
+        "debug.read"
+      ],
+      "kind": "query"
+    },
+    "set_address_breakpoint": {
+      "capabilities": [
+        "debug.breakpoint.write"
+      ],
+      "conditionalCapabilities": [
+        {
+          "capability": "debug.evaluate.unsafe",
+          "parameter": "condition",
+          "presentNonBlank": true
+        }
+      ],
+      "kind": "command"
+    },
+    "set_breakpoint": {
+      "capabilities": [
+        "debug.breakpoint.write"
+      ],
+      "conditionalCapabilities": [
+        {
+          "capability": "debug.evaluate.unsafe",
+          "parameter": "condition",
+          "presentNonBlank": true
+        }
+      ],
+      "kind": "command"
+    },
+    "set_data_breakpoint": {
+      "capabilities": [
+        "debug.breakpoint.write",
+        "debug.evaluate.unsafe"
+      ],
+      "kind": "command"
+    },
+    "set_function_breakpoint": {
+      "capabilities": [
+        "debug.breakpoint.write"
+      ],
+      "conditionalCapabilities": [
+        {
+          "capability": "debug.evaluate.unsafe",
+          "parameter": "condition",
+          "presentNonBlank": true
+        }
+      ],
+      "kind": "command"
+    },
+    "set_next_statement": {
+      "capabilities": [
+        "debug.context.write",
+        "debug.execution.control"
+      ],
+      "kind": "command"
+    },
+    "set_watchpoint": {
+      "capabilities": [
+        "debug.breakpoint.write",
+        "debug.evaluate.unsafe"
+      ],
+      "kind": "command"
+    },
+    "start_debugging": {
+      "capabilities": [
+        "debug.session.write"
+      ],
+      "kind": "command"
+    },
+    "step_into": {
+      "capabilities": [
+        "debug.execution.control"
+      ],
+      "kind": "command"
+    },
+    "step_out": {
+      "capabilities": [
+        "debug.execution.control"
+      ],
+      "kind": "command"
+    },
+    "step_over": {
+      "capabilities": [
+        "debug.execution.control"
+      ],
+      "kind": "command"
+    },
+    "stop": {
+      "capabilities": [
+        "debug.execution.control"
+      ],
+      "kind": "command"
+    },
+    "switch_stack_frame": {
+      "capabilities": [
+        "debug.context.write"
+      ],
+      "kind": "command"
+    },
+    "switch_thread": {
+      "capabilities": [
+        "debug.context.write"
+      ],
+      "kind": "command"
+    }
+  },
+  "protocol": "aidb/2"
+}

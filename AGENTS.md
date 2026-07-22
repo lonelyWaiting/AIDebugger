@@ -30,15 +30,22 @@ Output:
 - `VSDebuggerMCP/bin/Release/VSDebuggerMCP.VS2022.vsix`
 - `VSDebuggerMCP/bin/Release/VSDebuggerMCP.VS2026.vsix`
 
-Install examples:
+First install examples (normal, non-administrator terminal only):
 ```bash
 VSDebuggerMCP/Install-VSIX.cmd -Target vs2022
 VSDebuggerMCP/Install-VSIX.cmd -Target vs2026
 VSDebuggerMCP/Install-VSIX.cmd -Target all
 ```
 
+Upgrades require the exact previously installed VSIX plus its independently
+published SHA-256, supplied through matching `-RollbackVsixPath` and
+`-RollbackVsixSha256` arrays. CI artifacts publish `*.vsix.sha256` beside each
+VSIX. Installations predating those records must uninstall the old extension
+from Manage Extensions once, then use the first-install command.
+
 Note: `VSDebuggerMCP/bin/Release/VSDebuggerMCP.vsix` is an intermediate package and is deleted at the end of the build.
-The install script also seeds MCP server files to `~/.ai-debugger/mcp_server`.
+The explicit VS setup command seeds VS-only MCP files transactionally to
+`~/.ai-debugger/mcp_server_vs`.
 
 ### Rider Plugin Only
 ```bash
@@ -64,7 +71,9 @@ python server.py
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
-These tests validate protocol field alignment between VS/Rider implementations and bridge timeout semantics. They are static assertions (no running IDE required).
+These tests combine contract checks with Python behavior tests. Pure C# protocol,
+JSONC ownership, and frame-codec tests live in `VSDebuggerMCP.Tests/` and run with
+`dotnet test VSDebuggerMCP.Tests/VSDebuggerMCP.Tests.csproj -c Release`.
 
 ### Test Named Pipe Connection
 ```bash
@@ -80,15 +89,20 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 |-----------|----------|----------|---------|
 | VS Extension | `VSDebuggerMCP/` | C# (.NET 4.7.2) | VSIX package exposing EnvDTE debugger APIs via Named Pipe |
 | Rider Plugin | `RiderDebuggerMCP/` | Kotlin (JDK 21) | IntelliJ plugin exposing Rider debugger APIs via Named Pipe |
-| MCP Server | `mcp_server/` | Python 3.10-3.13 (x64) | FastMCP server bridging Named Pipes to Cursor stdio |
+| MCP Server | `mcp_server/` | Python 3.10-3.14 (x64) | FastMCP server bridging Named Pipes to MCP stdio |
 
 ### Key Files
 
 **VS Extension:**
-- `VSDebuggerMCPPackage.cs` - Package entry point, auto-loads on VS startup
-- `DebuggerService.cs` - All debugger operations (callstack, locals, memory, disassembly)
-- `NamedPipeServer.cs` - JSON-RPC over Named Pipe (`\\.\pipe\AIDebuggerVS_<PID>`)
-- `McpClientRegistration.cs` - Auto-registers MCP server with Cursor/Codex Desktop/OpenCode
+- `VSDebuggerMCPPackage.cs` - Explicit Tools-menu activation/setup entry point
+- `DebuggerService.cs` - Shared debugger facade, state, and UI-thread helpers
+- `Services/DebuggerService.*.cs` - Domain partials for inspection, execution, breakpoints, context, memory, disassembly, native, and navigation operations
+- `Services/BuildErrorService.cs` / `Services/OutputWindowService.cs` - Bounded build/output collection services
+- `NamedPipeServer.cs` - Authenticated AIDB/2 host (`\\.\pipe\AIDebuggerVS_<PID>`)
+- `Ipc/LengthPrefixedFrameCodec.cs` - strict UTF-8 length-prefixed transport
+- `Ipc/NamedPipeRequestProcessor.cs` / `NamedPipeMethodRouter.cs` / `NamedPipeProtocolValidator.cs` - deduplication, dispatch, strict validation, and typed errors
+- `Protocol/DebugMethodCatalog.cs` - method risk/capability/deadline descriptors
+- `McpClientRegistration.cs` / `Registration/McpClientRegistration.*.cs` - Explicit setup-only bundle deployment and atomic client registration
 - `Protocol/DebugModels.cs` - Shared data models for responses
 
 **Rider Plugin:**
@@ -98,17 +112,20 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 - `McpClientRegistration.kt` - MCP registration with Python version check
 
 **MCP Server:**
-- `server.py` - FastMCP tool definitions (40+ debugging tools)
+- `server.py` - Combined thin entry point for all 79 MCP tools
+- `vs_server.py` - VS-only entry point; never imports or discovers Rider
 - `ide_bridge.py` - Unified bridge with auto-selection logic for multiple IDE instances
 - `vs_bridge.py` / `rider_bridge.py` - Named Pipe clients with overlapped I/O and timeout handling
 - `bootstrap.py` - Extracts bundled wheels to `~/.ai-debugger/pydeps` on first run
 
 ### Communication Protocol
 
-Named Pipe uses JSON-RPC style messages:
+Visual Studio uses authenticated AIDB/2 length-prefixed messages. Requests include
+`protocol`, UUID `id`, `method`, `params`, and metadata containing `authToken`,
+`deadlineUnixMs`, `kind`, `capability`, and immutable target/session identity.
 ```json
 // Request
-{"id": "uuid", "method": "get_callstack", "params": {}}
+{"protocol":"aidb/2","id":"uuid","method":"get_callstack","params":{},"meta":{"kind":"query","capability":"debug.read","target":{}}}
 
 // Response
 {"id": "uuid", "result": {...}}
@@ -122,7 +139,9 @@ Named Pipe uses JSON-RPC style messages:
 - Each IDE instance creates a unique pipe: `AIDebuggerVS_<PID>` or `AIDebuggerRider_<PID>`
 - `AIDB_PREFERRED_IDE` env var locks MCP server to `vs` or `rider`
 - Auto-selection priority: paused at breakpoint > debugging > single instance
-- Pipe security configurable via `AIDB_PIPE_SECURITY` (strict/same_user/owner_only)
+- VS pipe/instance registration default to current-user owner-only ACLs
+- `AIDB_ALLOWED_CAPABILITIES` optionally restricts the server capability set
+- VS has no world-access pipe compatibility mode
 
 ## Versioning
 
@@ -131,7 +150,7 @@ Version is computed automatically from git history — no manual edits needed.
 | Scenario | Version format | Example |
 |----------|---------------|---------|
 | Tagged commit (`v1.2.3`) | Tag version | `1.2.3` |
-| Untagged commit | `1.1.<commit count>` | `1.1.18` |
+| Untagged commit | `<nearest tag>.<distance>` | `2.0.3.6` |
 
 This scheme is identical for local IDE builds and CI, so the same commit always
 produces the same version number regardless of where it is built.
@@ -179,4 +198,6 @@ All responses include capability declarations:
 
 ### Python Dependencies
 
-Dependencies are bundled as wheels in `mcp_server/vendor/wheels/` with `manifest.json` for signature-based incremental updates. No pip install required at runtime.
+Dependencies are bundled as wheels in `mcp_server/vendor/wheels/` with a
+Python/platform coverage manifest and SHA-256 hashes. Runtime verifies selected
+wheels and never invokes pip.

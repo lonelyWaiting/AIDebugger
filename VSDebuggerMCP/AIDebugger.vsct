@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CommandTable xmlns="http://schemas.microsoft.com/VisualStudio/2005-10-18/CommandTable">
+  <Extern href="stdidcmd.h" />
+  <Extern href="vsshlids.h" />
+  <Commands package="guidAIDebuggerPackage">
+    <Groups>
+      <Group guid="guidAIDebuggerCommandSet" id="AIDebuggerToolsGroup" priority="0x0600">
+        <Parent guid="guidSHLMainMenu" id="IDM_VS_MENU_TOOLS" />
+      </Group>
+    </Groups>
+    <Buttons>
+      <Button guid="guidAIDebuggerCommandSet" id="StartServerCommand" priority="0x0100" type="Button">
+        <Parent guid="guidAIDebuggerCommandSet" id="AIDebuggerToolsGroup" />
+        <Strings>
+          <ButtonText>Start AIDebugger MCP Server (Read Only)</ButtonText>
+          <CanonicalName>AIDebugger.StartServer</CanonicalName>
+        </Strings>
+      </Button>
+      <Button guid="guidAIDebuggerCommandSet" id="StartFullAccessServerCommand" priority="0x0105" type="Button">
+        <Parent guid="guidAIDebuggerCommandSet" id="AIDebuggerToolsGroup" />
+        <Strings>
+          <ButtonText>Start AIDebugger MCP Server (Choose Capabilities)...</ButtonText>
+          <CanonicalName>AIDebugger.StartFullAccessServer</CanonicalName>
+        </Strings>
+      </Button>
+      <Button guid="guidAIDebuggerCommandSet" id="StopServerCommand" priority="0x0108" type="Button">
+        <Parent guid="guidAIDebuggerCommandSet" id="AIDebuggerToolsGroup" />
+        <Strings>
+          <ButtonText>Stop AIDebugger MCP Server</ButtonText>
+          <CanonicalName>AIDebugger.StopServer</CanonicalName>
+        </Strings>
+      </Button>
+      <Button guid="guidAIDebuggerCommandSet" id="SetupClientsCommand" priority="0x0110" type="Button">
+        <Parent guid="guidAIDebuggerCommandSet" id="AIDebuggerToolsGroup" />
+        <Strings>
+          <ButtonText>Configure AIDebugger MCP Clients...</ButtonText>
+          <CanonicalName>AIDebugger.ConfigureClients</CanonicalName>
+        </Strings>
+      </Button>
+      <Button guid="guidAIDebuggerCommandSet" id="UninstallClientsCommand" priority="0x0115" type="Button">
+        <Parent guid="guidAIDebuggerCommandSet" id="AIDebuggerToolsGroup" />
+        <Strings>
+          <ButtonText>Remove AIDebugger MCP Client Entries...</ButtonText>
+          <CanonicalName>AIDebugger.UninstallClients</CanonicalName>
+        </Strings>
+      </Button>
+      <Button guid="guidAIDebuggerCommandSet" id="StartAutomationTestServerCommand" priority="0x01f0" type="Button">
+        <Parent guid="guidAIDebuggerCommandSet" id="AIDebuggerToolsGroup" />
+        <CommandFlag>DefaultInvisible</CommandFlag>
+        <Strings>
+          <ButtonText>AIDebugger Automation Test Server</ButtonText>
+          <CanonicalName>AIDebugger.StartAutomationTestServer</CanonicalName>
+        </Strings>
+      </Button>
+    </Buttons>
+  </Commands>
+  <Symbols>
+    <GuidSymbol name="guidAIDebuggerPackage" value="{475DEBBA-1C22-4878-9824-DEF0379A1042}" />
+    <GuidSymbol name="guidAIDebuggerCommandSet" value="{B524E80E-2159-4CB6-B020-A9BAA88DC707}">
+      <IDSymbol name="AIDebuggerToolsGroup" value="0x1020" />
+      <IDSymbol name="StartServerCommand" value="0x0100" />
+      <IDSymbol name="SetupClientsCommand" value="0x0101" />
+      <IDSymbol name="StartFullAccessServerCommand" value="0x0102" />
+      <IDSymbol name="StopServerCommand" value="0x0103" />
+      <IDSymbol name="UninstallClientsCommand" value="0x0104" />
+      <IDSymbol name="StartAutomationTestServerCommand" value="0x0105" />
+    </GuidSymbol>
+  </Symbols>
+</CommandTable>

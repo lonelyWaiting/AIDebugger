@@ -2,15 +2,18 @@ from typing import Any, Dict, List, Optional
 import asyncio
 
 try:
-    from .. import ide_bridge
-    from ..mcp_app import mcp
+    from ..tool_runtime import backend as ide_bridge, mcp
     from ..tool_context import *
 except ImportError:
-    import ide_bridge
-    from mcp_app import mcp
+    from tool_runtime import backend as ide_bridge, mcp
     from tool_context import *
 @mcp.tool()
-async def get_breakpoints() -> str:
+async def get_breakpoints(
+    start_index: int = 0,
+    max_nodes: Optional[int] = None,
+    budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+) -> str:
     """
     获取所有已设置的断点列表，包括文件断点、函数断点和条件断点。
     返回断点位置、条件、命中次数等详细信息。
@@ -18,13 +21,22 @@ async def get_breakpoints() -> str:
     **触发场景**: 当用户询问"断点在哪"、"有哪些断点"、"breakpoint列表"时调用此工具。
     """
     try:
-        result = await ide_bridge.call("get_breakpoints")
+        params = add_bounded_collection_params({}, start_index, max_nodes, budget_ms)
+        result = await ide_bridge.call(
+            "get_breakpoints", params,
+            timeout=tool_timeout_for_budget(timeout_seconds, THREADS_TIMEOUT_SECONDS, budget_ms),
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_breakpoints")
 
 @mcp.tool()
-async def get_breakpoint_bindings() -> str:
+async def get_breakpoint_bindings(
+    start_index: int = 0,
+    max_nodes: Optional[int] = None,
+    budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+) -> str:
     """
     Return breakpoints with binding status and bound-child counts.
 
@@ -33,7 +45,12 @@ async def get_breakpoint_bindings() -> str:
     the Visual Studio Breakpoints UI.
     """
     try:
-        result = await ide_bridge.call("get_breakpoint_bindings", preferred_ide="vs")
+        params = add_bounded_collection_params({}, start_index, max_nodes, budget_ms)
+        result = await ide_bridge.call(
+            "get_breakpoint_bindings", params,
+            preferred_ide="vs",
+            timeout=tool_timeout_for_budget(timeout_seconds, THREADS_TIMEOUT_SECONDS, budget_ms),
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "get_breakpoint_bindings")
@@ -60,14 +77,14 @@ async def continue_and_capture_breakpoint(
     The result includes stop reason, current status, breakpoint bindings, and an
     optional hybrid native+managed snapshot at the stop.
     """
-    timeout_seconds = max(1, min(timeout_seconds, 1800))
-    poll_interval_ms = max(50, min(poll_interval_ms, 1000))
+    timeout_seconds = validate_int_range("timeout_seconds", timeout_seconds, 1, 1800)
+    poll_interval_ms = validate_int_range("poll_interval_ms", poll_interval_ms, 50, 1000)
     try:
         params = add_thread_capture_params({
             "timeoutMs": timeout_seconds * 1000,
             "pollIntervalMs": poll_interval_ms,
-            "disassemblyCount": max(1, min(disassembly_count, 256)),
-            "stackBytes": max(16, min(stack_bytes, 4096)),
+            "disassemblyCount": validate_int_range("disassembly_count", disassembly_count, 1, 256),
+            "stackBytes": validate_int_range("stack_bytes", stack_bytes, 16, 4096),
             "includeNative": include_native,
             "includeModules": include_modules,
             "includeThreads": include_threads,
@@ -106,17 +123,12 @@ async def set_breakpoint(
         condition_type: when_true / when_changed
     """
     try:
-        params = {
+        params = _validated_breakpoint_options({
             "filePath": file_path,
             "lineNumber": line_number,
-            "hitCount": max(0, hit_count),
-        }
+        }, hit_count, hit_count_type, condition_type)
         if condition:
             params["condition"] = condition
-        if hit_count_type:
-            params["hitCountType"] = hit_count_type
-        if condition_type:
-            params["conditionType"] = condition_type
         result = await ide_bridge.call("set_breakpoint", params)
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
@@ -138,16 +150,11 @@ async def set_function_breakpoint(
         condition: 可选的条件表达式
     """
     try:
-        params = {
+        params = _validated_breakpoint_options({
             "functionName": function_name,
-            "hitCount": max(0, hit_count),
-        }
+        }, hit_count, hit_count_type, condition_type)
         if condition:
             params["condition"] = condition
-        if hit_count_type:
-            params["hitCountType"] = hit_count_type
-        if condition_type:
-            params["conditionType"] = condition_type
         result = await ide_bridge.call("set_function_breakpoint", params)
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
@@ -167,17 +174,12 @@ async def set_data_breakpoint(
     address expression. Example: set_data_breakpoint(data_expression="*(int*)0x12345678", byte_count=4)
     """
     try:
-        params = {
+        params = _validated_breakpoint_options({
             "dataExpression": data_expression,
-            "byteCount": max(1, min(byte_count, 1024)),
-            "hitCount": max(0, hit_count),
-        }
+            "byteCount": validate_int_range("byte_count", byte_count, 1, 64),
+        }, hit_count, hit_count_type, condition_type)
         if condition:
             params["condition"] = condition
-        if hit_count_type:
-            params["hitCountType"] = hit_count_type
-        if condition_type:
-            params["conditionType"] = condition_type
         result = await ide_bridge.call("set_data_breakpoint", params, preferred_ide="vs")
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
@@ -198,20 +200,33 @@ async def set_address_breakpoint(
     set_address_breakpoint(address="devenv.exe+0x1234").
     """
     try:
-        params = {
-            "address": address,
-            "hitCount": max(0, hit_count),
-        }
+        params = _validated_breakpoint_options({
+            "address": validate_address_breakpoint_target("address", address),
+        }, hit_count, hit_count_type, condition_type)
         if condition:
             params["condition"] = condition
-        if hit_count_type:
-            params["hitCountType"] = hit_count_type
-        if condition_type:
-            params["conditionType"] = condition_type
         result = await ide_bridge.call("set_address_breakpoint", params, preferred_ide="vs")
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "set_address_breakpoint")
+
+
+def _validated_breakpoint_options(
+    params: Dict[str, Any],
+    hit_count: int,
+    hit_count_type: Optional[str],
+    condition_type: Optional[str],
+) -> Dict[str, Any]:
+    params["hitCount"] = validate_int_range("hit_count", hit_count, 0, 0x7FFFFFFF)
+    if hit_count_type is not None:
+        params["hitCountType"] = validate_enum(
+            "hit_count_type", hit_count_type, ("equal", "greater_or_equal", "multiple")
+        )
+    if condition_type is not None:
+        params["conditionType"] = validate_enum(
+            "condition_type", condition_type, ("when_true", "when_changed")
+        )
+    return params
 
 @mcp.tool(name="set_watchpoint")
 async def set_watchpoint_alias(
@@ -233,7 +248,12 @@ async def set_watchpoint_alias(
     )
 
 @mcp.tool()
-async def delete_breakpoint(file_path: str, line_number: int) -> str:
+async def delete_breakpoint(
+    file_path: str,
+    line_number: int,
+    breakpoint_lookup_budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+) -> str:
     """
     删除指定位置的断点。
 
@@ -242,10 +262,20 @@ async def delete_breakpoint(file_path: str, line_number: int) -> str:
         line_number: 断点所在行号
     """
     try:
-        result = await ide_bridge.call("delete_breakpoint", {
+        params = {
             "filePath": file_path,
             "lineNumber": line_number
-        })
+        }
+        if breakpoint_lookup_budget_ms is not None:
+            params["breakpointLookupBudgetMs"] = validate_int_range(
+                "breakpoint_lookup_budget_ms", breakpoint_lookup_budget_ms, 0, 120000
+            )
+        result = await ide_bridge.call(
+            "delete_breakpoint", params,
+            timeout=tool_timeout_for_budget(
+                timeout_seconds, THREADS_TIMEOUT_SECONDS, breakpoint_lookup_budget_ms
+            ),
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "delete_breakpoint")
@@ -272,7 +302,9 @@ async def delete_all_breakpoints() -> str:
 async def enable_breakpoint(
     file_path: str,
     line_number: int,
-    enabled: bool = True
+    enabled: bool = True,
+    breakpoint_lookup_budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
 ) -> str:
     """
     启用或禁用指定位置的断点。禁用的断点保留但不触发。
@@ -283,11 +315,21 @@ async def enable_breakpoint(
         enabled: True启用，False禁用
     """
     try:
-        result = await ide_bridge.call("enable_breakpoint", {
+        params = {
             "filePath": file_path,
             "lineNumber": line_number,
             "enabled": enabled
-        })
+        }
+        if breakpoint_lookup_budget_ms is not None:
+            params["breakpointLookupBudgetMs"] = validate_int_range(
+                "breakpoint_lookup_budget_ms", breakpoint_lookup_budget_ms, 0, 120000
+            )
+        result = await ide_bridge.call(
+            "enable_breakpoint", params,
+            timeout=tool_timeout_for_budget(
+                timeout_seconds, THREADS_TIMEOUT_SECONDS, breakpoint_lookup_budget_ms
+            ),
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "enable_breakpoint")
@@ -317,7 +359,11 @@ async def select_stack_frame(frame_index: int) -> str:
     return await switch_stack_frame(frame_index)
 
 @mcp.tool()
-async def switch_thread(thread_id: int) -> str:
+async def switch_thread(
+    thread_id: int,
+    thread_lookup_budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+) -> str:
     """
     切换到指定线程以查看其调用堆栈和变量。
     使用 get_threads 获取线程ID。
@@ -326,9 +372,18 @@ async def switch_thread(thread_id: int) -> str:
         thread_id: 目标线程的ID
     """
     try:
-        result = await ide_bridge.call("switch_thread", {
-            "threadId": thread_id
-        })
+        params = {"threadId": thread_id}
+        if thread_lookup_budget_ms is not None:
+            params["threadLookupBudgetMs"] = validate_int_range(
+                "thread_lookup_budget_ms", thread_lookup_budget_ms, 0, 120000
+            )
+        result = await ide_bridge.call(
+            "switch_thread",
+            params,
+            timeout=tool_timeout_for_budget(
+                timeout_seconds, THREADS_TIMEOUT_SECONDS, thread_lookup_budget_ms
+            ),
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "switch_thread")

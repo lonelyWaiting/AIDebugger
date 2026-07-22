@@ -1,7 +1,30 @@
 using System;
+using System.IO;
+using System.Runtime.CompilerServices;
+
+namespace System.Runtime.CompilerServices
+{
+    [AttributeUsage(AttributeTargets.Method, Inherited = false)]
+    internal sealed class ModuleInitializerAttribute : Attribute
+    {
+    }
+}
 
 namespace ManagedInspectionEdgeCases
 {
+    internal static class ModuleInitializationProbe
+    {
+        [ModuleInitializer]
+        internal static void Initialize()
+        {
+            string sentinel = Environment.GetEnvironmentVariable("AIDB_MANAGED_INSPECTION_SENTINEL");
+            if (!string.IsNullOrWhiteSpace(sentinel))
+            {
+                File.WriteAllText(sentinel, "target assembly code executed");
+            }
+        }
+    }
+
     public class HardIlCases
     {
         private static readonly string StaticPrefix = "edge";

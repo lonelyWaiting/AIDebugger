@@ -2,12 +2,10 @@ from typing import Any, Dict, List, Optional
 import asyncio
 
 try:
-    from .. import ide_bridge
-    from ..mcp_app import mcp
+    from ..tool_runtime import backend as ide_bridge, mcp
     from ..tool_context import *
 except ImportError:
-    import ide_bridge
-    from mcp_app import mcp
+    from tool_runtime import backend as ide_bridge, mcp
     from tool_context import *
 @mcp.tool()
 async def resolve_address(
@@ -48,8 +46,8 @@ async def get_module_layout(
             "get_module_layout",
             {
                 "module": module,
-                "maxImportFunctions": max(0, min(max_import_functions, 4096)),
-                "maxExports": max(0, min(max_exports, 4096)),
+                "maxImportFunctions": validate_int_range("max_import_functions", max_import_functions, 1, 4096),
+                "maxExports": validate_int_range("max_exports", max_exports, 1, 4096),
             },
             timeout=clamp_tool_timeout(timeout_seconds, NATIVE_CONTEXT_TIMEOUT_SECONDS),
             preferred_ide="vs",
@@ -75,8 +73,8 @@ async def capture_native_context(
         result = await ide_bridge.call(
             "capture_native_context",
             {
-                "disassemblyCount": max(1, min(disassembly_count, 256)),
-                "stackBytes": max(16, min(stack_bytes, 4096)),
+                "disassemblyCount": validate_int_range("disassembly_count", disassembly_count, 1, 256),
+                "stackBytes": validate_int_range("stack_bytes", stack_bytes, 16, 4096),
                 "includeModules": include_modules,
             },
             timeout=clamp_tool_timeout(timeout_seconds, NATIVE_CONTEXT_TIMEOUT_SECONDS),
@@ -90,8 +88,8 @@ async def capture_native_context(
 async def inspect_managed_assembly(
     assembly_path: str,
     type_filter: Optional[str] = None,
-    max_types: int = 256,
-    max_methods_per_type: int = 64,
+    max_types: int = 128,
+    max_methods_per_type: int = 32,
     timeout_seconds: Optional[float] = None
 ) -> str:
     """
@@ -103,8 +101,8 @@ async def inspect_managed_assembly(
     try:
         params = {
             "assemblyPath": assembly_path,
-            "maxTypes": max(1, min(max_types, 4096)),
-            "maxMethodsPerType": max(0, min(max_methods_per_type, 512)),
+            "maxTypes": validate_int_range("max_types", max_types, 1, 128),
+            "maxMethodsPerType": validate_int_range("max_methods_per_type", max_methods_per_type, 1, 32),
         }
         if type_filter:
             params["typeFilter"] = type_filter
@@ -122,7 +120,7 @@ async def inspect_managed_assembly(
 async def inspect_managed_type(
     assembly_path: str,
     type_name: str,
-    max_methods: int = 512,
+    max_methods: int = 32,
     timeout_seconds: Optional[float] = None
 ) -> str:
     """
@@ -137,7 +135,7 @@ async def inspect_managed_type(
             {
                 "assemblyPath": assembly_path,
                 "typeName": type_name,
-                "maxMethods": max(0, min(max_methods, 4096)),
+                "maxMethods": validate_int_range("max_methods", max_methods, 1, 32),
             },
             timeout=clamp_tool_timeout(timeout_seconds, MANAGED_INSPECTION_TIMEOUT_SECONDS),
             preferred_ide="vs",
@@ -169,8 +167,8 @@ async def inspect_managed_method_il(
                 "assemblyPath": assembly_path,
                 "typeName": type_name,
                 "methodName": method_name,
-                "overloadIndex": max(0, overload_index),
-                "maxInstructions": max(1, min(max_instructions, 4096)),
+                "overloadIndex": validate_int_range("overload_index", overload_index, 0, 4096),
+                "maxInstructions": validate_int_range("max_instructions", max_instructions, 1, 2048),
             },
             timeout=clamp_tool_timeout(timeout_seconds, MANAGED_INSPECTION_TIMEOUT_SECONDS),
             preferred_ide="vs",
@@ -202,8 +200,8 @@ async def capture_hybrid_context(
     """
     try:
         params = add_thread_capture_params({
-            "disassemblyCount": max(1, min(disassembly_count, 256)),
-            "stackBytes": max(16, min(stack_bytes, 4096)),
+            "disassemblyCount": validate_int_range("disassembly_count", disassembly_count, 1, 256),
+            "stackBytes": validate_int_range("stack_bytes", stack_bytes, 16, 4096),
             "includeNative": include_native,
             "includeModules": include_modules,
             "includeThreads": include_threads,

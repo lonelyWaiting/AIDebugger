@@ -1,0 +1,15 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Debuggee", "Debuggee\Debuggee.csproj", "{CB804E46-15A8-497A-91A7-728E92387574}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{CB804E46-15A8-497A-91A7-728E92387574}.Debug|Any CPU.ActiveCfg = Debug|AnyCPU
+		{CB804E46-15A8-497A-91A7-728E92387574}.Debug|Any CPU.Build.0 = Debug|AnyCPU
+	EndGlobalSection
+EndGlobal

@@ -1,56 +1,138 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.IO.Pipes;
+using System.Linq;
+using System.Runtime.InteropServices;
 using System.Runtime.Serialization.Json;
-using System.Security.AccessControl;
-using System.Security.Principal;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
+using Microsoft.Win32.SafeHandles;
+using VSDebuggerMCP.Ipc;
 using VSDebuggerMCP.Protocol;
 
 namespace VSDebuggerMCP
 {
     /// <summary>
     /// Named Pipe server for MCP communication.
-    /// Uses JSON-RPC style protocol over a named pipe.
+    /// Uses the authenticated AIDB/2 protocol over a length-prefixed named pipe.
     /// Each VS instance creates a unique pipe with its process ID.
     /// </summary>
-    public class NamedPipeServer : IDisposable
+    public partial class NamedPipeServer : IDisposable
     {
+        private const string ProtocolVersion = "aidb/2";
         private const string PipeNamePrefix = "AIDebuggerVS";
-        private const int MaxConnections = 10;
-        private const int MaxMessageSize = 10 * 1024 * 1024; // 10 MB per message
+        private const int DataPipeInstances = 8;
+        private const int InterruptPipeInstances = 4;
+        private const int RecoveryPipeInstances = 2;
+        private const int MaxRequestMessageSize = 4 * 1024 * 1024;
+        private const int MaxResponseMessageSize = 16 * 1024 * 1024;
+        private const int MaxMethodNameLength = 128;
+        private const int FrameIoTimeoutMs = 10000;
+        private const int InitialFrameIoTimeoutMs = 2000;
+        private const int MaxExpressionCount = 100;
+        private const int MaxExpressionLength = 16 * 1024;
+        private const int MaxCachedCommandResults = 512;
+        private const int MaxQueuedDebuggerRequests = 128;
+        private static readonly TimeSpan CachedCommandResultTtl = TimeSpan.FromMinutes(10);
         
         // Unique pipe name for this VS instance (includes process ID)
         private readonly string _pipeName;
+        private readonly string _controlPipeName;
+        private readonly string _recoveryPipeName;
+        private readonly int _processId;
+        private readonly long _processStartTimeUtcTicks;
+        private readonly string _serverInstanceId;
+        private readonly InstanceRegistration _instanceRegistration;
 
         private readonly DebuggerService _debuggerService;
         private readonly Action<string> _log;
         private readonly CancellationTokenSource _cts;
         private readonly JavaScriptSerializer _serializer;
         private readonly List<Task> _connectionTasks;
+        private readonly DebugSessionActor _debugSessionActor;
+        private readonly LongRunningDebugOperationGate _longRunningOperationGate;
+        private readonly SemaphoreSlim _inspectionDispatchGate;
+        private readonly object _activeRequestsLock = new object();
+        private readonly CommandResultStore _commandResults;
+        private readonly Dictionary<string, ActiveRequest> _activeRequests;
+        private readonly HashSet<string> _allowedCapabilities;
         private volatile bool _isRunning;
         private volatile bool _disposed;
+        private int _transportResourcesDisposed;
+        private readonly object _lifetimeLock = new object();
+        private Task _stopTask;
 
         /// <summary>
         /// Gets the unique pipe name for this VS instance.
         /// </summary>
         public string PipeName => _pipeName;
+        public IReadOnlyCollection<string> AllowedCapabilities =>
+            _allowedCapabilities.OrderBy(value => value, StringComparer.Ordinal).ToArray();
 
-        public NamedPipeServer(DebuggerService debuggerService, Action<string> log)
+        public NamedPipeServer(
+            DebuggerService debuggerService,
+            Action<string> log,
+            IEnumerable<string> requestedCapabilities = null)
         {
             _debuggerService = debuggerService ?? throw new ArgumentNullException(nameof(debuggerService));
             _log = log ?? ((s) => { });
             _cts = new CancellationTokenSource();
             _serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
             _connectionTasks = new List<Task>();
+            _debugSessionActor = new DebugSessionActor(MaxQueuedDebuggerRequests);
+            _longRunningOperationGate = new LongRunningDebugOperationGate();
+            _inspectionDispatchGate = new SemaphoreSlim(2, 2);
+            _commandResults = new CommandResultStore(
+                MaxCachedCommandResults,
+                CachedCommandResultTtl);
+            _activeRequests = new Dictionary<string, ActiveRequest>(StringComparer.Ordinal);
+            _allowedCapabilities = ResolveAllowedCapabilities(requestedCapabilities);
             
             // Create unique pipe name with process ID
-            int processId = System.Diagnostics.Process.GetCurrentProcess().Id;
-            _pipeName = $"{PipeNamePrefix}_{processId}";
+            using (var process = System.Diagnostics.Process.GetCurrentProcess())
+            {
+                _processId = process.Id;
+                _processStartTimeUtcTicks = process.StartTime.ToUniversalTime().Ticks;
+            }
+            _pipeName = $"{PipeNamePrefix}_{_processId}";
+            _controlPipeName = _pipeName + "_control";
+            _recoveryPipeName = _pipeName + "_recovery";
+            _serverInstanceId = Guid.NewGuid().ToString("N");
+            _instanceRegistration = new InstanceRegistration(
+                ProtocolVersion,
+                _pipeName,
+                _controlPipeName,
+                _recoveryPipeName,
+                _processId,
+                _processStartTimeUtcTicks,
+                _serverInstanceId,
+                _allowedCapabilities.OrderBy(value => value, StringComparer.Ordinal).ToArray(),
+                _log);
+        }
+
+        private static bool IsClientLaneAlive(string clientLane)
+        {
+            string[] parts = (clientLane ?? string.Empty).Split(':');
+            if (parts.Length != 2 ||
+                !int.TryParse(parts[0], out int processId) || processId <= 0 ||
+                !long.TryParse(parts[1], out long expectedStartTicks) || expectedStartTicks <= 0)
+                return true;
+            try
+            {
+                using (var process = System.Diagnostics.Process.GetProcessById(processId))
+                {
+                    return !process.HasExited &&
+                        process.StartTime.ToUniversalTime().Ticks == expectedStartTicks;
+                }
+            }
+            catch (ArgumentException) { return false; }
+            catch (InvalidOperationException) { return false; }
+            catch { return true; }
         }
 
         public void Start()
@@ -59,88 +141,124 @@ namespace VSDebuggerMCP
             _isRunning = true;
 
             _log($"Starting Named Pipe server on \\\\.\\pipe\\{_pipeName}");
+            _log("Named Pipe security: current-user owner only.");
 
-            // Start multiple listeners for concurrent connections
-            for (int i = 0; i < MaxConnections; i++)
+            StartListenerPool(_pipeName, false, false, DataPipeInstances);
+            // Interrupts may touch the debugger/UI and therefore use their own pool.
+            StartListenerPool(_controlPipeName, true, false, InterruptPipeInstances);
+            // Cancellation, request-status and health never share listener or client
+            // worker capacity with an interrupt that can block in the debugger.
+            StartListenerPool(_recoveryPipeName, true, true, RecoveryPipeInstances);
+        }
+
+        private void StartListenerPool(
+            string pipeName,
+            bool controlOnly,
+            bool recoveryOnly,
+            int instanceCount)
+        {
+            for (int index = 0; index < instanceCount; index++)
             {
-                var task = Task.Run(() => ListenForConnectionsAsync(_cts.Token));
-                _connectionTasks.Add(task);
+                _connectionTasks.Add(Task.Run(() => ListenForConnectionsAsync(
+                    pipeName,
+                    controlOnly,
+                    recoveryOnly,
+                    instanceCount,
+                    _cts.Token)));
             }
         }
 
         public void Stop()
         {
-            if (!_isRunning) return;
-            _isRunning = false;
+            _ = StopAsync();
+        }
 
-            _log("Stopping Named Pipe server...");
-            _cts.Cancel();
+        public Task StopAsync()
+        {
+            lock (_lifetimeLock)
+            {
+                if (_stopTask != null)
+                {
+                    return _stopTask;
+                }
 
-            // Wait for all connection tasks to complete (with timeout)
+                _isRunning = false;
+                _log("Stopping Named Pipe server...");
+                _cts.Cancel();
+                _instanceRegistration.Dispose();
+                ActiveRequest[] active;
+                lock (_activeRequestsLock)
+                {
+                    active = _activeRequests.Values.ToArray();
+                }
+                foreach (ActiveRequest request in active)
+                {
+                    request.TryCancel();
+                }
+                _debugSessionActor.Stop();
+                _stopTask = CompleteStopAsync(_connectionTasks.ToArray());
+                return _stopTask;
+            }
+        }
+
+        private async Task CompleteStopAsync(Task[] workers)
+        {
             try
             {
-                var allTasks = Task.WhenAll(_connectionTasks.ToArray());
-                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5));
-                // Wait for either all tasks to complete or timeout
-                var completedTask = Task.WhenAny(allTasks, timeoutTask).ConfigureAwait(false).GetAwaiter().GetResult();
-                // Observe the result to prevent unobserved task exceptions
-                if (completedTask == allTasks)
-                {
-                    try { allTasks.GetAwaiter().GetResult(); } catch { }
-                }
-            }
-            catch (AggregateException)
-            {
-                // Ignore cancellation exceptions
+                await Task.WhenAll(workers);
             }
             catch (OperationCanceledException)
             {
-                // Expected
+                // Expected during normal shutdown.
+            }
+            finally
+            {
+                try
+                {
+                    await _debugSessionActor.Completion;
+                }
+                catch (OperationCanceledException)
+                {
+                    // Expected during shutdown.
+                }
+                DisposeTransportResources();
+            }
+        }
+
+        private void DisposeTransportResources()
+        {
+            if (Interlocked.Exchange(ref _transportResourcesDisposed, 1) != 0)
+            {
+                return;
             }
 
-            _connectionTasks.Clear();
+            _debugSessionActor.Dispose();
+            _inspectionDispatchGate.Dispose();
+            _cts.Dispose();
             _log("Named Pipe server stopped.");
         }
 
-        private async Task ListenForConnectionsAsync(CancellationToken cancellationToken)
+        private async Task ListenForConnectionsAsync(
+            string pipeName,
+            bool controlOnly,
+            bool recoveryOnly,
+            int maxConnections,
+            CancellationToken cancellationToken)
         {
+            int consecutiveFailures = 0;
             while (!cancellationToken.IsCancellationRequested)
             {
                 NamedPipeServerStream pipeServer = null;
+                int retryDelayMs = 0;
 
                 try
                 {
-                    // Create pipe security that allows access from non-admin processes
-                    // This is critical when VS runs as admin but Cursor runs as normal user
-                    var pipeSecurity = new PipeSecurity();
-                    bool strictPipeSecurity = IsStrictPipeSecurityEnabled();
-                    
-                    if (strictPipeSecurity)
-                    {
-                        // Strict mode: only current user can connect.
-                        pipeSecurity.AddAccessRule(new PipeAccessRule(
-                            WindowsIdentity.GetCurrent().User,
-                            PipeAccessRights.FullControl,
-                            AccessControlType.Allow));
-                    }
-                    else
-                    {
-                        // Default compatibility mode: allow cross-privilege local clients.
-                        pipeSecurity.AddAccessRule(new PipeAccessRule(
-                            new SecurityIdentifier(WellKnownSidType.WorldSid, null),
-                            PipeAccessRights.ReadWrite | PipeAccessRights.CreateNewInstance,
-                            AccessControlType.Allow));
-
-                        pipeSecurity.AddAccessRule(new PipeAccessRule(
-                            WindowsIdentity.GetCurrent().User,
-                            PipeAccessRights.FullControl,
-                            AccessControlType.Allow));
-                    }
+                    var pipeSecurity = PipeSecurityFactory.Create();
 
                     pipeServer = new NamedPipeServerStream(
-                        _pipeName,
+                        pipeName,
                         PipeDirection.InOut,
-                        MaxConnections,
+                        maxConnections,
                         PipeTransmissionMode.Byte,
                         PipeOptions.Asynchronous,
                         inBufferSize: 4096,
@@ -151,6 +269,7 @@ namespace VSDebuggerMCP
 
                     // Wait for connection with cancellation support
                     await WaitForConnectionAsync(pipeServer, cancellationToken);
+                    consecutiveFailures = 0;
 
                     if (cancellationToken.IsCancellationRequested)
                     {
@@ -161,7 +280,7 @@ namespace VSDebuggerMCP
                     _log("Client connected.");
 
                     // Handle the connection
-                    await HandleConnectionAsync(pipeServer, cancellationToken);
+                    await HandleConnectionAsync(pipeServer, controlOnly, recoveryOnly, cancellationToken);
                 }
                 catch (OperationCanceledException)
                 {
@@ -170,17 +289,36 @@ namespace VSDebuggerMCP
                 }
                 catch (IOException ex)
                 {
-                    _log($"IO error: {ex.Message}");
+                    _log($"Pipe listener IO error: {ex.GetType().Name}");
+                    retryDelayMs = ComputeListenerRetryDelay(++consecutiveFailures);
                 }
                 catch (Exception ex)
                 {
-                    _log($"Error in pipe listener: {ex.Message}");
+                    _log($"Pipe listener error: {ex.GetType().Name}");
+                    retryDelayMs = ComputeListenerRetryDelay(++consecutiveFailures);
                 }
                 finally
                 {
                     pipeServer?.Dispose();
                 }
+                if (retryDelayMs > 0)
+                {
+                    try
+                    {
+                        await Task.Delay(retryDelayMs, cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                }
             }
+        }
+
+        private static int ComputeListenerRetryDelay(int consecutiveFailures)
+        {
+            int exponent = Math.Min(Math.Max(0, consecutiveFailures - 1), 6);
+            return Math.Min(2000, 25 << exponent);
         }
 
         private static async Task WaitForConnectionAsync(NamedPipeServerStream pipeServer, CancellationToken cancellationToken)
@@ -225,47 +363,52 @@ namespace VSDebuggerMCP
             }
         }
 
-        private async Task HandleConnectionAsync(NamedPipeServerStream pipeServer, CancellationToken cancellationToken)
+        [SuppressMessage(
+            "Usage",
+            "VSTHRD010",
+            Justification = "ProcessRequest invokes only self-marshalling DebuggerService entrypoints; pipe framing remains off the UI thread.")]
+        private async Task HandleConnectionAsync(
+            NamedPipeServerStream pipeServer,
+            bool controlOnly,
+            bool recoveryOnly,
+            CancellationToken cancellationToken)
         {
             try
             {
-                var reader = new StreamReader(pipeServer, Encoding.UTF8, true, 4096, leaveOpen: true);
+                var codec = new LengthPrefixedFrameCodec(pipeServer);
+                EnsureLocalPipeClient(pipeServer);
+                int clientProcessId = GetNamedPipeClientProcessIdVerified(pipeServer);
 
-                // Use UTF-8 without BOM - the BOM causes Python's json.loads to fail
-                var utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
-                var writer = new StreamWriter(pipeServer, utf8NoBom, 4096, leaveOpen: true);
-
-                try
+                // One connection carries exactly one request/response. With one
+                // server instance per public name this prevents an unauthenticated
+                // idle client (or a client retaining a post-response handle) from
+                // monopolizing the data/control lane indefinitely.
+                string requestLine;
+                using (var frameReadCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
-                    // NOTE: Do NOT set writer.AutoFlush = true here!
-                    // It causes deadlock with async NamedPipeServerStream when client has pending writes.
-                    // Instead, call FlushAsync() explicitly after each write.
-
-                    while (pipeServer.IsConnected && !cancellationToken.IsCancellationRequested)
-                    {
-                        // Read request with size limit to prevent OOM from malicious/buggy clients
-                        string requestLine = await ReadLineWithLimitAsync(reader, MaxMessageSize);
-                        if (requestLine == null)
-                        {
-                            break;
-                        }
-
-                        _log($"Received request: {requestLine.Substring(0, Math.Min(100, requestLine.Length))}...");
-
-                        // Process request
-                        string response = ProcessRequest(requestLine);
-
-                        // Send response and flush explicitly
-                        await writer.WriteLineAsync(response);
-                        await writer.FlushAsync();
-                        _log($"Sent response: {response.Substring(0, Math.Min(100, response.Length))}...");
-                    }
+                    frameReadCts.CancelAfter(InitialFrameIoTimeoutMs);
+                    requestLine = await codec.ReadFrameAsync(MaxRequestMessageSize, frameReadCts.Token);
                 }
-                finally
+                if (requestLine == null) return;
+
+                _log($"Received request ({Encoding.UTF8.GetByteCount(requestLine)} bytes).");
+
+                string response = await ProcessRequestAsync(
+                    requestLine,
+                    clientProcessId,
+                    controlOnly,
+                    recoveryOnly);
+
+                using (var frameWriteCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
-                    reader.Dispose();
-                    writer.Dispose();
+                    frameWriteCts.CancelAfter(FrameIoTimeoutMs);
+                    await codec.WriteFrameAsync(response, MaxResponseMessageSize, frameWriteCts.Token);
                 }
+                _log($"Sent response ({Encoding.UTF8.GetByteCount(response)} bytes).");
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                _log("Client frame IO exceeded the 10-second transport deadline.");
             }
             catch (IOException)
             {
@@ -274,647 +417,94 @@ namespace VSDebuggerMCP
             }
             catch (Exception ex)
             {
-                _log($"Error handling connection: {ex.Message}");
+                _log($"Connection handler error: {ex.GetType().Name}");
             }
         }
 
-        /// <summary>
-        /// Reads a line from the stream with a maximum size limit.
-        /// Returns null on end-of-stream or empty input. Throws IOException if limit exceeded.
-        /// </summary>
-        private static async Task<string> ReadLineWithLimitAsync(StreamReader reader, int maxSize)
+
+        private string SerializeResponse(
+            DebugResponse response,
+            DebugServerIdentity serverIdentity = null,
+            DebugRequest completedRequest = null)
         {
-            var sb = new StringBuilder();
-            var buffer = new char[4096];
-            
-            while (true)
-            {
-                int ch = reader.Peek();
-                if (ch == -1)
-                {
-                    // End of stream
-                    return sb.Length > 0 ? sb.ToString() : null;
-                }
-
-                int read = await reader.ReadAsync(buffer, 0, Math.Min(buffer.Length, maxSize - sb.Length + 1));
-                if (read == 0)
-                {
-                    return sb.Length > 0 ? sb.ToString() : null;
-                }
-
-                for (int i = 0; i < read; i++)
-                {
-                    char c = buffer[i];
-                    if (c == '\n')
-                    {
-                        // End of line found - return what we have (trim trailing \r if present)
-                        string result = sb.ToString();
-                        if (result.Length > 0 && result[result.Length - 1] == '\r')
-                            result = result.Substring(0, result.Length - 1);
-                        return result.Length > 0 ? result : null;
-                    }
-                    
-                    sb.Append(c);
-                    
-                    if (sb.Length > maxSize)
-                    {
-                        throw new IOException($"Message exceeds maximum size of {maxSize} bytes");
-                    }
-                }
-            }
-        }
-
-        private string ProcessRequest(string requestJson)
-        {
-            DebugRequest request = null;
+            DebugServerIdentity effectiveIdentity = serverIdentity ?? CreateServerIdentity(
+                _debuggerService.CaptureCurrentDebuggerIdentity());
             try
             {
-                request = _serializer.Deserialize<DebugRequest>(requestJson);
+                response.Protocol = ProtocolVersion;
+                response.Status = response.Error == null ? "ok" : "error";
+                response.Server = effectiveIdentity;
+
+                string serialized = DebugResponseJsonSerializer.Serialize(response);
+                if (completedRequest != null)
+                {
+                    return EnforceMethodResultLimit(
+                        completedRequest,
+                        serialized,
+                        effectiveIdentity);
+                }
+                if (Encoding.UTF8.GetByteCount(serialized) <= MaxResponseMessageSize)
+                {
+                    return serialized;
+                }
+
+                if (response?.Error?.Code == "RESOURCE_LIMIT_EXCEEDED")
+                {
+                    return serialized;
+                }
+
+                return SerializeResponse(DebugResponse.Failure(
+                    response?.Id,
+                    "RESOURCE_LIMIT_EXCEEDED",
+                    $"Response exceeds maximum size of {MaxResponseMessageSize} bytes"),
+                    effectiveIdentity);
             }
             catch (Exception ex)
             {
-                return SerializeResponse(DebugResponse.Failure(null, "PARSE_ERROR", $"Failed to parse request: {ex.Message}"));
-            }
-
-            if (request == null || string.IsNullOrEmpty(request.Method))
-            {
-                return SerializeResponse(DebugResponse.Failure(request?.Id, "INVALID_REQUEST", "Missing method"));
-            }
-
-            try
-            {
-                object result = HandleMethod(request);
-                return SerializeResponse(DebugResponse.Success(request.Id, result));
-            }
-            catch (Exception ex)
-            {
-                _log($"Error processing method {request.Method}: {ex.Message}");
-                return SerializeResponse(DebugResponse.Failure(request.Id, "INTERNAL_ERROR", ex.Message));
-            }
-        }
-
-        private object HandleMethod(DebugRequest request)
-        {
-            switch (request.Method.ToLowerInvariant())
-            {
-                case "get_debug_status":
-                    return _debuggerService.GetDebugStatus();
-
-                case "get_callstack":
-                    return _debuggerService.GetCallStack();
-
-                case "get_locals":
-                    int localsDepth = GetParam<int>(request.Params, "depth", 2);
-                    return _debuggerService.GetLocals(localsDepth);
-
-                case "get_threads":
-                    {
-                        bool includeFrames = GetParam<bool>(request.Params, "includeFrames", true);
-                        int maxFramesPerThread = GetParam<int>(request.Params, "maxFramesPerThread", -1);
-                        int maxNodes = GetParam<int>(request.Params, "maxNodes", -1);
-                        int budgetMs = GetParam<int>(request.Params, "budgetMs", -1);
-                        return _debuggerService.GetThreads(includeFrames, maxFramesPerThread, maxNodes, budgetMs);
-                    }
-
-                case "get_modules":
-                    return _debuggerService.GetModules();
-
-                case "get_exception":
-                    return _debuggerService.GetException();
-
-                case "evaluate_expression":
-                    {
-                        string expression = GetParam<string>(request.Params, "expression", "");
-                        bool expandChildren = GetParam<bool>(request.Params, "expandChildren", false);
-                        int maxDepth = GetParam<int>(request.Params, "maxDepth", 2);
-                        bool allowSideEffects = GetParam<bool>(request.Params, "allowSideEffects", false);
-                        return _debuggerService.EvaluateExpression(expression, expandChildren, maxDepth, allowSideEffects);
-                    }
-
-                case "evaluate_expressions_batch":
-                    {
-                        var expressions = GetStringListParam(request.Params, "expressions");
-                        bool expandChildren = GetParam<bool>(request.Params, "expandChildren", false);
-                        int maxDepth = GetParam<int>(request.Params, "maxDepth", 2);
-                        bool allowSideEffects = GetParam<bool>(request.Params, "allowSideEffects", false);
-                        return _debuggerService.EvaluateExpressionsBatch(expressions, expandChildren, maxDepth, allowSideEffects);
-                    }
-
-                case "capture_debug_bundle":
-                    {
-                        var expressions = GetStringListParam(request.Params, "expressions");
-                        bool expandChildren = GetParam<bool>(request.Params, "expandChildren", false);
-                        int maxDepth = GetParam<int>(request.Params, "maxDepth", 2);
-                        int outputTailLines = GetParam<int>(request.Params, "outputTailLines", 80);
-                        bool includeLocals = GetParam<bool>(request.Params, "includeLocals", false);
-                        bool includeModules = GetParam<bool>(request.Params, "includeModules", false);
-                        bool includeRegisters = GetParam<bool>(request.Params, "includeRegisters", false);
-                        bool includeOutput = GetParam<bool>(request.Params, "includeOutput", false);
-                        bool includeThreads = GetParam<bool>(request.Params, "includeThreads", true);
-                        bool includeException = GetParam<bool>(request.Params, "includeException", true);
-                        bool allowSideEffects = GetParam<bool>(request.Params, "allowSideEffects", false);
-                        bool threadIncludeFrames = GetParam<bool>(request.Params, "threadIncludeFrames", true);
-                        int threadMaxFramesPerThread = GetParam<int>(request.Params, "threadMaxFramesPerThread", -1);
-                        int threadMaxNodes = GetParam<int>(request.Params, "threadMaxNodes", -1);
-                        int threadBudgetMs = GetParam<int>(request.Params, "threadBudgetMs", -1);
-                        return _debuggerService.CaptureDebugBundle(
-                            expressions,
-                            expandChildren,
-                            maxDepth,
-                            outputTailLines,
-                            includeLocals,
-                            includeModules,
-                            includeRegisters,
-                            includeOutput,
-                            includeThreads,
-                            includeException,
-                            allowSideEffects,
-                            threadIncludeFrames,
-                            threadMaxFramesPerThread,
-                            threadMaxNodes,
-                            threadBudgetMs);
-                    }
-
-                case "read_memory":
-                    {
-                        string address = GetParam<string>(request.Params, "address", "");
-                        int size = GetParam<int>(request.Params, "size", 256);
-                        return _debuggerService.ReadMemory(address, size);
-                    }
-
-                case "get_disassembly":
-                    {
-                        int linesBefore = GetParam<int>(request.Params, "linesBefore", 20);
-                        int linesAfter = GetParam<int>(request.Params, "linesAfter", 20);
-                        return _debuggerService.GetDisassembly(linesBefore, linesAfter);
-                    }
-
-                case "get_disassembly_at":
-                    {
-                        string address = GetParam<string>(request.Params, "address", "");
-                        int count = GetParam<int>(request.Params, "count", 50);
-                        return _debuggerService.GetDisassemblyAt(address, count);
-                    }
-
-                case "resolve_address":
-                    {
-                        string address = GetParam<string>(request.Params, "address", "");
-                        return _debuggerService.ResolveAddress(address);
-                    }
-
-                case "get_module_layout":
-                    {
-                        string module = GetParam<string>(request.Params, "module", "");
-                        int maxImportFunctions = GetParam<int>(request.Params, "maxImportFunctions", 256);
-                        int maxExports = GetParam<int>(request.Params, "maxExports", 512);
-                        return _debuggerService.GetModuleLayout(module, maxImportFunctions, maxExports);
-                    }
-
-                case "capture_native_context":
-                    {
-                        int disassemblyCount = GetParam<int>(request.Params, "disassemblyCount", 32);
-                        int stackBytes = GetParam<int>(request.Params, "stackBytes", 256);
-                        bool includeModules = GetParam<bool>(request.Params, "includeModules", true);
-                        return _debuggerService.CaptureNativeContext(disassemblyCount, stackBytes, includeModules);
-                    }
-
-                case "continue_and_capture_native":
-                    {
-                        int timeoutMs = GetParam<int>(request.Params, "timeoutMs", 120000);
-                        int pollIntervalMs = GetParam<int>(request.Params, "pollIntervalMs", 200);
-                        int disassemblyCount = GetParam<int>(request.Params, "disassemblyCount", 32);
-                        int stackBytes = GetParam<int>(request.Params, "stackBytes", 256);
-                        bool includeModules = GetParam<bool>(request.Params, "includeModules", true);
-                        return _debuggerService.ContinueAndCaptureNative(timeoutMs, pollIntervalMs, disassemblyCount, stackBytes, includeModules);
-                    }
-
-                case "inspect_managed_assembly":
-                    {
-                        string assemblyPath = GetParam<string>(request.Params, "assemblyPath", "");
-                        string typeFilter = GetParam<string>(request.Params, "typeFilter", null);
-                        int maxTypes = GetParam<int>(request.Params, "maxTypes", 256);
-                        int maxMethodsPerType = GetParam<int>(request.Params, "maxMethodsPerType", 64);
-                        return _debuggerService.InspectManagedAssembly(assemblyPath, typeFilter, maxTypes, maxMethodsPerType);
-                    }
-
-                case "inspect_managed_type":
-                    {
-                        string assemblyPath = GetParam<string>(request.Params, "assemblyPath", "");
-                        string typeName = GetParam<string>(request.Params, "typeName", "");
-                        int maxMethods = GetParam<int>(request.Params, "maxMethods", 512);
-                        return _debuggerService.InspectManagedType(assemblyPath, typeName, maxMethods);
-                    }
-
-                case "inspect_managed_method_il":
-                    {
-                        string assemblyPath = GetParam<string>(request.Params, "assemblyPath", "");
-                        string typeName = GetParam<string>(request.Params, "typeName", "");
-                        string methodName = GetParam<string>(request.Params, "methodName", "");
-                        int overloadIndex = GetParam<int>(request.Params, "overloadIndex", 0);
-                        int maxInstructions = GetParam<int>(request.Params, "maxInstructions", 512);
-                        return _debuggerService.InspectManagedMethodIl(assemblyPath, typeName, methodName, overloadIndex, maxInstructions);
-                    }
-
-                case "capture_hybrid_context":
-                    {
-                        int disassemblyCount = GetParam<int>(request.Params, "disassemblyCount", 32);
-                        int stackBytes = GetParam<int>(request.Params, "stackBytes", 256);
-                        bool includeNative = GetParam<bool>(request.Params, "includeNative", true);
-                        bool includeModules = GetParam<bool>(request.Params, "includeModules", true);
-                        bool includeThreads = GetParam<bool>(request.Params, "includeThreads", true);
-                        bool includeBreakpoints = GetParam<bool>(request.Params, "includeBreakpoints", true);
-                        bool threadIncludeFrames = GetParam<bool>(request.Params, "threadIncludeFrames", true);
-                        int threadMaxFramesPerThread = GetParam<int>(request.Params, "threadMaxFramesPerThread", -1);
-                        int threadMaxNodes = GetParam<int>(request.Params, "threadMaxNodes", -1);
-                        int threadBudgetMs = GetParam<int>(request.Params, "threadBudgetMs", -1);
-                        return _debuggerService.CaptureHybridContext(
-                            disassemblyCount,
-                            stackBytes,
-                            includeNative,
-                            includeModules,
-                            includeThreads,
-                            includeBreakpoints,
-                            threadIncludeFrames,
-                            threadMaxFramesPerThread,
-                            threadMaxNodes,
-                            threadBudgetMs);
-                    }
-
-                case "get_breakpoint_bindings":
-                    return _debuggerService.GetBreakpointBindings();
-
-                case "continue_and_capture_breakpoint":
-                    {
-                        int timeoutMs = GetParam<int>(request.Params, "timeoutMs", 120000);
-                        int pollIntervalMs = GetParam<int>(request.Params, "pollIntervalMs", 200);
-                        int disassemblyCount = GetParam<int>(request.Params, "disassemblyCount", 32);
-                        int stackBytes = GetParam<int>(request.Params, "stackBytes", 256);
-                        bool includeNative = GetParam<bool>(request.Params, "includeNative", true);
-                        bool includeModules = GetParam<bool>(request.Params, "includeModules", true);
-                        bool includeThreads = GetParam<bool>(request.Params, "includeThreads", true);
-                        bool includeBreakpoints = GetParam<bool>(request.Params, "includeBreakpoints", true);
-                        bool threadIncludeFrames = GetParam<bool>(request.Params, "threadIncludeFrames", true);
-                        int threadMaxFramesPerThread = GetParam<int>(request.Params, "threadMaxFramesPerThread", -1);
-                        int threadMaxNodes = GetParam<int>(request.Params, "threadMaxNodes", -1);
-                        int threadBudgetMs = GetParam<int>(request.Params, "threadBudgetMs", -1);
-                        return _debuggerService.ContinueAndCaptureBreakpoint(
-                            timeoutMs,
-                            pollIntervalMs,
-                            disassemblyCount,
-                            stackBytes,
-                            includeNative,
-                            includeModules,
-                            includeThreads,
-                            includeBreakpoints,
-                            threadIncludeFrames,
-                            threadMaxFramesPerThread,
-                            threadMaxNodes,
-                            threadBudgetMs);
-                    }
-
-                case "get_build_errors":
-                    return _debuggerService.GetBuildErrors();
-
-                case "get_errors_only":
-                    return _debuggerService.GetBuildErrors(errorsOnly: true);
-
-                case "get_warnings_only":
-                    return _debuggerService.GetBuildErrors(warningsOnly: true);
-
-                case "get_full_context":
-                    {
-                        bool threadIncludeFrames = GetParam<bool>(request.Params, "threadIncludeFrames", true);
-                        int threadMaxFramesPerThread = GetParam<int>(request.Params, "threadMaxFramesPerThread", -1);
-                        int threadMaxNodes = GetParam<int>(request.Params, "threadMaxNodes", -1);
-                        int threadBudgetMs = GetParam<int>(request.Params, "threadBudgetMs", -1);
-                        return _debuggerService.GetFullContext(
-                            threadIncludeFrames,
-                            threadMaxFramesPerThread,
-                            threadMaxNodes,
-                            threadBudgetMs);
-                    }
-
-                case "ping":
-                    return new PingResult { Status = "ok", Timestamp = DateTime.UtcNow.ToString("o") };
-
-                case "get_instance_info":
-                    return _debuggerService.GetInstanceInfo(_pipeName);
-
-                // Debug Control
-                case "attach_process":
-                    {
-                        int processId = GetParam<int>(request.Params, "processId", 0);
-                        string processName = GetParam<string>(request.Params, "processName", null);
-                        return _debuggerService.AttachProcess(processId, processName);
-                    }
-
-                case "start_debugging":
-                    {
-                        string executablePath = GetParam<string>(request.Params, "executablePath", null);
-                        string workingDirectory = GetParam<string>(request.Params, "workingDirectory", null);
-                        string arguments = GetParam<string>(request.Params, "arguments", null);
-                        bool attach = GetParam<bool>(request.Params, "attach", true);
-                        return _debuggerService.StartDebugging(executablePath, workingDirectory, arguments, attach);
-                    }
-
-                case "continue":
-                    return _debuggerService.Continue();
-
-                case "continue_and_wait_for_break":
-                    {
-                        var expressions = GetStringListParam(request.Params, "expressions");
-                        bool expandChildren = GetParam<bool>(request.Params, "expandChildren", false);
-                        int maxDepth = GetParam<int>(request.Params, "maxDepth", 2);
-                        int outputTailLines = GetParam<int>(request.Params, "outputTailLines", 80);
-                        int timeoutMs = GetParam<int>(request.Params, "timeoutMs", 120000);
-                        int pollIntervalMs = GetParam<int>(request.Params, "pollIntervalMs", 200);
-                        bool includeLocals = GetParam<bool>(request.Params, "includeLocals", false);
-                        bool includeModules = GetParam<bool>(request.Params, "includeModules", false);
-                        bool includeRegisters = GetParam<bool>(request.Params, "includeRegisters", false);
-                        bool includeOutput = GetParam<bool>(request.Params, "includeOutput", false);
-                        bool includeThreads = GetParam<bool>(request.Params, "includeThreads", true);
-                        bool includeException = GetParam<bool>(request.Params, "includeException", true);
-                        bool allowSideEffects = GetParam<bool>(request.Params, "allowSideEffects", false);
-                        bool threadIncludeFrames = GetParam<bool>(request.Params, "threadIncludeFrames", true);
-                        int threadMaxFramesPerThread = GetParam<int>(request.Params, "threadMaxFramesPerThread", -1);
-                        int threadMaxNodes = GetParam<int>(request.Params, "threadMaxNodes", -1);
-                        int threadBudgetMs = GetParam<int>(request.Params, "threadBudgetMs", -1);
-                        return _debuggerService.ContinueAndWaitForBreak(
-                            expressions,
-                            expandChildren,
-                            maxDepth,
-                            outputTailLines,
-                            timeoutMs,
-                            pollIntervalMs,
-                            includeLocals,
-                            includeModules,
-                            includeRegisters,
-                            includeOutput,
-                            includeThreads,
-                            includeException,
-                            allowSideEffects,
-                            threadIncludeFrames,
-                            threadMaxFramesPerThread,
-                            threadMaxNodes,
-                            threadBudgetMs);
-                    }
-
-                case "step_into":
-                    return _debuggerService.StepInto();
-
-                case "step_over":
-                    return _debuggerService.StepOver();
-
-                case "step_out":
-                    return _debuggerService.StepOut();
-
-                case "break":
-                    return _debuggerService.Break();
-
-                case "stop":
-                    return _debuggerService.Stop();
-
-                case "detach":
-                    return _debuggerService.Detach();
-
-                case "run_to_cursor":
-                    {
-                        string filePath = GetParam<string>(request.Params, "filePath", "");
-                        int lineNumber = GetParam<int>(request.Params, "lineNumber", 0);
-                        return _debuggerService.RunToCursor(filePath, lineNumber);
-                    }
-
-                case "set_next_statement":
-                    {
-                        string filePath = GetParam<string>(request.Params, "filePath", "");
-                        int lineNumber = GetParam<int>(request.Params, "lineNumber", 0);
-                        return _debuggerService.SetNextStatement(filePath, lineNumber);
-                    }
-
-                // Breakpoints
-                case "get_breakpoints":
-                    return _debuggerService.GetBreakpoints();
-
-                case "set_breakpoint":
-                    {
-                        string filePath = GetParam<string>(request.Params, "filePath", "");
-                        int lineNumber = GetParam<int>(request.Params, "lineNumber", 0);
-                        string condition = GetParam<string>(request.Params, "condition", null);
-                        int hitCount = GetParam<int>(request.Params, "hitCount", 0);
-                        string hitCountType = GetParam<string>(request.Params, "hitCountType", null);
-                        string conditionType = GetParam<string>(request.Params, "conditionType", null);
-                        return _debuggerService.SetBreakpoint(filePath, lineNumber, condition, hitCount, hitCountType, conditionType);
-                    }
-
-                case "set_function_breakpoint":
-                    {
-                        string functionName = GetParam<string>(request.Params, "functionName", "");
-                        string condition = GetParam<string>(request.Params, "condition", null);
-                        int hitCount = GetParam<int>(request.Params, "hitCount", 0);
-                        string hitCountType = GetParam<string>(request.Params, "hitCountType", null);
-                        string conditionType = GetParam<string>(request.Params, "conditionType", null);
-                        return _debuggerService.SetFunctionBreakpoint(functionName, condition, hitCount, hitCountType, conditionType);
-                    }
-
-                case "set_data_breakpoint":
-                case "set_watchpoint":
-                    {
-                        string dataExpression = GetParam<string>(request.Params, "dataExpression", "");
-                        int byteCount = GetParam<int>(request.Params, "byteCount", 1);
-                        string condition = GetParam<string>(request.Params, "condition", null);
-                        int hitCount = GetParam<int>(request.Params, "hitCount", 0);
-                        string hitCountType = GetParam<string>(request.Params, "hitCountType", null);
-                        string conditionType = GetParam<string>(request.Params, "conditionType", null);
-                        return _debuggerService.SetDataBreakpoint(dataExpression, byteCount, condition, hitCount, hitCountType, conditionType);
-                    }
-
-                case "set_address_breakpoint":
-                    {
-                        string address = GetParam<string>(request.Params, "address", "");
-                        string condition = GetParam<string>(request.Params, "condition", null);
-                        int hitCount = GetParam<int>(request.Params, "hitCount", 0);
-                        string hitCountType = GetParam<string>(request.Params, "hitCountType", null);
-                        string conditionType = GetParam<string>(request.Params, "conditionType", null);
-                        return _debuggerService.SetAddressBreakpoint(address, condition, hitCount, hitCountType, conditionType);
-                    }
-
-                case "delete_breakpoint":
-                case "clear_breakpoint":
-                    {
-                        string filePath = GetParam<string>(request.Params, "filePath", "");
-                        int lineNumber = GetParam<int>(request.Params, "lineNumber", 0);
-                        return _debuggerService.DeleteBreakpoint(filePath, lineNumber);
-                    }
-
-                case "delete_all_breakpoints":
-                    return _debuggerService.DeleteAllBreakpoints();
-
-                case "enable_breakpoint":
-                    {
-                        string filePath = GetParam<string>(request.Params, "filePath", "");
-                        int lineNumber = GetParam<int>(request.Params, "lineNumber", 0);
-                        bool enabled = GetParam<bool>(request.Params, "enabled", true);
-                        return _debuggerService.EnableBreakpoint(filePath, lineNumber, enabled);
-                    }
-
-                // Registers
-                case "get_registers":
-                    return _debuggerService.GetRegisters();
-
-                // Watch
-                case "add_watch":
-                    {
-                        string expression = GetParam<string>(request.Params, "expression", "");
-                        return _debuggerService.AddWatch(expression);
-                    }
-
-                // Memory Search
-                case "search_memory":
-                    {
-                        string startAddress = GetParam<string>(request.Params, "startAddress", "");
-                        string pattern = GetParam<string>(request.Params, "pattern", "");
-                        int maxResults = GetParam<int>(request.Params, "maxResults", 100);
-                        int searchSize = GetParam<int>(request.Params, "searchSize", 0x10000);
-                        string patternFormat = GetParam<string>(request.Params, "patternFormat", "auto");
-                        long startOffset = GetParam<long>(request.Params, "startOffset", 0);
-                        return _debuggerService.SearchMemory(startAddress, pattern, maxResults, searchSize, patternFormat, startOffset);
-                    }
-
-                // Stack Frame Navigation
-                case "switch_stack_frame":
-                    {
-                        int frameIndex = GetParam<int>(request.Params, "frameIndex", 0);
-                        return _debuggerService.SwitchStackFrame(frameIndex);
-                    }
-
-                case "switch_thread":
-                    {
-                        int threadId = GetParam<int>(request.Params, "threadId", 0);
-                        return _debuggerService.SwitchThread(threadId);
-                    }
-
-                // Output Window
-                case "get_output_window":
-                    {
-                        string pane = GetParam<string>(request.Params, "pane", "Debug");
-                        int tailLines = GetParam<int>(request.Params, "tailLines", 50);
-                        return _debuggerService.GetOutputWindow(pane, tailLines);
-                    }
-
-                case "search_output":
-                    {
-                        string pattern = GetParam<string>(request.Params, "pattern", "");
-                        string pane = GetParam<string>(request.Params, "pane", "Debug");
-                        bool isRegex = GetParam<bool>(request.Params, "isRegex", false);
-                        int contextLines = GetParam<int>(request.Params, "contextLines", 2);
-                        int maxMatches = GetParam<int>(request.Params, "maxMatches", 20);
-                        return _debuggerService.SearchOutput(pattern, pane, isRegex, contextLines, maxMatches);
-                    }
-
-                default:
-                    throw new NotSupportedException($"Unknown method: {request.Method}");
-            }
-        }
-
-        private T GetParam<T>(Dictionary<string, object> parameters, string key, T defaultValue)
-        {
-            if (parameters == null || !parameters.ContainsKey(key))
-            {
-                return defaultValue;
-            }
-
-            try
-            {
-                object value = parameters[key];
-                if (value == null)
+                _log($"Error serializing response: {ex.GetType().Name}");
+                if (completedRequest != null &&
+                    string.Equals(GetMethodKind(completedRequest.Method), "command", StringComparison.Ordinal))
                 {
-                    return defaultValue;
-                }
-
-                // Handle type conversions
-                if (typeof(T) == typeof(int))
-                {
-                    return (T)(object)Convert.ToInt32(value);
-                }
-                if (typeof(T) == typeof(long))
-                {
-                    return (T)(object)Convert.ToInt64(value);
-                }
-                if (typeof(T) == typeof(bool))
-                {
-                    return (T)(object)Convert.ToBoolean(value);
-                }
-                if (typeof(T) == typeof(string))
-                {
-                    return (T)(object)value.ToString();
-                }
-
-                return (T)value;
-            }
-            catch
-            {
-                return defaultValue;
-            }
-        }
-
-        private List<string> GetStringListParam(Dictionary<string, object> parameters, string key)
-        {
-            var result = new List<string>();
-            if (parameters == null || !parameters.TryGetValue(key, out object value) || value == null)
-            {
-                return result;
-            }
-
-            if (value is string single)
-            {
-                if (!string.IsNullOrWhiteSpace(single))
-                {
-                    result.Add(single);
-                }
-                return result;
-            }
-
-            if (value is System.Collections.IEnumerable enumerable)
-            {
-                foreach (var item in enumerable)
-                {
-                    if (item == null)
+                    var completedFailure = DebugResponse.Failure(
+                        completedRequest.Id,
+                        "RESULT_SERIALIZATION_FAILED_AFTER_COMMAND",
+                        $"Command '{completedRequest.Method}' completed, but its result could not be serialized. The command was not replayed.");
+                    completedFailure.Error.RequestId = completedRequest.Id;
+                    completedFailure.Error.Details = new Dictionary<string, object>
                     {
-                        continue;
-                    }
-
-                    string expression = item.ToString();
-                    if (!string.IsNullOrWhiteSpace(expression))
-                    {
-                        result.Add(expression);
-                    }
+                        ["commandCompleted"] = true,
+                        ["method"] = completedRequest.Method,
+                    };
+                    return SerializeResponse(completedFailure, effectiveIdentity);
                 }
-            }
-
-            return result;
-        }
-
-        private string SerializeResponse(DebugResponse response)
-        {
-            try
-            {
-                // Use DataContractJsonSerializer to respect DataMember(Name = "...") attributes
-                // This ensures lowercase property names like "result" instead of "Result"
-                var serializer = new DataContractJsonSerializer(typeof(DebugResponse));
-                using (var ms = new MemoryStream())
-                {
-                    serializer.WriteObject(ms, response);
-                    return Encoding.UTF8.GetString(ms.ToArray());
-                }
-            }
-            catch (Exception ex)
-            {
-                _log($"Error serializing response: {ex.Message}");
-                // Fallback to simple error JSON with proper escaping
                 string safeId = EscapeJsonString(response?.Id);
-                string safeMessage = EscapeJsonString(ex.Message);
-                return $"{{\"id\":\"{safeId}\",\"error\":{{\"code\":\"SERIALIZE_ERROR\",\"message\":\"{safeMessage}\"}}}}";
+                return "{" +
+                    $"\"protocol\":\"{ProtocolVersion}\"," +
+                    $"\"id\":\"{safeId}\"," +
+                    "\"status\":\"error\"," +
+                    "\"server\":{" +
+                    $"\"processId\":{_processId}," +
+                    $"\"processStartTimeUtcTicks\":{_processStartTimeUtcTicks}," +
+                    $"\"serverInstanceId\":\"{EscapeJsonString(_serverInstanceId)}\"," +
+                    $"\"debugSessionGeneration\":{effectiveIdentity.DebugSessionGeneration}," +
+                    $"\"breakSequence\":{effectiveIdentity.BreakSequence}," +
+                    $"\"contextEpoch\":{effectiveIdentity.ContextEpoch}" +
+                    "}," +
+                    "\"error\":{\"code\":\"SERIALIZE_ERROR\",\"message\":\"Response serialization failed; see the Visual Studio Activity Log.\"}}";
             }
+        }
+
+        private DebugServerIdentity CreateServerIdentity(DebuggerIdentitySnapshot debuggerIdentity)
+        {
+            return new DebugServerIdentity
+            {
+                ProcessId = _processId,
+                ProcessStartTimeUtcTicks = _processStartTimeUtcTicks,
+                ServerInstanceId = _serverInstanceId,
+                DebugSessionGeneration = debuggerIdentity?.DebugSessionGeneration ?? 0,
+                BreakSequence = debuggerIdentity?.BreakSequence ?? 0,
+                ContextEpoch = debuggerIdentity?.ContextEpoch ?? 0,
+            };
         }
 
         public void Dispose()
@@ -923,21 +513,67 @@ namespace VSDebuggerMCP
             _disposed = true;
 
             Stop();
-            _cts.Dispose();
+            _instanceRegistration.Dispose();
+            if (!_isRunning && _connectionTasks.Count == 0)
+            {
+                DisposeTransportResources();
+            }
         }
 
-        private static bool IsStrictPipeSecurityEnabled()
+        private sealed class ProtocolRequestException : Exception
         {
-            var value = Environment.GetEnvironmentVariable("AIDB_PIPE_SECURITY");
-            if (string.IsNullOrEmpty(value))
+            public ProtocolRequestException(string code, string message) : base(message)
             {
-                return false;
+                Code = code;
             }
 
-            return value.Equals("strict", StringComparison.OrdinalIgnoreCase) ||
-                   value.Equals("same_user", StringComparison.OrdinalIgnoreCase) ||
-                   value.Equals("owner_only", StringComparison.OrdinalIgnoreCase);
+            public string Code { get; }
         }
+
+        private static int GetNamedPipeClientProcessIdVerified(NamedPipeServerStream pipeServer)
+        {
+            if (pipeServer == null || !pipeServer.IsConnected ||
+                !GetNamedPipeClientProcessId(pipeServer.SafePipeHandle, out uint processId) ||
+                processId == 0 || processId > int.MaxValue)
+            {
+                throw new IOException("Unable to identify the named-pipe client process");
+            }
+            return (int)processId;
+        }
+
+        private static void EnsureLocalPipeClient(NamedPipeServerStream pipeServer)
+        {
+            if (pipeServer == null || !pipeServer.IsConnected)
+            {
+                throw new IOException("Named-pipe client is not connected");
+            }
+            var computerName = new StringBuilder(256);
+            if (!GetNamedPipeClientComputerName(
+                pipeServer.SafePipeHandle,
+                computerName,
+                (uint)computerName.Capacity))
+            {
+                throw new UnauthorizedAccessException("Unable to verify that the named-pipe client is local");
+            }
+            string actual = computerName.ToString().Trim().TrimStart('\\');
+            if (!string.Equals(actual, Environment.MachineName, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new UnauthorizedAccessException("Remote named-pipe clients are not permitted");
+            }
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetNamedPipeClientProcessId(
+            SafePipeHandle pipe,
+            out uint clientProcessId);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetNamedPipeClientComputerName(
+            SafePipeHandle pipe,
+            StringBuilder clientComputerName,
+            uint clientComputerNameLength);
 
         /// <summary>
         /// Escapes a string for safe inclusion in a JSON string value.

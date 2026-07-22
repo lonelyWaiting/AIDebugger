@@ -8,7 +8,7 @@ plugins {
 }
 
 // ---------------------------------------------------------------------------
-// Git-based version: tagged commit → tag version, else → 1.1.<commit count>
+// Git-based version: exact vX.Y.Z tag -> X.Y.Z; otherwise X.Y.Z.<distance>.
 // Falls back to gradle.properties pluginVersion when git is unavailable.
 // ---------------------------------------------------------------------------
 fun gitVersion(): String {
@@ -18,13 +18,12 @@ fun gitVersion(): String {
         if (p.waitFor(5, TimeUnit.SECONDS) && p.exitValue() == 0) out else null
     } catch (_: Exception) { null }
 
-    // Exact tag on HEAD? (e.g. v1.2.3)
-    exec("git", "describe", "--exact-match", "--tags", "HEAD")?.let { tag ->
-        Regex("^v?(\\d+\\.\\d+\\.\\d+)").find(tag)?.groupValues?.get(1)?.let { return it }
-    }
-    // Commit count
-    exec("git", "rev-list", "--count", "HEAD")?.let { count ->
-        if (count.all { it.isDigit() }) return "1.1.$count"
+    exec("git", "describe", "--tags", "--long", "--match", "v[0-9]*.[0-9]*.[0-9]*", "HEAD")?.let { description ->
+        Regex("^v?(\\d+)\\.(\\d+)\\.(\\d+)-(\\d+)-g[0-9a-f]+$").matchEntire(description)?.let { match ->
+            val baseVersion = match.groupValues.subList(1, 4).joinToString(".")
+            val distance = match.groupValues[4].toInt()
+            return if (distance == 0) baseVersion else "$baseVersion.$distance"
+        }
     }
     // Fallback
     return providers.gradleProperty("pluginVersion").get()

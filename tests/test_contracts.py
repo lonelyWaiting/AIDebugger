@@ -42,6 +42,18 @@ def find_msbuild() -> pathlib.Path | None:
 def read(path: str) -> str:
     if path == "mcp_server/server.py":
         return "\n".join((ROOT / source_path).read_text(encoding="utf-8") for source_path in MCP_SERVER_SOURCE_FILES)
+    if path == "VSDebuggerMCP/DebuggerService.cs":
+        sources = [ROOT / path]
+        sources.extend(sorted((ROOT / "VSDebuggerMCP" / "Services").glob("DebuggerService.*.cs")))
+        return "\n".join(source.read_text(encoding="utf-8") for source in sources)
+    if path == "VSDebuggerMCP/NamedPipeServer.cs":
+        sources = [ROOT / path]
+        sources.extend(sorted((ROOT / "VSDebuggerMCP" / "Ipc").glob("NamedPipe*.cs")))
+        return "\n".join(source.read_text(encoding="utf-8") for source in sources)
+    if path == "VSDebuggerMCP/McpClientRegistration.cs":
+        sources = [ROOT / path]
+        sources.extend(sorted((ROOT / "VSDebuggerMCP" / "Registration").glob("McpClientRegistration.*.cs")))
+        return "\n".join(source.read_text(encoding="utf-8") for source in sources)
     return (ROOT / path).read_text(encoding="utf-8")
 
 
@@ -91,7 +103,7 @@ def registered_tool_module_names() -> list[str]:
         for alias in node.names:
             if alias.name != "*":
                 registered_modules.append(alias.name)
-    return registered_modules
+    return sorted(set(registered_modules))
 
 
 def discover_mcp_tool_names() -> list[str]:
@@ -106,8 +118,10 @@ def discover_mcp_tool_names() -> list[str]:
             for decorator in node.decorator_list:
                 if not (
                     isinstance(decorator, ast.Call)
-                    and isinstance(decorator.func, ast.Attribute)
-                    and decorator.func.attr == "tool"
+                    and (
+                        (isinstance(decorator.func, ast.Attribute) and decorator.func.attr == "tool")
+                        or (isinstance(decorator.func, ast.Name) and decorator.func.id == "_combined_only_tool")
+                    )
                 ):
                     continue
                 tool_name = node.name
@@ -134,7 +148,7 @@ def expected_packaged_mcp_files() -> list[str]:
         relative_parts = path.relative_to(mcp_root).parts
         if "vendor" in relative_parts or "__pycache__" in relative_parts:
             continue
-        if path.suffix == ".py" or path.name == "requirements.txt":
+        if path.suffix == ".py" or path.name in {"requirements.txt", "debug_method_manifest.json"}:
             files.append(path.relative_to(mcp_root).as_posix())
     return sorted(files)
 
@@ -161,6 +175,36 @@ def vsix_content_items() -> dict[str, dict[str, str]]:
 
 
 class ContractTests(unittest.TestCase):
+    def test_vs_entrypoint_has_an_independent_vs_only_runtime_surface(self) -> None:
+        script = """
+import asyncio, json, sys
+sys.path.insert(0, 'mcp_server')
+import vs_server, tool_runtime
+tools = asyncio.run(vs_server.mcp.list_tools())
+print(json.dumps({
+    'backend': tool_runtime.backend.__name__,
+    'tools': sorted(tool.name for tool in tools),
+    'ideBridgeLoaded': 'ide_bridge' in sys.modules or 'mcp_server.ide_bridge' in sys.modules,
+    'riderBridgeLoaded': 'rider_bridge' in sys.modules or 'mcp_server.rider_bridge' in sys.modules,
+}))
+"""
+        environment = dict(os.environ)
+        environment.update({"AIDB_SERVER_SCOPE": "vs", "AIDB_PREFERRED_IDE": "vs"})
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertEqual("vs_session", payload["backend"])
+        self.assertFalse(payload["ideBridgeLoaded"])
+        self.assertFalse(payload["riderBridgeLoaded"])
+        self.assertFalse({"list_ide_instances", "select_ide_instance", "clear_ide_selection"} & set(payload["tools"]))
+
     def test_memory_contract_fields_present(self) -> None:
         vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
         rider_models = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/protocol/DebugModels.kt")
@@ -257,7 +301,7 @@ class ContractTests(unittest.TestCase):
             self.assertIn("PeekNamedPipe", bridge_code)
             self.assertIn("_compute_timeouts", bridge_code)
             self.assertIn("ThreadPoolExecutor", bridge_code)
-            self.assertIn("run_in_executor(self._executor", bridge_code)
+            self.assertIn("run_in_executor", bridge_code)
             self.assertIn("FILE_FLAG_OVERLAPPED", bridge_code)
             self.assertIn("CancelIoEx", bridge_code)
             self.assertIn("GetOverlappedResult", bridge_code)
@@ -276,7 +320,7 @@ class ContractTests(unittest.TestCase):
         self.assertIn("capture_debug_bundle", vs_registration)
         self.assertIn("evaluate_expressions_batch", vs_registration)
         self.assertIn("stopReason", vs_registration)
-        self.assertIn("cursor_allowlist_sync.py", vs_registration)
+        self.assertNotIn("cursor_allowlist_sync.py", vs_registration)
         self.assertIn("continue_and_wait_for_break", vs_registration)
 
     def test_vs_registration_refreshes_seeded_bundle_and_pins_python_versions(self) -> None:
@@ -285,12 +329,17 @@ class ContractTests(unittest.TestCase):
         self.assertIn("TryEnsureBundledServerFiles", vs_registration)
         self.assertIn("ComputeDirectorySignature", vs_registration)
         self.assertIn('manifest.json', vs_registration)
-        self.assertIn('PrefixArgs = new[] { $"-3.{minor}" }', vs_registration)
+        self.assertIn('RegistryKey.OpenBaseKey(hive, view)', vs_registration)
+        self.assertIn('Path.IsPathRooted(command)', vs_registration)
+        self.assertNotIn('Command = "py"', vs_registration)
+        self.assertNotIn('Command = "python"', vs_registration)
+        self.assertNotIn('Command = "python3"', vs_registration)
 
     def test_named_pipe_strict_mode_toggle_present(self) -> None:
         vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
         rider_pipe = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/NamedPipeServer.kt")
-        self.assertIn("AIDB_PIPE_SECURITY", vs_pipe)
+        self.assertNotIn("WorldSid", vs_pipe)
+        self.assertNotIn("AIDB_PIPE_SECURITY", vs_pipe)
         self.assertIn("AIDB_PIPE_SECURITY", rider_pipe)
         self.assertIn("WaitForConnectionAsync", vs_pipe)
         self.assertIn("cancellationToken.Register", vs_pipe)
@@ -324,7 +373,7 @@ class ContractTests(unittest.TestCase):
             "detach_debugger",
             "get_call_stack",
             "list_threads",
-            "select_stack_frame",
+            "switch_stack_frame",
             "select_thread",
             "clear_breakpoint",
             "set_data_breakpoint",
@@ -359,10 +408,13 @@ class ContractTests(unittest.TestCase):
         ):
             self.assertIn(keyword, server_py)
 
-        for registration in (vs_registration, rider_registration):
-            self.assertIn("stop debugging", registration)
-            self.assertIn("stop_debugging", registration)
-            self.assertIn('debug_control(action=', registration)
+        self.assertIn("stop debugging", vs_registration)
+        self.assertIn("debug_stop", vs_registration)
+        self.assertNotIn("stop_debugging", vs_registration)
+        self.assertIn('debug_control(action=', vs_registration)
+        self.assertIn("stop debugging", rider_registration)
+        self.assertIn("stop_debugging", rider_registration)
+        self.assertIn('debug_control(action=', rider_registration)
 
     def test_vs_active_debugging_protocol_is_routed(self) -> None:
         vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
@@ -400,6 +452,7 @@ class ContractTests(unittest.TestCase):
 
     def test_no_source_native_tools_are_exposed_without_patch_surface(self) -> None:
         server_py = read("mcp_server/server.py")
+        capability_tools = read("mcp_server/tool_modules/capability_tools.py")
 
         for tool_name in (
             "resolve_address",
@@ -410,12 +463,11 @@ class ContractTests(unittest.TestCase):
         ):
             self.assertIn(f"async def {tool_name}", server_py)
 
-        debug_capabilities = function_source(server_py, "debug_capabilities")
-        self.assertIn("noSourceNative", debug_capabilities)
-        self.assertIn("module+RVA", debug_capabilities)
-        self.assertIn("No write-memory or patching tool is exposed", debug_capabilities)
-        self.assertIn("Visual Studio only", debug_capabilities)
-        self.assertIn("Rider support is explicitly missing", debug_capabilities)
+        self.assertIn('"noSourceNative"', capability_tools)
+        self.assertIn("module+RVA", capability_tools)
+        self.assertIn("No write-memory or patching tool is exposed", capability_tools)
+        self.assertIn("Visual Studio only", capability_tools)
+        self.assertIn("Rider support is explicitly missing", capability_tools)
         self.assertIn("NATIVE_CONTEXT_TIMEOUT_SECONDS = 45.0", server_py)
         self.assertIn("timeout=float(timeout_seconds + NATIVE_CONTEXT_TIMEOUT_SECONDS)", function_source(server_py, "continue_and_capture_native"))
         for tool_name in (
@@ -505,7 +557,8 @@ class ContractTests(unittest.TestCase):
         self.assertNotIn(".Where(m => m.Base != 0 && address >= m.Base)", vs_service)
         self.assertIn("FindSectionForRva", vs_service)
         self.assertIn("NearestSymbol", vs_service)
-        self.assertIn("SizeBytes = GetModuleSizeFromBase", vs_service)
+        self.assertIn("moduleInformation.SizeOfImage", vs_service)
+        self.assertIn("GetModulesFromProcessHandle", vs_service)
         self.assertIn("existing.SizeBytes == 0 && moduleInfo.SizeBytes != 0", vs_service)
         self.assertIn("FormatRva(result.RvaValue - sectionRva)", vs_service)
         self.assertIn("FunctionStatus", vs_models)
@@ -526,6 +579,268 @@ class ContractTests(unittest.TestCase):
         self.assertNotIn("function boundary is heuristic", vs_service)
         self.assertNotIn("prologue", vs_service.lower())
         self.assertNotIn("heuristic", vs_service.lower())
+
+    def test_address_breakpoints_are_strict_and_unsafe_capability_gated(self) -> None:
+        vs_native = read("VSDebuggerMCP/Services/DebuggerService.Native.cs")
+        py_tools = read("mcp_server/tool_modules/breakpoint_tools.py")
+        method_manifest = json.loads(read("mcp_server/debug_method_manifest.json"))["methods"]
+
+        self.assertIn("Address breakpoints accept only an absolute address or module+RVA", vs_native)
+        self.assertIn('validate_address_breakpoint_target("address", address)', py_tools)
+        self.assertEqual(
+            ["debug.breakpoint.write"],
+            method_manifest["set_address_breakpoint"]["capabilities"],
+        )
+        self.assertEqual(
+            [{
+                "capability": "debug.evaluate.unsafe",
+                "parameter": "condition",
+                "presentNonBlank": True,
+            }],
+            method_manifest["set_address_breakpoint"]["conditionalCapabilities"],
+        )
+
+    def test_debug_waiters_do_not_cross_session_generations(self) -> None:
+        tracker = read("VSDebuggerMCP/DebugSessionTracker.cs")
+        execution = read("VSDebuggerMCP/Services/DebuggerService.Execution.cs")
+        native = read("VSDebuggerMCP/Services/DebuggerService.Native.cs")
+
+        generation_branch = tracker[
+            tracker.index("if (current.Generation != afterGeneration)"):
+            tracker.index("if (current.BreakSequence > afterBreakSequence")
+        ]
+        self.assertIn("return current;", generation_branch)
+        self.assertNotIn("afterGeneration = current.Generation", tracker)
+        self.assertIn('result.ErrorCode = "STALE_DEBUG_SESSION"', execution)
+        self.assertIn('result.ErrorCode = "STALE_DEBUG_SESSION"', native)
+
+    def test_context_invalidation_preserves_raw_stop_event(self) -> None:
+        tracker = read("VSDebuggerMCP/DebugSessionTracker.cs")
+        invalidate = tracker[
+            tracker.index("public void InvalidateContext"):
+            tracker.index("public StopEventSnapshot GetStopEventSnapshot")
+        ]
+        self.assertIn("Interlocked.Increment(ref _contextEpoch)", invalidate)
+        self.assertNotIn("_stopReasonRaw =", invalidate)
+
+    def test_add_watch_preserves_at_most_once_command_outcome(self) -> None:
+        service = read("VSDebuggerMCP/Services/DebuggerService.SecondaryInspection.cs")
+        models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+        policy = read("VSDebuggerMCP/Ipc/OperationResultPolicy.cs")
+        output_models = read("mcp_server/output_models.py")
+
+        self.assertIn("public class WatchResult : IOperationResult", models)
+        self.assertIn("result.CommandIssued = true", service)
+        self.assertIn("result.EvaluationIssued = true", service)
+        self.assertIn("MarkUnsafeEvaluationIssued()", service)
+        self.assertIn("watch.CommandIssued || watch.EvaluationIssued", policy)
+        for field in ("success", "message", "commandIssued", "evaluationIssued", "evaluationStatus", "outcome"):
+            self.assertIn(f'Name = "{field}"', models)
+            self.assertIn(field, output_models)
+
+    def test_ui_thread_and_frame_changes_advance_context_epoch(self) -> None:
+        service = read("VSDebuggerMCP/DebuggerService.cs")
+        inspection = read("VSDebuggerMCP/Services/DebuggerService.Inspection.cs")
+        tracker = read("VSDebuggerMCP/DebugSessionTracker.cs")
+
+        validate = service[
+            service.index("private void ValidateExpectedDebuggerIdentity"):
+            service.index("private static void RethrowRequestControlFlow")
+        ]
+        self.assertIn("ObserveDebugContext(Debugger)", validate)
+        self.assertIn("debugger?.CurrentThread?.ID", inspection)
+        self.assertIn("Marshal.GetIUnknownForObject(frame)", inspection)
+        self.assertIn("ObserveDebuggerContext", tracker)
+        self.assertIn("Interlocked.Increment(ref _contextEpoch)", tracker)
+
+    def test_callstack_reports_incomplete_frame_capture(self) -> None:
+        inspection = read("VSDebuggerMCP/Services/DebuggerService.Inspection.cs")
+        models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+        output_models = read("mcp_server/output_models.py")
+
+        self.assertIn("ExpectedFrameCount = header.FrameCount", inspection)
+        self.assertIn("result.CapturedFrameCount = result.Frames.Count", inspection)
+        self.assertIn("result.SnapshotStatus = result.Partial", inspection)
+        for field in ("expectedFrameCount", "capturedFrameCount", "partial", "error"):
+            self.assertIn(f'Name = "{field}"', models)
+            self.assertIn(field, output_models)
+
+    def test_disassembly_does_not_guess_preceding_instruction_boundaries(self) -> None:
+        service = read("VSDebuggerMCP/Services/DebuggerService.Disassembly.cs")
+        models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+        output_models = read("mcp_server/output_models.py")
+
+        self.assertNotIn("requireCurrentAlignment", service)
+        self.assertNotIn("maximumStartOffset", service)
+        self.assertIn("header.InstructionPointer,", service)
+        self.assertIn("CurrentAddress = currentAddress", service)
+        self.assertIn("StartAddress = address", service)
+        self.assertIn("unavailable_without_trusted_instruction_boundary", service)
+        for field in ("startAddress", "precedingInstructionsStatus"):
+            self.assertIn(f'Name = "{field}"', models)
+            self.assertIn(field, output_models)
+
+    def test_os_memory_and_modules_require_trusted_live_process_identity(self) -> None:
+        service = read("VSDebuggerMCP/DebuggerService.cs")
+        execution = read("VSDebuggerMCP/Services/DebuggerService.Execution.cs")
+        memory = read("VSDebuggerMCP/Services/DebuggerService.EvaluationMemory.cs")
+        inspection = read("VSDebuggerMCP/Services/DebuggerService.Inspection.cs")
+        disassembly = read("VSDebuggerMCP/Services/DebuggerService.Disassembly.cs")
+
+        self.assertIn("OpenTrustedLiveProcessHandle", service)
+        self.assertIn("trustedGeneration != _sessionTracker.Generation", service)
+        self.assertIn("actualStartTime != trustedStartTime", service)
+        self.assertIn("RecordTrustedLiveProcessIdentity", execution)
+        self.assertIn("RefreshTrustedLiveProcessIdentity", service)
+        self.assertNotIn("CurrentDebuggeeHasLocalProcessIdentity", service)
+        self.assertIn("Never enumerate Debugger.LocalProcesses here", service)
+        self.assertIn("_pendingTrustedLiveProcessStartTimeUtcTicks", service)
+        self.assertIn("debugger_expression_fallback_untrusted_session", memory)
+        self.assertIn("OpenTrustedLiveProcessHandle", memory)
+        self.assertIn("OpenTrustedLiveProcessHandle", inspection)
+        self.assertNotIn("ValidateMemoryWithExpression", disassembly + memory)
+
+    def test_managed_inspection_drains_and_reports_output_overflow(self) -> None:
+        service = read("VSDebuggerMCP/Services/ManagedInspectionService.cs")
+
+        self.assertIn("stdoutOverflow.Task.IsCompleted", service)
+        self.assertIn("await Task.WhenAll(stdoutTask, stderrTask)", service)
+        self.assertIn("throw CreateOverflowException", service)
+        self.assertIn("return new ResourceLimitExceededException", service)
+        self.assertIn("overflow.TrySetResult(true)", service)
+        self.assertIn("if (exceeded)", service)
+
+    def test_output_search_has_cancellation_and_total_budget(self) -> None:
+        service = read("VSDebuggerMCP/Services/OutputWindowService.cs")
+        capture = read("VSDebuggerMCP/Services/DebuggerService.SecondaryInspection.cs")
+
+        self.assertIn("SearchBudgetMs = 2000", service)
+        self.assertIn("DebuggerRequestContext.ThrowIfCancellationOrDeadlineExceeded", service)
+        self.assertIn("stopwatch.ElapsedMilliseconds >= SearchBudgetMs", service)
+        self.assertIn("TimeSpan.FromMilliseconds(100)", service)
+        self.assertIn('snapshot.SnapshotStatus = stable ? "best_effort" : "unstable"', capture)
+        self.assertNotIn('snapshot.SnapshotStatus = stable ? "stable" : "unstable"', capture)
+
+    def test_named_pipe_connection_is_single_request_with_short_initial_frame_timeout(self) -> None:
+        server = read("VSDebuggerMCP/NamedPipeServer.cs")
+        handler = server
+        self.assertIn("InitialFrameIoTimeoutMs = 2000", server)
+        self.assertIn("frameReadCts.CancelAfter(InitialFrameIoTimeoutMs)", handler)
+        self.assertNotIn("while (pipeServer.IsConnected", handler)
+        self.assertIn("DataPipeInstances = 8", server)
+        self.assertIn("InterruptPipeInstances = 4", server)
+        self.assertIn("RecoveryPipeInstances = 2", server)
+        self.assertIn("StartListenerPool(_recoveryPipeName, true, true", server)
+
+    def test_locals_and_exception_capture_report_incomplete_data(self) -> None:
+        inspection = read("VSDebuggerMCP/Services/DebuggerService.Inspection.cs")
+        variables = read("VSDebuggerMCP/Services/DebuggerService.VariableSlices.cs")
+        evaluation = read("VSDebuggerMCP/Services/DebuggerService.EvaluationMemory.cs")
+        models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+        output_models = read("mcp_server/output_models.py")
+
+        self.assertIn("budget.ReportCaptureError", variables)
+        self.assertIn("Variable child metadata is unavailable", variables)
+        self.assertIn("Variable children are incomplete", variables)
+        self.assertIn("budget.IsIncomplete", inspection + evaluation + variables)
+        self.assertIn("Inner exception chain was truncated", inspection)
+        self.assertIn("result.HasMoreInnerExceptions = true", inspection)
+        self.assertIn("expression could not be evaluated", inspection)
+        self.assertIn("The debugger could not evaluate $exception", inspection)
+        for field in ("capturedDepth", "maxDepth", "hasMoreInnerExceptions"):
+            self.assertIn(f'Name = "{field}"', models)
+            self.assertIn(field, output_models)
+
+    def test_expression_hex_formatting_does_not_evaluate_twice(self) -> None:
+        variables = read("VSDebuggerMCP/Services/DebuggerService.VariableSlices.cs")
+        self.assertIn("TryFormatCapturedNumericValueAsHex(result.Value", variables)
+        self.assertNotIn('GetExpression(\n                $"(void*){expression}"', variables)
+        self.assertNotIn("CaptureEvaluationHexValue", variables)
+
+    def test_full_context_exposes_cross_component_snapshot_truth(self) -> None:
+        context = read("VSDebuggerMCP/Services/DebuggerService.Context.cs")
+        models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+        output_models = read("mcp_server/output_models.py")
+
+        self.assertIn("CaptureFullContextBoundary", context)
+        self.assertIn("unsafeEvaluationAttempted", context)
+        self.assertIn('fullContextResult.SnapshotStatus = !boundaryStable', context)
+        self.assertIn("!result.Modules.SnapshotStable", context)
+        for field in (
+            "snapshotStable", "snapshotStatus", "startDebugSessionGeneration",
+            "startBreakSequence", "startContextEpoch", "endDebugSessionGeneration",
+            "endBreakSequence", "endContextEpoch",
+        ):
+            self.assertIn(f'Name = "{field}"', models)
+            self.assertIn(field, output_models)
+
+    def test_vs_bundle_deployment_is_content_and_version_addressed(self) -> None:
+        registration = read("VSDebuggerMCP/McpClientRegistration.cs")
+        installer = read("VSDebuggerMCP/Install-VSIX.ps1")
+
+        self.assertIn("bundleIdentity", registration)
+        self.assertIn("Assembly.GetName().Version", registration)
+        self.assertIn("expectedSignature.Substring(0, 16)", registration)
+        self.assertIn('Path.Combine(bundleRoot, bundleIdentity)', registration)
+        self.assertIn('Path.Combine(stagingDir, ".bundle-version")', registration)
+        self.assertIn("versionedPayloadRoot", installer)
+        self.assertIn("bundleIdentity", installer)
+        self.assertIn(".active-bundle", registration)
+        self.assertIn(".active-bundle", installer)
+        self.assertIn("StableServerEntryFileName", registration)
+        self.assertIn("vs_launcher.py", read("VSDebuggerMCP/VSDebuggerMCP.csproj"))
+        activation = installer[installer.index("function Activate-McpServerDeployment"):]
+        activation = activation[:activation.index("function Remove-PreparedDeployments")]
+        self.assertLess(
+            activation.index("Ensure-PlainDirectoryTree -path $bundleRoot"),
+            activation.index("Move-Item -LiteralPath $stagingRoot -Destination $userMcpRoot"),
+        )
+        self.assertIn("[System.IO.FileAttributes]::ReparsePoint", installer)
+        self.assertIn("Assert-PlainOwnedTree -path $stagingRoot", activation)
+        self.assertIn("Refusing to create an MCP bundle root outside", activation)
+
+    def test_vs_instance_access_mode_is_discoverable(self) -> None:
+        models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+        router = read("VSDebuggerMCP/Ipc/NamedPipeMethodRouter.cs")
+        vs_bridge_py = read("mcp_server/vs_bridge.py")
+        ide_bridge_py = read("mcp_server/ide_bridge.py")
+        capability_module = read("mcp_server/tool_modules/capability_tools.py")
+        capabilities = function_source(read("mcp_server/server.py"), "debug_capabilities")
+
+        for marker in ("allowedCapabilities", "accessMode"):
+            self.assertIn(marker, models)
+            self.assertIn(marker, vs_bridge_py)
+            self.assertIn(marker, ide_bridge_py)
+        self.assertIn("_allowedCapabilities.SetEquals", router)
+        self.assertIn("instanceAccess", capabilities)
+        self.assertIn("effectiveInstance", capabilities)
+        self.assertIn("staleSelectedTarget", capabilities)
+        self.assertIn("has_pinned_selection", capabilities)
+        self.assertIn("static_tool_index", capabilities)
+        self.assertIn("_recommended_workflow_for_access", capabilities)
+        self.assertIn("do not assume any debugger capability", capability_module)
+        self.assertIn("use only actions whose required capabilities", capability_module)
+        self.assertIn('access_mode == "full_access"', capability_module)
+
+    def test_debug_bundle_default_does_not_claim_exception_capture(self) -> None:
+        snapshot_tools = read("mcp_server/tool_modules/snapshot_tools.py")
+        capability_tools = read("mcp_server/tool_modules/capability_tools.py")
+        registration = read("VSDebuggerMCP/McpClientRegistration.cs")
+
+        self.assertIn("默认低阻塞：只抓 status/callstack/threads", snapshot_tools)
+        self.assertNotIn("默认 status/callstack/exception/threads", registration)
+        self.assertIn("include_exception=true", registration)
+        self.assertNotIn("status/callstack/exception/threads", capability_tools)
+        self.assertIn("Exception requires include_exception=True", capability_tools)
+
+    def test_vs_python_probe_pins_a_supported_x64_windows_executable(self) -> None:
+        registration = read("VSDebuggerMCP/McpClientRegistration.cs")
+        self.assertIn("struct.calcsize('P')*8", registration)
+        self.assertIn("sysconfig.get_platform()", registration)
+        self.assertIn('string.Equals(platform, "win_amd64"', registration)
+        self.assertIn("Command = Path.GetFullPath(executable)", registration)
+        self.assertIn('argsBuilder.Append("-I -S -c ")', registration)
+        self.assertIn('PrefixArgs = new[] { "-I", "-S" }', registration)
 
     def test_vs_module_layout_parser_covers_pe_boundaries_and_truncation(self) -> None:
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
@@ -553,20 +868,24 @@ class ContractTests(unittest.TestCase):
     def test_vs_native_context_is_snapshot_oriented_and_read_only(self) -> None:
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
         server_py = read("mcp_server/server.py")
+        capability_tools = read("mcp_server/tool_modules/capability_tools.py")
 
-        native_context = csharp_slice(vs_service, "private NativeContextResult BuildNativeContextResult", "        private NativeAddressInfo ResolveAddressInternal")
-        self.assertIn('string ipRegister = is64Bit ? "@rip" : "@eip"', native_context)
-        self.assertIn('string spRegister = is64Bit ? "@rsp" : "@esp"', native_context)
-        self.assertIn("ResolveAddressInternal(debugger, ipRegister)", native_context)
-        self.assertIn("BuildRegistersResult(debugger)", native_context)
-        self.assertIn("BuildCallStackResult(debugger)", native_context)
-        self.assertIn("ExecuteDisassemblyAt(debugger, ipExpression, disassemblyCount", native_context)
-        self.assertIn("ReadMemoryInternal(debugger, spExpression, stackBytes)", native_context)
-        self.assertIn("BuildModulesResult(debugger)", native_context)
+        native_context = csharp_slice(vs_service, "public NativeContextResult CaptureNativeContext", "        public NativeContinueResult ContinueAndCaptureNative")
+        self.assertIn('string instructionPointer = is64Bit.Value ? "@rip" : "@eip"', native_context)
+        self.assertIn('string stackPointer = is64Bit.Value ? "@rsp" : "@esp"', native_context)
+        self.assertIn('result.ArchitectureStatus = unknown ? "unknown" : "unsupported"', native_context)
+        self.assertIn('"ARCHITECTURE_NOT_SUPPORTED"', native_context)
+        self.assertIn("ResolveAddressWithModules(instructionPointer, addressModules)", native_context)
+        self.assertIn('RetainNativeComponent(result, budget, "registers", GetRegisters())', native_context)
+        self.assertIn('RetainNativeComponent(result, budget, "callstack", GetCallStack())', native_context)
+        self.assertIn("GetDisassemblyAt(address", native_context)
+        self.assertIn("ReadMemory(address", native_context)
+        self.assertIn('RetainNativeComponent(result, budget, "modules", addressModules)', native_context)
 
-        continue_native = csharp_slice(vs_service, "public NativeContinueResult ContinueAndCaptureNative", "        private NativeContextResult BuildNativeContextResult")
+        continue_native = csharp_slice(vs_service, "public NativeContinueResult ContinueAndCaptureNative", "        public ManagedAssemblyResult InspectManagedAssembly")
         self.assertIn("Math.Max(50, Math.Min(pollIntervalMs, 1000))", continue_native)
-        self.assertIn("System.Threading.Thread.Sleep(normalizedPollIntervalMs)", continue_native)
+        self.assertIn("WaitForBreakOrDesign", continue_native)
+        self.assertNotIn("Thread.Sleep", continue_native)
         self.assertIn("CaptureNativeContext(disassemblyCount, stackBytes, includeModules)", continue_native)
         self.assertIn("Timed out waiting for debugger to enter break mode", continue_native)
 
@@ -575,6 +894,7 @@ class ContractTests(unittest.TestCase):
 
     def test_no_source_managed_and_hybrid_tools_are_exposed(self) -> None:
         server_py = read("mcp_server/server.py")
+        capability_tools = read("mcp_server/tool_modules/capability_tools.py")
         vs_registration = read("VSDebuggerMCP/McpClientRegistration.cs")
 
         for tool_name in (
@@ -587,11 +907,10 @@ class ContractTests(unittest.TestCase):
         ):
             self.assertIn(f"async def {tool_name}", server_py)
 
-        debug_capabilities = function_source(server_py, "debug_capabilities")
-        self.assertIn("noSourceManaged", debug_capabilities)
-        self.assertIn("noSourceHybrid", debug_capabilities)
-        self.assertIn("without source or UI automation", debug_capabilities)
-        self.assertIn("Breakpoint-oriented dynamic loop", debug_capabilities)
+        self.assertIn('"noSourceManaged"', capability_tools)
+        self.assertIn('"noSourceHybrid"', capability_tools)
+        self.assertIn("without source or UI automation", capability_tools)
+        self.assertIn("Breakpoint-oriented dynamic loop", capability_tools)
         self.assertIn("MANAGED_INSPECTION_TIMEOUT_SECONDS = 75.0", server_py)
         self.assertIn("HYBRID_CONTEXT_TIMEOUT_SECONDS = 135.0", server_py)
         self.assertIn("tool_timeout_for_budget(timeout_seconds, HYBRID_CONTEXT_TIMEOUT_SECONDS, thread_budget_ms)", function_source(server_py, "capture_hybrid_context"))
@@ -695,6 +1014,9 @@ class ContractTests(unittest.TestCase):
         vs_project = read("VSDebuggerMCP/VSDebuggerMCP.csproj")
         helper_project = read("VSDebuggerMCP/ManagedInspectionHelper/ManagedInspectionHelper.csproj")
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+        native_service = read("VSDebuggerMCP/Services/DebuggerService.Native.cs")
+        managed_service = read("VSDebuggerMCP/Services/ManagedInspectionService.cs")
+        managed_process = read("VSDebuggerMCP/Services/ManagedInspectionProcess.cs")
 
         self.assertIn("<OutputType>Exe</OutputType>", helper_project)
         self.assertIn("<TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion>", helper_project)
@@ -706,56 +1028,52 @@ class ContractTests(unittest.TestCase):
         self.assertIn("ManagedInspectionHelper\\bin\\$(Configuration)\\ManagedInspectionHelper.exe", vs_project)
         self.assertIn("<IncludeInVSIX>true</IncludeInVSIX>", vs_project)
 
-        managed_entrypoints = csharp_slice(vs_service, "public ManagedAssemblyResult InspectManagedAssembly", "        public HybridContextResult CaptureHybridContext")
-        self.assertIn("RunManagedInspectionHelper<ManagedAssemblyResult>", managed_entrypoints)
-        self.assertIn("RunManagedInspectionHelper<ManagedTypeResult>", managed_entrypoints)
-        self.assertIn("RunManagedInspectionHelper<ManagedMethodIlResult>", managed_entrypoints)
-        self.assertIn("external_process_managed_metadata_and_il_read_only", managed_entrypoints)
-        self.assertIn("FileNotFoundException(\"ManagedInspectionHelper.exe was not found", vs_service)
-        self.assertNotIn("Assembly.LoadFrom", vs_service)
-        self.assertNotIn("ReflectionTypeLoadException", vs_service)
-        self.assertNotIn("AssemblyResolve", vs_service)
-        self.assertNotIn("DecodeIlInstructions", vs_service)
-        self.assertNotIn("OperandType.", vs_service)
-        self.assertNotIn("BuildOpCodeMap", vs_service)
+        managed_entrypoints = csharp_slice(native_service, "public ManagedAssemblyResult InspectManagedAssembly", "        public HybridContextResult CaptureHybridContext")
+        self.assertIn("_managedInspectionService.InspectAssembly", managed_entrypoints)
+        self.assertIn("_managedInspectionService.InspectType", managed_entrypoints)
+        self.assertIn("_managedInspectionService.InspectMethodIl", managed_entrypoints)
+        self.assertIn("appcontainer_managed_metadata_and_il_read_only", managed_service)
+        self.assertIn("ManagedInspectionProcess.Start", managed_service)
+        self.assertIn("ProcThreadAttributeSecurityCapabilities", managed_process)
+        self.assertIn("ProcThreadAttributeHandleList", managed_process)
+        self.assertIn('"ManagedInspectionHelper.exe",', managed_process)
+        self.assertIn('"Mono.Cecil.dll"', managed_process)
+        self.assertNotIn('"*.dll"', managed_process)
+        self.assertNotIn('"*.exe"', managed_process)
+        self.assertIn("EnsurePlainSourceFile", managed_process)
+        self.assertIn("ComputeSha256", managed_process)
+        self.assertIn("staging checksum mismatch", managed_process)
+        self.assertIn("unexpected payload", managed_process)
+        self.assertIn("FileNotFoundException(\"ManagedInspectionHelper.exe was not found", managed_service)
+        combined = vs_service + native_service + managed_service + managed_process
+        self.assertNotIn("Assembly.LoadFrom", combined)
+        self.assertNotIn("ReflectionTypeLoadException", combined)
+        self.assertNotIn("AssemblyResolve", combined)
+        self.assertNotIn("DecodeIlInstructions", combined)
+        self.assertNotIn("OperandType.", combined)
+        self.assertNotIn("BuildOpCodeMap", combined)
 
-    def test_managed_inspection_helper_covers_hard_operands_and_metadata_boundaries(self) -> None:
+    def test_managed_inspection_helper_parses_metadata_without_loading_target_code(self) -> None:
         helper = read("VSDebuggerMCP/ManagedInspectionHelper/Program.cs")
-        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
-        il_decoder = csharp_slice(helper, "private static List<ManagedIlInstructionInfo> DecodeIlInstructions", "        private static OpCode[] BuildOpCodeMap")
+        helper_project = read("VSDebuggerMCP/ManagedInspectionHelper/ManagedInspectionHelper.csproj")
+        managed_service = read("VSDebuggerMCP/Services/ManagedInspectionService.cs")
+        managed_process = read("VSDebuggerMCP/Services/ManagedInspectionProcess.cs")
 
         for marker in (
-            "OperandType.InlineSwitch",
-            "OperandType.ShortInlineBrTarget",
-            "OperandType.InlineBrTarget",
-            "OperandType.InlineMethod",
-            "OperandType.InlineField",
-            "OperandType.InlineString",
-            "OperandType.InlineType",
-            "OperandType.InlineTok",
-            "OperandType.InlineSig",
-            "ResolveIlToken",
-            "module.ResolveMember",
-            "module.ResolveString",
-            "module.ResolveType",
-            "module.ResolveField",
-            "GetSafeGenericArguments",
-            "RequireIlBytes",
-            "<truncated operand>",
-            "Unknown opcode",
+            "AssemblyDefinition.ReadAssembly",
+            "ReaderParameters",
+            "ReadWrite = false",
+            "ReadingMode = ReadingMode.Immediate",
+            "method.Body.Instructions",
+            "instruction.Operand is Instruction[]",
+            "instruction.Operand is IMetadataTokenProvider",
+            "FormatMetadataOperand",
             "FormatIlOffset",
         ):
-            self.assertIn(marker, il_decoder)
+            self.assertIn(marker, helper)
 
         for marker in (
-            "Assembly.LoadFrom(normalizedPath)",
-            "ReflectionTypeLoadException",
-            "AssemblyResolve",
-            "ResolveManagedDependency",
             "NormalizeProbeDirectories",
-            "method.GetMethodBody()",
-            "body.GetILAsByteArray()",
-            "LocalVariableInfo",
             "methodName, \".ctor\"",
             "methodName, \".cctor\"",
             "overloadIndex",
@@ -763,15 +1081,28 @@ class ContractTests(unittest.TestCase):
         ):
             self.assertIn(marker, helper)
 
-        for marker in (
-            "PublicAssemblies",
-            "PrivateAssemblies",
-            "CommonExtensions\", \"Microsoft\", \"Editor",
-            "SharedAssemblies",
+        for forbidden in (
+            "Assembly.LoadFrom",
+            "Assembly.LoadFile",
+            "Assembly.Load(",
+            "ReflectionOnlyLoadFrom",
+            "AppDomain.CurrentDomain.AssemblyResolve",
+            "GetMethodBody()",
         ):
-            self.assertIn(marker, vs_service)
+            self.assertNotIn(forbidden, helper)
+        self.assertIn('<PackageReference Include="Mono.Cecil" Version="0.11.6" />', helper_project)
 
-        self.assertNotIn("Assembly.LoadFrom", vs_service)
+        for marker in (
+            "CreateAppContainerProfile",
+            "ProcThreadAttributeSecurityCapabilities",
+            "ProcThreadAttributeHandleList",
+            "--assembly-handle",
+            "StageHelperInContainer",
+        ):
+            self.assertIn(marker, managed_process)
+
+        self.assertIn("ManagedInspectionProcess.Start", managed_service)
+        self.assertNotIn("Assembly.LoadFrom", managed_service + managed_process)
 
     def test_managed_inspection_edge_fixture_exercises_nontrivial_il(self) -> None:
         fixture_project = read("tests/fixtures/ManagedInspectionEdgeCases/ManagedInspectionEdgeCases.csproj")
@@ -817,17 +1148,31 @@ class ContractTests(unittest.TestCase):
         self.assertTrue(fixture_dll.exists())
 
         def invoke_helper(request: dict) -> dict:
-            completed = subprocess.run(
-                [str(helper_exe)],
-                cwd=ROOT,
-                input=json.dumps(request),
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                capture_output=True,
-            )
+            sentinel = ROOT / "tests/fixtures/ManagedInspectionEdgeCases/bin/Release/inspection-executed.txt"
+            sentinel.unlink(missing_ok=True)
+            invocation_environment = os.environ.copy()
+            invocation_environment["AIDB_MANAGED_INSPECTION_SENTINEL"] = str(sentinel)
+            import msvcrt
+            with fixture_dll.open("rb") as assembly_stream:
+                assembly_handle = msvcrt.get_osfhandle(assembly_stream.fileno())
+                os.set_handle_inheritable(assembly_handle, True)
+                try:
+                    completed = subprocess.run(
+                        [str(helper_exe), "--assembly-handle", str(assembly_handle)],
+                        cwd=ROOT,
+                        input=json.dumps(request),
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        capture_output=True,
+                        env=invocation_environment,
+                        close_fds=False,
+                    )
+                finally:
+                    os.set_handle_inheritable(assembly_handle, False)
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             self.assertTrue(completed.stdout.strip(), completed.stderr)
+            self.assertFalse(sentinel.exists(), "managed inspection executed target assembly module initialization")
             return json.loads(completed.stdout)
 
         def result_value(result: dict, name: str):
@@ -873,27 +1218,30 @@ class ContractTests(unittest.TestCase):
 
     def test_hybrid_breakpoint_capture_composes_no_source_dynamic_snapshot(self) -> None:
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+        native_service = read("VSDebuggerMCP/Services/DebuggerService.Native.cs")
+        breakpoint_service = read("VSDebuggerMCP/Services/DebuggerService.Breakpoints.cs")
         server_py = read("mcp_server/server.py")
 
-        hybrid = csharp_slice(vs_service, "public HybridContextResult CaptureHybridContext", "        public BreakpointsResult GetBreakpointBindings")
+        hybrid = csharp_slice(native_service, "public HybridContextResult CaptureHybridContext", "        public BreakpointsResult GetBreakpointBindings")
         for marker in (
-            "BuildDebugStatus(debugger)",
-            "SelectedStackFrameIndex = _selectedStackFrameIndex",
-            "BuildNativeContextResult(debugger",
-            "BuildThreadsResult(",
-            "DetermineThreadsSnapshotStatus",
-            "BuildBreakpointsResult(debugger)",
+            'RetainHybridComponent(result, budget, "status", GetDebugStatus())',
+            "SelectedStackFrameIndex = 0",
+            "CaptureNativeContext(",
+            "GetThreads(",
+            'RetainHybridComponent(\n                        result, budget, "breakpoints", GetBreakpoints())',
             "includeNative",
             "includeThreads",
             "includeBreakpoints",
         ):
             self.assertIn(marker, hybrid)
 
-        capture = csharp_slice(vs_service, "public BreakpointCaptureResult ContinueAndCaptureBreakpoint", "        private static string NormalizeAssemblyPath")
+        capture = csharp_slice(
+            native_service,
+            "public BreakpointCaptureResult ContinueAndCaptureBreakpoint",
+            "        private NativeAddressInfo ResolveAddressInternal")
         for marker in (
             "ContinueAndWaitForBreak(",
-            "includeException: true",
-            "allowSideEffects: false",
+            "includeException: false",
             "CaptureHybridContext(",
             "GetBreakpointBindings()",
             "waitResult.BreakDetected",
@@ -909,28 +1257,56 @@ class ContractTests(unittest.TestCase):
         ):
             self.assertIn(marker, capture)
 
-        self.assertIn("AddressBreakpointTagPrefix = \"AIDB_ADDR=\"", vs_service)
-        self.assertIn("TrySetAddressBreakpointTag(breakpoint, addressText)", vs_service)
-        self.assertIn("TryGetAddressBreakpointTag", vs_service)
-        self.assertIn("breakpointInfo.TrackedAddress = ResolveAddressInternal(debugger, taggedAddress)", vs_service)
-        self.assertIn("breakpointInfo.TrackedAddresses.Add(breakpointInfo.TrackedAddress)", vs_service)
-        self.assertIn("!breakpoint.Enabled", vs_service)
-        self.assertIn("!breakpoint.IsBound", vs_service)
-        self.assertIn("PopulateHitVerification(result)", vs_service)
-        self.assertIn("hit_exact_tracked_address", vs_service)
-        self.assertIn("hit_exact_source_location", vs_service)
-        self.assertIn("not_hit_timeout", vs_service)
-        self.assertIn("breakpoint_stop_unattributed", vs_service)
-        self.assertIn("stopped_not_verified_as_breakpoint", vs_service)
-        self.assertIn("FindCurrentSourceLocationBreakpointMatches", vs_service)
-        self.assertNotIn("LikelyHitBreakpoint", vs_service)
-        self.assertNotIn("exactMatches.Count == 0 && breakpoints.Count == 1", vs_service)
+        combined_service = vs_service + native_service + breakpoint_service
+        self.assertIn("AddressBreakpointTagPrefix = \"AIDB_ADDR=\"", combined_service)
+        self.assertIn("TrySetAddressBreakpointTag(breakpoint, addressText)", combined_service)
+        self.assertIn("TryGetAddressBreakpointTag", combined_service)
+        self.assertIn("TryParseAddressLiteral(taggedAddress", combined_service)
+        self.assertIn("TryParseModuleRvaExpression(taggedAddress", combined_service)
+        self.assertIn("Legacy address tag is not a literal or module+RVA and was not evaluated", combined_service)
+        self.assertIn("breakpointInfo.TrackedAddresses.Add(breakpointInfo.TrackedAddress)", combined_service)
+        self.assertIn("!breakpoint.Enabled", combined_service)
+        self.assertIn("!breakpoint.IsBound", combined_service)
+        self.assertIn("PopulateHitVerification(result)", combined_service)
+        self.assertIn("hit_exact_tracked_address", combined_service)
+        self.assertIn("hit_exact_source_location", combined_service)
+        self.assertIn("not_hit_timeout", combined_service)
+        self.assertIn("breakpoint_stop_unattributed", combined_service)
+        self.assertIn("stopped_not_verified_as_breakpoint", combined_service)
+        self.assertIn("FindCurrentSourceLocationBreakpointMatches", combined_service)
+        self.assertNotIn("LikelyHitBreakpoint", combined_service)
+        self.assertNotIn("exactMatches.Count == 0 && breakpoints.Count == 1", combined_service)
 
         breakpoint_tool = function_source(server_py, "continue_and_capture_breakpoint")
         self.assertIn("add_thread_capture_params", breakpoint_tool)
         self.assertIn('"includeNative": include_native', breakpoint_tool)
         self.assertIn('"includeBreakpoints": include_breakpoints', breakpoint_tool)
         self.assertIn("timeout=float(timeout_seconds + tool_timeout_for_budget(None, HYBRID_CONTEXT_TIMEOUT_SECONDS, thread_budget_ms))", breakpoint_tool)
+
+    def test_wait_timeout_rebases_context_before_status_capture(self) -> None:
+        execution_service = read("VSDebuggerMCP/Services/DebuggerService.Execution.cs")
+        native_service = read("VSDebuggerMCP/Services/DebuggerService.Native.cs")
+        continue_wait = csharp_slice(
+            execution_service,
+            "public ContinueAndWaitResult ContinueAndWaitForBreak",
+            "        public DebugControlResult StepInto",
+        )
+        native_wait = csharp_slice(
+            native_service,
+            "public NativeContinueResult ContinueAndCaptureNative",
+            "        public ManagedAssemblyResult InspectManagedAssembly",
+        )
+
+        self.assertIn(
+            "RebaseRequestToCurrentDebuggerIdentity();\n            result.Status = ExecuteLongWaitPhase(GetDebugStatus, phaseExecutor);\n            result.StopReason",
+            continue_wait,
+        )
+        self.assertIn(
+            "RebaseRequestToCurrentDebuggerIdentity();\n              result.Status = ExecuteLongWaitPhase(GetDebugStatus, phaseExecutor);\n            result.Success = false;\n            result.TimedOut = true",
+            native_wait,
+        )
+        for method in (continue_wait, native_wait):
+            self.assertIn("result.ErrorCode = continueResult.ErrorCode", method)
 
     def test_breakpoint_binding_verification_surfaces_optimized_or_unbound_locations(self) -> None:
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
@@ -963,7 +1339,7 @@ class ContractTests(unittest.TestCase):
             "Requested source line did not bind; a nearby executable line was selected",
             "no nearby bound executable line was found",
             "Optimized code, statement folding, or source/symbol mismatch may be involved",
-            "BreakpointProbeBindWaitMs",
+            "IsBreakpointBound",
             "dbgDebugMode.dbgRunMode",
             "return \"pending\"",
             "debugger.CurrentMode == dbgDebugMode.dbgBreakMode",
@@ -972,7 +1348,8 @@ class ContractTests(unittest.TestCase):
 
         set_breakpoint = csharp_slice(vs_service, "public BreakpointOperationResult SetBreakpoint", "        public BreakpointOperationResult SetFunctionBreakpoint")
         self.assertIn("ShouldSearchNearbyBindableLine(debugger, breakpointInfo)", set_breakpoint)
-        self.assertIn("TryFindNearbyBoundBreakpoint(", set_breakpoint)
+        self.assertIn("ProbeNearbyBreakpointsSliced(", set_breakpoint)
+        self.assertIn("NearbyProbeIdentity", set_breakpoint)
         self.assertIn("ApplyBreakpointOperationVerification(result, breakpointInfo, debugger, requireBoundInActiveSession: true)", set_breakpoint)
         self.assertIn("breakpoint_binding_verification", function_source(server_py, "debug_capabilities"))
 
@@ -990,10 +1367,12 @@ class ContractTests(unittest.TestCase):
             "主动断点式定位",
             "attach_process",
             "start_debugging",
-            "select_stack_frame",
+            "switch_stack_frame",
             "set_data_breakpoint",
             "当前不暴露 logpoint 工具",
-            "continue、pause、step_over",
+            "debug_continue",
+            "debug_break",
+            "debug_step_over",
         ):
             self.assertIn(keyword, vs_registration)
 
@@ -1014,7 +1393,7 @@ class ContractTests(unittest.TestCase):
         self.assertIn("timeout_seconds", server_py)
         self.assertIn("clamp_tool_timeout(timeout_seconds, EVALUATION_TIMEOUT_SECONDS)", server_py)
         self.assertIn("tool_timeout_for_budget(timeout_seconds, THREADS_TIMEOUT_SECONDS, budget_ms)", server_py)
-        self.assertIn("clamp_tool_timeout(timeout_seconds, MODULES_TIMEOUT_SECONDS)", server_py)
+        self.assertIn("tool_timeout_for_budget(timeout_seconds, MODULES_TIMEOUT_SECONDS, budget_ms)", server_py)
         self.assertIn("clamp_tool_timeout(timeout_seconds, EXCEPTION_TIMEOUT_SECONDS)", server_py)
         self.assertIn("clamp_tool_timeout(timeout_seconds, MEMORY_TIMEOUT_SECONDS)", function_source(server_py, "read_memory"))
         search_memory = function_source(server_py, "search_memory")
@@ -1022,8 +1401,9 @@ class ContractTests(unittest.TestCase):
         self.assertIn("remaining_tool_timeout(deadline, MEMORY_TIMEOUT_SECONDS)", search_memory)
         self.assertIn("clamp_tool_timeout(timeout_seconds, DISASSEMBLY_TIMEOUT_SECONDS)", function_source(server_py, "get_disassembly"))
         self.assertIn("clamp_tool_timeout(timeout_seconds, DISASSEMBLY_TIMEOUT_SECONDS)", function_source(server_py, "get_disassembly_at"))
-        self.assertIn("allow_side_effects", server_py)
-        self.assertIn("allowSideEffects", server_py)
+        self.assertIn("evaluation_policy", server_py)
+        self.assertIn("evaluationPolicy", server_py)
+        self.assertNotIn("allow_side_effects", server_py)
         self.assertIn("include_locals", server_py)
         self.assertIn("includeLocals", server_py)
         self.assertIn("ExpressionEvaluationTimeoutMs", vs_service)
@@ -1032,31 +1412,31 @@ class ContractTests(unittest.TestCase):
         self.assertIn("ExpressionExpansionMaxNodes", vs_service)
         self.assertIn("LocalsExpansionBudgetMs", vs_service)
         self.assertIn("LocalsExpansionMaxNodes", vs_service)
-        self.assertIn("allowSideEffects", vs_service)
+        self.assertNotIn("allowSideEffects", vs_service)
         self.assertIn("GetExpression(expression, false, ExpressionEvaluationTimeoutMs)", vs_service)
-        self.assertIn("Expansion truncated", vs_service)
+        self.assertIn("budget.IsIncomplete", vs_service)
         self.assertIn("variableExpansionBudgetMs", rider_service)
         self.assertIn("allowSideEffects", rider_service)
         self.assertIn("Expansion truncated", rider_service)
 
-    def test_bootstrap_pip_fallback_drains_stderr(self) -> None:
+    def test_bootstrap_requires_manifest_pinned_offline_wheels(self) -> None:
         bootstrap_py = read("mcp_server/bootstrap.py")
-        pip_fallback = function_source(bootstrap_py, "_pip_install_pydantic_core")
         ensure_deps = function_source(bootstrap_py, "ensure_deps")
         dependency_stamp = function_source(bootstrap_py, "_dependency_stamp")
 
         self.assertIn("_DEPS_ENSURED = False", bootstrap_py)
         self.assertIn("global _DEPS_ENSURED", ensure_deps)
-        self.assertIn("subprocess.run(", pip_fallback)
-        self.assertIn("capture_output=True", pip_fallback)
-        self.assertIn("check=False", pip_fallback)
-        self.assertNotIn("subprocess.check_call(", pip_fallback)
-        self.assertNotIn("stderr=subprocess.PIPE", pip_fallback)
+        self.assertNotIn("pip download", bootstrap_py)
+        self.assertNotIn("_pip_install_pydantic_core", bootstrap_py)
+        self.assertIn("_load_and_validate_manifest(wheels_dir)", ensure_deps)
+        self.assertIn("_verify_selected_wheels(selected, manifest)", ensure_deps)
+        self.assertIn("hmac.compare_digest", bootstrap_py)
         self.assertIn("_dependency_stamp(selected, wheels_dir)", ensure_deps)
         self.assertIn("_get_target_dir(stamp)", ensure_deps)
         self.assertIn("_target_marker_matches(target_dir, stamp)", ensure_deps)
         self.assertIn("_find_valid_repair_target_dir(target_dir, stamp)", ensure_deps)
         self.assertIn("_allocate_repair_target_dir(target_dir, stamp)", ensure_deps)
+        self.assertIn("_write_target_marker(target_dir, stamp)", ensure_deps)
         self.assertNotIn("shutil.rmtree(target_dir)", ensure_deps)
         self.assertIn("_file_sha256(manifest)", dependency_stamp)
         self.assertIn("_file_sha256(wheel)", dependency_stamp)
@@ -1084,15 +1464,23 @@ class ContractTests(unittest.TestCase):
             extracted_targets = []
             added_paths = []
 
-            def fake_extract(_wheel, install_dir):
+            def fake_extract(_wheel, install_dir, _extracted_files, _expected_sha256=None):
                 extracted_targets.append(install_dir)
                 (install_dir / "installed.txt").write_text("ok", encoding="utf-8")
 
-            bootstrap._select_wheels = lambda _wheels_dir: [fake_wheel]
+            bootstrap._select_wheels = lambda _wheels_dir, _manifest: [fake_wheel]
+            bootstrap._load_and_validate_manifest = lambda _wheels_dir: {
+                "wheels": [{
+                    "file": "vendor/wheels/fake-1.0-py3-none-any.whl",
+                    "sha256": "0" * 64,
+                }]
+            }
+            bootstrap._verify_selected_wheels = lambda _selected, _manifest: None
             bootstrap._dependency_stamp = lambda _selected, _wheels_dir: stamp
             bootstrap._get_target_dir = lambda _stamp: target_dir
             bootstrap._extract_wheel = fake_extract
-            bootstrap._add_sys_path = lambda install_dir: added_paths.append(install_dir)
+            bootstrap._add_sys_path = lambda install_dir, _stamp=None: added_paths.append(install_dir)
+            bootstrap._validate_runtime_import_origins = lambda _install_dir: None
 
             for _ in range(2):
                 bootstrap._DEPS_ENSURED = False
@@ -1107,7 +1495,12 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(2, len(repair_dirs), [path.name for path in tmp_path.iterdir()])
             self.assertEqual([repair_dirs[0]], extracted_targets)
             self.assertEqual([repair_dirs[0], repair_dirs[0]], added_paths)
-            self.assertEqual(stamp, (repair_dirs[0] / ".bundled_deps").read_text(encoding="utf-8"))
+            marker = json.loads((repair_dirs[0] / ".bundled_deps").read_text(encoding="utf-8"))
+            self.assertEqual(stamp, marker["stamp"])
+            self.assertIn("installed.txt", marker["files"])
+
+            (repair_dirs[0] / "installed.txt").write_text("corrupt", encoding="utf-8")
+            self.assertFalse(bootstrap._target_marker_matches(repair_dirs[0], stamp))
 
     def test_thread_enumeration_is_budgeted(self) -> None:
         server_py = read("mcp_server/server.py")
@@ -1135,10 +1528,14 @@ class ContractTests(unittest.TestCase):
         self.assertIn("NormalizeThreadBudgetMs", vs_service)
         self.assertIn("maxFramesPerThread == 0", vs_service)
         self.assertIn("maxNodes == 0", vs_service)
+        self.assertIn("return ThreadFramesHardMaxPerThread", vs_service)
+        self.assertIn("return ThreadFrameExpansionHardMaxNodes", vs_service)
+        self.assertNotIn("return int.MaxValue", vs_service)
         self.assertIn("budgetMs < 0", vs_service)
         self.assertIn("budgetMs == 0", vs_service)
         self.assertIn("return DebugBundleMainThreadTimeoutMs - 5000", vs_service)
-        self.assertIn("Thread frame enumeration truncated", vs_service)
+        self.assertIn("sliced_thread_snapshot", vs_service)
+        self.assertIn("CaptureThreadFrame(", vs_service)
         self.assertIn("HeavyMainThreadTimeoutMs", vs_service)
         self.assertIn("AddPartialReason(partialReasons", vs_service)
         self.assertIn("DetermineThreadsSnapshotStatus", vs_service)
@@ -1186,7 +1583,7 @@ class ContractTests(unittest.TestCase):
         self.assertIn("public FullContextResult GetFullContext(", vs_service)
         self.assertIn("public DebugBundleResult CaptureDebugBundle(", vs_service)
         self.assertIn("public ContinueAndWaitResult ContinueAndWaitForBreak(", vs_service)
-        self.assertIn("BuildThreadsResult(", vs_service)
+        self.assertIn("GetThreads(", vs_service)
         self.assertIn("threadMaxFramesPerThread", vs_service)
         self.assertIn("threadMaxNodes", vs_service)
         self.assertIn("threadBudgetMs", vs_service)
@@ -1204,6 +1601,10 @@ class ContractTests(unittest.TestCase):
         step_and_capture = function_source(server_py, "step_and_capture")
 
         self.assertIn("remaining_tool_timeout", server_py)
+        self.assertNotIn("return max(1.0, min(default_seconds, remaining))", server_py)
+        self.assertIn("await asyncio.sleep(min(0.5, remaining))", server_py)
+        self.assertIn("timeout=poll_timeout", server_py)
+        self.assertNotIn("remaining_timeout = max(1.0, deadline", server_py)
         self.assertIn("deadline = asyncio.get_running_loop().time() + tool_timeout", crash_triage)
         self.assertIn("remaining_tool_timeout(deadline, DISASSEMBLY_TIMEOUT_SECONDS)", crash_triage)
         self.assertIn("remaining_tool_timeout(deadline, MEMORY_TIMEOUT_SECONDS)", crash_triage)
@@ -1219,51 +1620,136 @@ class ContractTests(unittest.TestCase):
 
         self.assertIn('return threads.Threads.Count > 0 ? "ok" : "unavailable";', vs_service)
         self.assertIn('return if (threads.threads.isNotEmpty()) "ok" else "unavailable"', rider_service)
-        self.assertIn("fullContext.Threads.SnapshotStatus = DetermineThreadsSnapshotStatus(fullContext.Threads, true);", vs_service)
-        self.assertIn("bundle.Threads.SnapshotStatus = DetermineThreadsSnapshotStatus(bundle.Threads, true);", vs_service)
+        self.assertIn('result.Threads.Count > 0 ? "best_effort" : "unavailable"', vs_service)
+        self.assertIn("bundle.Threads = RetainBundleComponent(", vs_service)
         self.assertIn("it.snapshotStatus = determineThreadsSnapshotStatus(it, true)", rider_service)
-        self.assertIn('result.Error = "Current debug program unavailable"', vs_service)
+        self.assertIn('new ThreadSnapshotHeader { Error = "Current debug program unavailable" }', vs_service)
         self.assertIn('result.error = "No execution stacks available"', rider_service)
 
-    def test_vs_locals_reports_selected_stack_frame_index(self) -> None:
+    def test_vs_locals_uses_explicit_non_ui_frame_context(self) -> None:
+        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+        vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
+        models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+
+        self.assertNotIn("private int _selectedStackFrameIndex;", vs_service)
+        self.assertIn("FindThreadIndexByIdSliced(threadId, threadLookupBudgetMs)", vs_service)
+        self.assertIn("ResolveThread(debugger, threadId, selectedThreadIndex)", vs_service)
+        self.assertIn("thread.ID == threadId ? thread : null", vs_service)
+        self.assertIn("ResolveFrame(selectedThread, frameIndex)", vs_service)
+        self.assertIn("selectedFrame.Locals", vs_service)
+        self.assertIn("selectedFrame.Arguments", vs_service)
+        self.assertIn("StaleDebugContextException", vs_service)
+        self.assertIn('"STALE_DEBUG_CONTEXT"', vs_pipe)
+        self.assertIn("class DebugFrameContext", models)
+        self.assertIn('DataMember(Name = "frameId")', models)
+
+    def test_vs_com_collections_are_sliced_paginated_and_truthful(self) -> None:
+        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+        router = read("VSDebuggerMCP/Ipc/NamedPipeMethodRouter.cs")
+        catalog = read("VSDebuggerMCP/Protocol/DebugMethodCatalog.cs")
+        server_py = read("mcp_server/server.py")
+        models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+
+        self.assertNotIn("foreach (EnvDTE.Breakpoint", vs_service)
+        self.assertNotIn("foreach (EnvDTE.Process", vs_service)
+        self.assertNotIn("foreach (EnvDTE.Thread", vs_service)
+        self.assertNotIn("_buildErrorService.Get(", vs_service)
+        for marker in (
+            "CaptureModuleFrame(",
+            "_buildErrorService.GetItem(",
+            "CaptureBreakpointAtIndex(",
+            "CaptureLocalProcessIdentity(",
+            "CaptureThreadIdentity(",
+            "DeleteFirstBreakpoint(",
+        ):
+            self.assertIn(marker, vs_service)
+
+        for field in (
+            'DataMember(Name = "startIndex")',
+            'DataMember(Name = "nextIndex")',
+            'DataMember(Name = "hasMore")',
+            'DataMember(Name = "nextThreadIndex")',
+            'DataMember(Name = "nextFrameIndex")',
+            'DataMember(Name = "hasMoreFrames")',
+        ):
+            self.assertIn(field, models)
+
+        self.assertIn("startIndex maxNodes budgetMs", catalog)
+        self.assertIn("startThreadIndex startFrameIndex", catalog)
+        self.assertIn('case "startIndex"', router)
+        self.assertIn('case "startThreadIndex"', router)
+        self.assertIn("add_bounded_collection_params", server_py)
+        self.assertIn('result.SnapshotStatus = countStable ? "best_effort" : "unstable";', vs_service)
+        self.assertIn('result.SnapshotStatus = countAndContextStable ? "best_effort" : "unstable";', vs_service)
+        self.assertIn("scanContinuationToken", catalog)
+        self.assertIn('DataMember(Name = "scanContinuationToken"', models)
+        self.assertIn(
+            "The debugger context changed while the fallback module snapshot was captured.",
+            vs_service,
+        )
+        self.assertIn("continue with scanContinuationToken", vs_service)
+
+    def test_partial_side_effect_commands_keep_structured_outcomes(self) -> None:
+        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+        policy = read("VSDebuggerMCP/Ipc/OperationResultPolicy.cs")
+        models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
+
+        self.assertIn("process.ProcessStarted || process.CommandIssued", policy)
+        self.assertIn("breakpoint.CommandIssued", policy)
+        self.assertIn('DataMember(Name = "processStarted")', models)
+        self.assertIn('DataMember(Name = "commandIssued")', models)
+        self.assertIn('DataMember(Name = "affectedCount")', models)
+        self.assertIn('DataMember(Name = "remainingCount")', models)
+        self.assertIn("process_started_attach_not_completed", vs_service)
+        self.assertIn("delete_all_outcome_unknown", vs_service)
+
+    def test_vs_stack_frames_do_not_fabricate_source_from_editor_state(self) -> None:
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
 
-        self.assertIn("private int _selectedStackFrameIndex;", vs_service)
-        self.assertIn("result.FrameIndex = _selectedStackFrameIndex;", vs_service)
-        self.assertIn("_selectedStackFrameIndex = frameIndex;", vs_service)
-        self.assertIn("_selectedStackFrameIndex = 0;", vs_service)
-
-    def test_vs_native_dump_frame_uses_active_source_fallback(self) -> None:
-        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
-
-        self.assertIn("TryGetActiveSourceDocumentPath", vs_service)
-        self.assertIn("TryGetActiveSourceLineNumber", vs_service)
-        self.assertIn("IsSourceFilePath", vs_service)
+        self.assertNotIn("TryGetActiveSourceDocumentPath", vs_service)
+        self.assertNotIn("TryGetActiveSourceLineNumber", vs_service)
+        self.assertNotIn("IsCurrentOrSelectedStackFrame", vs_service)
+        self.assertNotIn("FindSourceFileByClassName", vs_service)
         self.assertIn("IsSyntheticExecutionPointFrame", vs_service)
-        self.assertIn("Native dump debugging can expose the active source document", vs_service)
-        self.assertIn("GetFrameFileName(frame, index)", vs_service)
-        self.assertIn("GetFrameLineNumberEx(frame, index)", vs_service)
-        self.assertIn("sourceFallbackFrameIndex = threadInfo.IsCurrent ? currentFrameIndex : -1", vs_service)
-        self.assertIn("GetFrameLineNumberEx(frame, sourceFallbackFrameIndex)", vs_service)
-        self.assertIn("GetFrameFileName(frame, sourceFallbackFrameIndex)", vs_service)
-        self.assertIn("!IsSyntheticExecutionPointFrame(candidateFrame)", vs_service)
-        self.assertIn("isCurrentOrSelectedFrame && TryGetActiveSourceDocumentPath", vs_service)
-        self.assertIn("isCurrentFrame && TryGetActiveSourceLineNumber", vs_service)
+        self.assertIn("CaptureThreadFrame(", vs_service)
+        self.assertIn("_sourceLocationAdapter.GetLocation(frame)", vs_service)
+        self.assertIn("!IsSyntheticExecutionPointName(topFrame.FunctionName)", vs_service)
         self.assertIn('StartsWith("[Execution point when dump was captured"', vs_service)
-        self.assertIn('case ".ush":', vs_service)
+        self.assertNotIn('GetExpression("__FILE__")', vs_service)
+        self.assertNotIn('GetExpression("__LINE__")', vs_service)
+        frame_source = vs_service[
+            vs_service.index("private string GetFrameFileName"):
+            vs_service.index("private (int LineNumber, bool IsReliable) GetFrameLineNumberEx")
+        ]
+        self.assertIn("return _sourceLocationAdapter.GetLocation(frame).FilePath;", frame_source)
+        line_source = vs_service[
+            vs_service.index("private (int LineNumber, bool IsReliable) GetFrameLineNumberEx"):
+            vs_service.index("private int GetFrameLineNumber")
+        ]
+        self.assertIn("VisualStudioSourceLocation location = _sourceLocationAdapter.GetLocation(frame);", line_source)
+        self.assertIn("return (location.LineNumber ?? 0, location.IsReliable);", line_source)
+        self.assertNotIn("ActiveDocument", frame_source + line_source)
 
     def test_vs_dump_modules_use_minidump_module_list_fallback(self) -> None:
-        vs_service = read("VSDebuggerMCP/DebuggerService.cs")
+        vs_service = "\n".join([
+            read("VSDebuggerMCP/DebuggerService.cs"),
+            read("VSDebuggerMCP/Services/DebuggerService.Inspection.cs"),
+            read("VSDebuggerMCP/Services/DebuggerService.EvaluationMemory.cs"),
+        ])
 
         self.assertIn("GetModulesFromMinidump", vs_service)
-        self.assertIn("TryGetActiveDumpFilePath", vs_service)
+        self.assertIn("GetActiveDumpFilePathCandidate", vs_service)
+        self.assertIn("NormalizeExistingDumpPath", vs_service)
         self.assertIn("_activeDumpFilePath", vs_service)
-        self.assertIn("_activeDumpFilePath = dumpPath", vs_service)
+        self.assertIn("_activeDumpFilePath = _pendingDumpFilePath", vs_service)
+        self.assertIn("_activeDumpSessionGeneration = session.Generation", vs_service)
         self.assertIn("IsDumpFilePath(_activeDumpFilePath)", vs_service)
         self.assertIn("ModuleListStream", vs_service)
         self.assertIn("0x504D444D", vs_service)
         self.assertIn("ReadMinidumpCodeViewPdbPath", vs_service)
-        self.assertIn("MergeModuleInfo(moduleSet, moduleInfoDict, mod, addIfMissing: true)", vs_service)
+        self.assertIn("declaredModuleCount", vs_service)
+        self.assertIn("maxModulesBySize", vs_service)
+        self.assertIn("bounded enumeration cap of 4096", vs_service)
         self.assertIn('Address = $"0x{baseOfImage:X16}"', vs_service)
         self.assertIn("SymbolPath = ReadMinidumpCodeViewPdbPath", vs_service)
 
@@ -1276,12 +1762,13 @@ class ContractTests(unittest.TestCase):
         self.assertIn("timeout_seconds: Optional[float] = None", start_debugging)
         self.assertIn("clamp_tool_timeout(timeout_seconds, START_DEBUGGING_TIMEOUT_SECONDS)", start_debugging)
         self.assertIn("deadline = asyncio.get_running_loop().time() + wait_timeout", start_debugging)
-        self.assertIn("wait_for_debugging_to_start(result, remaining_timeout, attach)", start_debugging)
+        self.assertIn("wait_for_debugging_to_start(", start_debugging)
+        self.assertIn("target=instance_target", start_debugging)
         self.assertIn("wait_for_pause = executable_path.lower().endswith", server_py)
         self.assertIn("Started dump debugging and paused", server_py)
 
         vs_start = vs_service[vs_service.index("public ProcessDebugResult StartDebugging"):]
-        vs_start = vs_start[:vs_start.index("private EnvDTE.Process FindLocalProcess")]
+        vs_start = vs_start[:vs_start.index("private LocalProcessLookup FindLocalProcessSliced")]
         self.assertIn("}, HeavyMainThreadTimeoutMs);", vs_start)
 
     def test_start_debugging_handles_active_dump_document(self) -> None:
@@ -1289,38 +1776,44 @@ class ContractTests(unittest.TestCase):
         vs_project = read("VSDebuggerMCP/VSDebuggerMCP.csproj")
 
         vs_start = vs_service[vs_service.index("public ProcessDebugResult StartDebugging"):]
-        vs_start = vs_start[:vs_start.index("private EnvDTE.Process FindLocalProcess")]
+        vs_start = vs_start[:vs_start.index("private LocalProcessLookup FindLocalProcessSliced")]
         self.assertIn("TryStartActiveDumpDebugging(debugger, result)", vs_start)
-        self.assertIn("IsDumpFilePath(normalizedExe)", vs_start)
-        self.assertIn("StartDumpDebuggingFromPath(debugger, result, normalizedExe)", vs_start)
+        self.assertIn("normalizedDumpPath", vs_start)
+        self.assertIn("StartDumpDebuggingFromPath(debugger, result, normalizedDumpPath)", vs_start)
         self.assertIn("StartDumpDebuggingFromPath", vs_start)
-        self.assertIn("_dte.ItemOperations.OpenFile(dumpPath)", vs_start)
-        self.assertIn("TryStartActiveDumpNativeOnlyDebugging(out string startError)", vs_start)
-        self.assertIn("_activeDumpFilePath = null", vs_start)
-        self.assertIn("Requested Visual Studio to start native debugging for dump file", vs_start)
-        self.assertIn('"Debug with Native Only"', vs_start)
-        self.assertIn("TryInvokeVisualStudioControl", vs_start)
-        self.assertIn("InvokePattern.Pattern", vs_start)
-        self.assertIn("Requested Visual Studio to start native debugging for active dump file", vs_start)
-        self.assertIn("DumpDebugStartPollMs", vs_start)
-        self.assertIn("JoinableTaskFactory.Run(async () =>", vs_start)
-        self.assertIn("SwitchToMainThreadAsync", vs_start)
-        self.assertIn("_activeDumpFilePath = activeDocumentPath", vs_start)
-        self.assertIn("System.IO.File.Exists(activeDocumentPath)", vs_start)
+        self.assertIn("OpenAndVerifyTargetDocument(dumpPath)", vs_start)
+        self.assertIn("out bool outcomeUnknown", vs_start)
+        self.assertIn("if (!outcomeUnknown) ClearDumpSessionState()", vs_start)
+        self.assertIn("ClearDumpSessionState()", vs_start)
+        self.assertIn("Requested Visual Studio to start debugging the dump file", vs_start)
+        self.assertIn("VisualStudioDebuggerCommandSet", vs_service)
+        self.assertIn("DebugDumpFileCommandId", vs_service)
+        self.assertIn("PostExecCommand", vs_start)
+        self.assertIn("official_vs_dump_command", vs_start)
+        self.assertIn("debug_engine_selection_is_controlled_by_visual_studio", vs_start)
+        self.assertNotIn("TryInvokeVisualStudioControl", vs_start)
+        self.assertNotIn("AutomationElement", vs_start)
+        self.assertIn("BeginPendingDumpSession(activeDocumentPath)", vs_start)
+        self.assertNotIn("System.IO.File.Exists(activeDocumentPath)", vs_start)
         self.assertIn('string.Equals(extension, ".dmp"', vs_start)
-        self.assertNotIn('"Debug.DebugDumpFile"', vs_start)
-        self.assertNotIn('"Debug.StartDebugTarget"', vs_start)
-        self.assertIn('<Reference Include="UIAutomationClient" />', vs_project)
-        self.assertIn('<Reference Include="UIAutomationTypes" />', vs_project)
+        self.assertNotIn('<Reference Include="UIAutomationClient" />', vs_project)
+        self.assertNotIn('<Reference Include="UIAutomationTypes" />', vs_project)
 
-    def test_ide_bridge_reselects_stale_selected_instance(self) -> None:
+    def test_ide_bridge_preserves_stale_immutable_selection(self) -> None:
         bridge = read("mcp_server/ide_bridge.py")
 
         self.assertIn("_is_stale_selected_instance_error", bridge)
-        self.assertIn("self.clear_selection()", bridge)
         self.assertIn("selected_pipe = self._selected_pipe", bridge)
-        self.assertIn("self._selected_pipe == selected.pipe_name", bridge)
-        self.assertIn("self._selected_pipe == selected_pipe", bridge)
+        self.assertIn("selected_target = dict(self._selected_target)", bridge)
+        self.assertIn("selected_registration = (", bridge)
+        self.assertIn("vs_bridge.call_pipe_exact(", bridge)
+        self.assertIn("self._call_vs_exact_and_advance(", bridge)
+        self.assertIn("selected_registration,", bridge)
+        selected_vs_branch = bridge[
+            bridge.index('if selected_ide == "vs":'):
+            bridge.index('elif selected_ide == "rider":')
+        ]
+        self.assertNotIn("clear_selection()", selected_vs_branch)
         self.assertIn("access denied", bridge)
         non_stale_start = bridge.index("non_stale_markers = (")
         stale_start = bridge.index("stale_markers = (", non_stale_start + len("non_stale_markers = ("))
@@ -1337,16 +1830,24 @@ class ContractTests(unittest.TestCase):
 
         self.assertIn("selected_ide = self._selected_ide", ide_bridge_py)
         self.assertIn("selected_pipe = self._selected_pipe", ide_bridge_py)
-        self.assertIn("return await vs_bridge.call_pipe(selected_pipe, method, params, timeout)", ide_bridge_py)
-        self.assertIn("return await rider_bridge.call_pipe(selected_pipe, method, params, timeout)", ide_bridge_py)
-        self.assertIn("return await vs_bridge.call_pipe(selected.pipe_name, method, params, timeout)", ide_bridge_py)
-        self.assertIn("instances = await self.discover_instances(preferred_ide=preferred)", ide_bridge_py)
+        self.assertIn("selected_target = dict(self._selected_target)", ide_bridge_py)
+        self.assertIn("selected_registration = (", ide_bridge_py)
+        self.assertIn("vs_bridge.call_pipe_exact(", ide_bridge_py)
+        self.assertIn("self._call_vs_exact_and_advance(", ide_bridge_py)
+        self.assertIn("selected_registration,", ide_bridge_py)
+        self.assertIn("return await rider_bridge.call_pipe(selected_pipe, method, params, remaining)", ide_bridge_py)
+        self.assertIn("selected.target_identity()", ide_bridge_py)
+        self.assertIn("instances = await self.discover_instances(preferred_ide=preferred, timeout=discovery_budget)", ide_bridge_py)
 
         self.assertIn("pipe_name = self._selected_pipe", vs_bridge_py)
+        self.assertIn("selected_target = dict(self._selected_target)", vs_bridge_py)
+        self.assertIn("selected_registration = (", vs_bridge_py)
+        self.assertIn("registration_snapshot=selected_registration", vs_bridge_py)
         self.assertIn("async def call_pipe", vs_bridge_py)
         self.assertIn("loop.run_in_executor", vs_bridge_py)
         self.assertIn("self._cached_instances = instances", vs_bridge_py)
-        self.assertIn("return await self.call_pipe(pipe_name, method, params, timeout)", vs_bridge_py)
+        self.assertIn("selected_instance = self._find_best_instance(instances)", vs_bridge_py)
+        self.assertIn("selected_instance.registration_snapshot()", vs_bridge_py)
         self.assertIn("pipe_name = self._selected_pipe", rider_bridge_py)
         self.assertIn("async def call_pipe", rider_bridge_py)
         self.assertIn("loop.run_in_executor", rider_bridge_py)
@@ -1371,15 +1872,19 @@ class ContractTests(unittest.TestCase):
         self.assertIn('instances = [i for i in instances if i.connection_status == "ok"]', ide_bridge_py)
         self.assertIn('return any(i.connection_status == "ok" for i in instances)', ide_bridge_py)
 
-    def test_list_instances_do_not_claim_selection(self) -> None:
+    def test_list_and_detect_preserve_explicit_selection_truth(self) -> None:
         server_py = read("mcp_server/server.py")
 
         list_vs = function_source(server_py, "list_vs_instances")
         list_ide = function_source(server_py, "list_ide_instances")
         detect = function_source(server_py, "detect_debug_sessions")
 
-        self.assertIn('"selected": False', list_vs)
-        self.assertIn('result["selected"] = False', list_ide)
+        self.assertIn("_instances_with_selection", list_vs)
+        self.assertIn("_instances_with_selection", list_ide)
+        self.assertIn('"selected": has_selection', list_vs)
+        self.assertIn('result["selected"] = has_selection', list_ide)
+        self.assertIn('"selectedInstance": selected_payload', list_vs)
+        self.assertIn('result["selectedInstance"] = selected_payload', list_ide)
         self.assertIn("wouldAutoSelect", list_vs)
         self.assertIn("wouldAutoSelect", list_ide)
         self.assertIn('"unreachable": len(instances) - len(selectable_instances)', list_vs)
@@ -1387,20 +1892,25 @@ class ContractTests(unittest.TestCase):
         self.assertNotIn("autoSelected", list_vs)
         self.assertNotIn("autoSelected", list_ide)
         self.assertIn("autoSelected", detect)
+        self.assertIn("if has_selection:", detect)
+        self.assertIn("detect_debug_sessions 不会覆盖显式选择", detect)
+        self.assertIn("未自动切换到其他实例", detect)
 
     def test_preferred_ide_discovery_is_scoped(self) -> None:
         server_py = read("mcp_server/server.py")
         ide_bridge_py = read("mcp_server/ide_bridge.py")
 
-        self.assertIn("async def discover_instances(self, preferred_ide: Optional[str] = None)", ide_bridge_py)
+        self.assertIn("async def discover_instances(\n        self,\n        preferred_ide: Optional[str] = None,\n        timeout: Optional[float] = None", ide_bridge_py)
         self.assertIn("preferred_ide: Optional[str] = None", ide_bridge_py)
         self.assertIn("preferred_ide must be 'vs' or 'rider'", ide_bridge_py)
         self.assertIn("requires {preferred.upper()}", ide_bridge_py)
         self.assertIn("requires {requested_preferred.upper()}", ide_bridge_py)
         self.assertIn("bridge.call(method, params, timeout, preferred_ide=preferred_ide)", ide_bridge_py)
-        self.assertIn('if preferred in (None, "vs"):', ide_bridge_py)
-        self.assertIn('if preferred in (None, "rider"):', ide_bridge_py)
-        self.assertIn("async def discover_instances(preferred_ide: Optional[str] = None)", ide_bridge_py)
+        self.assertIn('if preferred in (None, "vs") and vs_bridge is not None:', ide_bridge_py)
+        self.assertIn('if preferred in (None, "rider") and rider_bridge is not None:', ide_bridge_py)
+        self.assertIn('_configured_ide != "rider"', ide_bridge_py)
+        self.assertIn('_configured_ide != "vs"', ide_bridge_py)
+        self.assertIn("async def discover_instances(\n    preferred_ide: Optional[str] = None,\n    timeout: Optional[float] = None", ide_bridge_py)
         self.assertIn('discover_instances(preferred_ide="vs")', function_source(server_py, "list_vs_instances"))
         self.assertIn("discover_instances(preferred_ide=ide_key)", function_source(server_py, "select_ide_instance"))
         self.assertIn('discover_instances(preferred_ide="vs")', function_source(server_py, "select_vs_instance"))
@@ -1449,17 +1959,36 @@ class ContractTests(unittest.TestCase):
     def test_split_server_files_are_packaged_for_vsix_and_rider(self) -> None:
         csproj_items = vsix_content_items()
         rider_registration = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/McpClientRegistration.kt")
-        expected_files = expected_packaged_mcp_files()
-        wildcard_include = r"..\mcp_server\tool_modules\*.py"
-        self.assertIn(wildcard_include, csproj_items)
-        self.assertEqual("true", csproj_items[wildcard_include].get("IncludeInVSIX"))
-        self.assertEqual("PreserveNewest", csproj_items[wildcard_include].get("CopyToOutputDirectory"))
-        self.assertEqual(r"mcp_server\tool_modules\%(Filename)%(Extension)", csproj_items[wildcard_include].get("Link"))
+        all_runtime_files = expected_packaged_mcp_files()
+        vs_root_files = {
+            "vs_server.py", "vs_launcher.py", "vs_bridge.py", "vs_errors.py", "vs_session.py", "vs_mcp_app.py",
+            "output_models.py", "tool_context.py", "tool_runtime.py", "vs_tool_registry.py", "vs_trust.py", "bootstrap.py",
+            "debug_method_manifest.json", "requirements.txt",
+        }
+        vs_tool_modules = {
+            "tool_modules/__init__.py", "tool_modules/capability_tools.py",
+            "tool_modules/vs_instance_tools.py", "tool_modules/snapshot_tools.py",
+            "tool_modules/native_managed_tools.py", "tool_modules/control_tools.py",
+            "tool_modules/breakpoint_tools.py", "tool_modules/memory_tools.py",
+        }
+        expected_vs_files = sorted(
+            path for path in all_runtime_files
+            if path in vs_tool_modules or path in vs_root_files
+        )
+        module_include = next(key for key in csproj_items if ";" in key and "tool_modules" in key)
+        module_sources = set(module_include.split(";"))
+        self.assertEqual(
+            {r"..\mcp_server" + "\\" + path.replace("/", "\\") for path in vs_tool_modules},
+            module_sources,
+        )
+        self.assertEqual("true", csproj_items[module_include].get("IncludeInVSIX"))
+        self.assertEqual("PreserveNewest", csproj_items[module_include].get("CopyToOutputDirectory"))
+        self.assertEqual(r"mcp_server\tool_modules\%(Filename)%(Extension)", csproj_items[module_include].get("Link"))
 
-        for relative_path in expected_files:
+        for relative_path in expected_vs_files:
             with self.subTest(target="vsix", file=relative_path):
                 if relative_path.startswith("tool_modules/") and relative_path.count("/") == 1:
-                    self.assertIn(wildcard_include, csproj_items)
+                    self.assertIn(r"..\mcp_server" + "\\" + relative_path.replace("/", "\\"), module_sources)
                 else:
                     include_path = r"..\mcp_server" + "\\" + relative_path.replace("/", "\\")
                     link_path = "mcp_server\\" + relative_path.replace("/", "\\")
@@ -1468,7 +1997,16 @@ class ContractTests(unittest.TestCase):
                     self.assertEqual("true", csproj_items[include_path].get("IncludeInVSIX"))
                     self.assertEqual("PreserveNewest", csproj_items[include_path].get("CopyToOutputDirectory"))
 
-        self.assertEqual(expected_files, rider_base_files(rider_registration))
+        expected_rider_files = [
+            path for path in all_runtime_files
+            if path not in {
+                "vs_server.py", "vs_launcher.py", "vs_session.py", "vs_mcp_app.py",
+                "vs_tool_registry.py", "tool_modules/vs_instance_tools.py",
+            }
+        ]
+        self.assertEqual(expected_rider_files, rider_base_files(rider_registration))
+        self.assertNotIn(r"..\mcp_server\rider_bridge.py", csproj_items)
+        self.assertNotIn(r"..\mcp_server\server.py", csproj_items)
 
         self.assertIn('val filesToCopy = (baseFiles + "vendor/wheels/manifest.json" + manifestFiles).distinct()', rider_registration)
         self.assertIn('val seedFiles = (baseFiles + "vendor/wheels/manifest.json" + manifestFiles).distinct()', rider_registration)
@@ -1540,11 +2078,12 @@ class ContractTests(unittest.TestCase):
 
     def test_tool_registry_matches_backend_matrix(self) -> None:
         registry = load_tool_registry()
-        vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
         rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
         ide_bridge_py = read("mcp_server/ide_bridge.py")
 
-        vs_methods = set(re.findall(r'case\s+"([^"]+)"\s*:', vs_pipe))
+        method_manifest = json.loads(read("mcp_server/debug_method_manifest.json"))
+        self.assertEqual("aidb/2", method_manifest["protocol"])
+        vs_methods = set(method_manifest["methods"])
         rider_methods = discover_rider_dispatch_methods(rider_service)
         tool_names = discover_mcp_tool_names()
 
@@ -1588,7 +2127,8 @@ class ContractTests(unittest.TestCase):
         rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
 
         search_memory = function_source(server_py, "search_memory")
-        vs_execute_search = csharp_slice(vs_service, "private MemorySearchResult ExecuteSearchMemory(", "            // Get start address")
+        vs_execute_search = csharp_slice(vs_service, "public MemorySearchResult SearchMemory(", "        private MemorySearchResult CreateUnavailableMemorySearchResult")
+        vs_parse_pattern = read("VSDebuggerMCP/Ipc/SearchPatternParser.cs")
         vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
         self.assertIn("MAX_MEMORY_SEARCH_CHUNK_SIZE = 0x100000", server_py)
         self.assertIn("MAX_MEMORY_SEARCH_SIZE = 0x40000000", server_py)
@@ -1601,25 +2141,32 @@ class ContractTests(unittest.TestCase):
         self.assertIn('"startOffset": start_offset', search_memory)
         self.assertIn('"startOffset": absolute_offset', search_memory)
         self.assertIn("chunk_start = start_address if absolute_offset == 0 else", search_memory)
-        self.assertIn("next_offset = offset + step", search_memory)
-        self.assertIn('chunk_result.get("nextStartAddress") or start_address', search_memory)
+        self.assertIn("next_offset = max(offset + 1, covered_until - overlap)", search_memory)
+        self.assertIn("newly_covered", search_memory)
+        self.assertIn('backend_next_offset = chunk_result.get("nextStartOffset")', search_memory)
+        self.assertIn('continuation_expression = start_address', search_memory)
+        self.assertIn('"INVALID_BACKEND_CONTINUATION"', search_memory)
         self.assertIn('"startAddress": start_address', search_memory)
         self.assertIn("Search stopped after reaching max_results", search_memory)
         self.assertNotIn("10 * 1024 * 1024", search_memory)
-        self.assertIn("单次后端调用最大1MB，较大范围会自动分片覆盖", search_memory)
+        self.assertIn("Search a bounded memory range beginning at a numeric address literal", search_memory)
         self.assertIn('pattern_format: str = "auto"', search_memory)
         self.assertIn('"patternFormat": pattern_format', search_memory)
         self.assertIn('string patternFormat = GetParam<string>(request.Params, "patternFormat", "auto")', vs_pipe)
         self.assertIn('long startOffset = GetParam<long>(request.Params, "startOffset", 0)', vs_pipe)
-        self.assertIn("Convert.ToInt64(value)", vs_pipe)
-        self.assertIn("Pattern cannot be empty", vs_execute_search)
-        self.assertIn("string.IsNullOrWhiteSpace(pattern)", vs_execute_search)
-        self.assertIn('normalizedPatternFormat == "hex"', vs_execute_search)
-        self.assertIn("looksLikeSpacedHex", vs_execute_search)
-        self.assertIn('"41" remains literal ASCII text', vs_execute_search)
+        self.assertIn("if (value is long longValue)", vs_pipe)
+        self.assertIn("long converted = intValue", vs_pipe)
+        self.assertIn("ValidateLongRange(key, converted)", vs_pipe)
+        self.assertIn("ParameterValidationException", vs_pipe)
+        self.assertIn("must not be empty", vs_parse_pattern)
+        self.assertIn("string.IsNullOrWhiteSpace(pattern)", vs_parse_pattern)
+        self.assertIn('case "hex"', vs_parse_pattern)
+        self.assertIn("LooksLikeSpacedHex", vs_parse_pattern)
+        self.assertIn("Encoding.UTF8.GetBytes(pattern)", vs_parse_pattern)
+        self.assertIn("contains non-ASCII characters", vs_parse_pattern)
         self.assertIn("startOffset > 0 ? (ulong)startOffset : 0UL", vs_service)
-        self.assertIn("addr += byteOffset", vs_service)
-        self.assertNotIn("pattern.Trim().Length == 2", vs_execute_search)
+        self.assertIn("baseAddress += offsetValue", vs_execute_search)
+        self.assertNotIn("pattern.Trim().Length == 2", vs_parse_pattern)
         self.assertIn("result.Truncated = true", vs_service)
         self.assertIn("result.NextStartAddress", vs_service)
         self.assertIn('val patternFormat = getParam(request.params, "patternFormat", "auto")', rider_service)
@@ -1650,7 +2197,8 @@ class ContractTests(unittest.TestCase):
         for code in (vs_pipe, rider_service):
             self.assertIn('"includeLocals"', code)
             self.assertIn('"includeOutput"', code)
-            self.assertIn('"allowSideEffects"', code)
+        self.assertIn('"evaluationPolicy"', vs_pipe)
+        self.assertIn('"allowSideEffects"', rider_service)
 
         for doc in (vs_registration, rider_registration, readme):
             self.assertIn("low-blocking", doc)
@@ -1681,7 +2229,7 @@ class ContractTests(unittest.TestCase):
         ):
             body = function_source(server_py, name)
             self.assertNotIn("return rejection", body)
-            self.assertIn('"allowSideEffects": allow_side_effects', body)
+            self.assertIn('"evaluationPolicy": evaluation_policy', body)
 
     def test_cursor_allowlist_helper_is_bundled(self) -> None:
         helper_py = read("mcp_server/cursor_allowlist_sync.py")
@@ -1690,7 +2238,7 @@ class ContractTests(unittest.TestCase):
 
         self.assertIn("mcpAllowedTools", helper_py)
         self.assertIn("state.vscdb", helper_py)
-        self.assertIn("cursor_allowlist_sync.py", vs_project)
+        self.assertNotIn("cursor_allowlist_sync.py", vs_project)
         self.assertIn("cursor_allowlist_sync.py", rider_registration)
 
     def test_codex_registration_is_wired_for_vs_and_rider(self) -> None:

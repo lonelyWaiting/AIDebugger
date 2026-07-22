@@ -2,32 +2,25 @@ from typing import Any, Dict, List, Optional
 import asyncio
 
 try:
-    from .. import ide_bridge
-    from ..mcp_app import mcp
+    from .. import vs_bridge
+    from ..tool_runtime import backend as ide_bridge, mcp
     from ..tool_context import *
 except ImportError:
-    import ide_bridge
-    from mcp_app import mcp
+    import vs_bridge
+    from tool_runtime import backend as ide_bridge, mcp
     from tool_context import *
 @mcp.tool()
 async def read_memory(address: str, size: int = 256, timeout_seconds: Optional[float] = None) -> str:
-    """
-    读取指定内存地址的原始字节数据。用于分析内存布局、检查数据结构、排查内存损坏问题。
-    返回十六进制转储、ASCII视图和格式化的内存视图。地址可以是十六进制或变量表达式。
+    """Read raw bytes from a non-zero numeric address literal.
 
-    **触发场景**: 当用户提到"内存"、"memory"、"内存损坏"、"内存布局"、"查看地址"、"hex dump"时调用此工具。
-
-    Args:
-        address: 内存地址，支持十六进制（如0x7ff61234）或表达式（如&myVariable、myPointer）
-        size: 要读取的字节数，默认256，最大4096
-        timeout_seconds: 等待 IDE 响应的最长秒数
+    To resolve a variable or symbol, first use evaluate_expression/resolve_address
+    under the unsafe-evaluation capability, then pass the returned numeric address.
     """
-    # Clamp size
-    size = max(1, min(size, 4096))
+    size = validate_int_range("size", size, 1, 4096)
 
     try:
         result = await ide_bridge.call("read_memory", {
-            "address": address,
+            "address": validate_address_literal("address", address),
             "size": size
         }, timeout=clamp_tool_timeout(timeout_seconds, MEMORY_TIMEOUT_SECONDS))
         return format_result(result)
@@ -51,6 +44,8 @@ async def get_disassembly(
         lines_after: 当前指令之后要显示的行数，默认20
         timeout_seconds: 等待 IDE 响应的最长秒数
     """
+    lines_before = validate_int_range("lines_before", lines_before, 0, 256)
+    lines_after = validate_int_range("lines_after", lines_after, 0, 256)
     try:
         result = await ide_bridge.call("get_disassembly", {
             "linesBefore": lines_before,
@@ -66,18 +61,15 @@ async def get_disassembly_at(
     count: int = 50,
     timeout_seconds: Optional[float] = None
 ) -> str:
-    """
-    获取指定内存地址处的反汇编代码。可以用于查看特定函数或代码段的汇编指令。
-    地址可以是十六进制格式（如0x7ff61234）或表达式（如&myFunction）。
+    """Disassemble instructions at a non-zero numeric address literal.
 
-    Args:
-        address: 起始内存地址，支持十六进制（如0x7ff61234）或表达式（如&myFunction）
-        count: 要获取的指令数量，默认50
-        timeout_seconds: 等待 IDE 响应的最长秒数
+    Symbol or expression resolution is deliberately separate and requires
+    resolve_address, which is classified as unsafe debugger evaluation.
     """
+    count = validate_int_range("count", count, 1, 256)
     try:
         result = await ide_bridge.call("get_disassembly_at", {
-            "address": address,
+            "address": validate_address_literal("address", address),
             "count": count
         }, timeout=clamp_tool_timeout(timeout_seconds, DISASSEMBLY_TIMEOUT_SECONDS))
         return format_result(result)
@@ -124,23 +116,20 @@ async def search_memory(
     start_offset: int = 0,
     timeout_seconds: Optional[float] = None
 ) -> str:
-    """
-    在内存中搜索指定模式。可用于查找特定数据或字符串。
+    """Search a bounded memory range beginning at a numeric address literal.
 
-    Args:
-        start_address: 搜索起始地址（十六进制如0x7ff61234或表达式如&myVar）
-        pattern: 搜索模式，可以是十六进制字节(如"4D 5A")或ASCII字符串
-        max_results: 最大返回结果数，默认100
-        search_size: 搜索范围大小（字节），默认64KB；Visual Studio 单次后端调用最大1MB，较大范围会自动分片覆盖
-        pattern_format: auto/text/hex。auto 仅把带空格的十六进制串当字节，"41" 默认按 ASCII 文本搜索；hex 可显式搜索单字节
-        start_offset: 从 start_address 解析出的基址开始增加的字节偏移，便于从 nextStartOffset 继续搜索
-        timeout_seconds: 等待 IDE 响应的最长秒数
+    start_address accepts unsigned decimal or hexadecimal notation only. Larger
+    ranges are chunked with explicit byte/result/time budgets.
     """
-    # Clamp parameters to safe ranges. The total requested range is not reduced to
-    # the VSIX per-call limit; larger searches are chunked below.
-    search_size = max(1, min(search_size, MAX_MEMORY_SEARCH_SIZE))
-    max_results = max(1, min(max_results, 10000))
-    start_offset = max(0, int(start_offset))
+    # The total requested range is not reduced to the VSIX per-call limit;
+    # larger searches are chunked below. Invalid input is rejected, never changed.
+    search_size = validate_int_range("search_size", search_size, 1, MAX_MEMORY_SEARCH_SIZE)
+    max_results = validate_int_range("max_results", max_results, 1, 10000)
+    start_offset = validate_int_range("start_offset", start_offset, 0, 0x7FFFFFFFFFFFFFFF)
+    start_address = validate_address_literal("start_address", start_address)
+    pattern_format = validate_enum(
+        "pattern_format", pattern_format, ("auto", "hex", "bytes", "text", "ascii", "string")
+    )
     tool_timeout = clamp_tool_timeout(
         timeout_seconds,
         min(MAX_TOOL_TIMEOUT_SECONDS, max(MEMORY_TIMEOUT_SECONDS, ((search_size + MAX_MEMORY_SEARCH_CHUNK_SIZE - 1) // MAX_MEMORY_SEARCH_CHUNK_SIZE) * MEMORY_TIMEOUT_SECONDS))
@@ -149,6 +138,15 @@ async def search_memory(
 
     try:
         if search_size <= MAX_MEMORY_SEARCH_CHUNK_SIZE:
+            call_timeout = remaining_tool_timeout(deadline, MEMORY_TIMEOUT_SECONDS)
+            if call_timeout is None:
+                return handle_ide_error(
+                    ide_bridge.IDEBridgeError(
+                        "Search was not started because the search_memory timeout budget was exhausted",
+                        code="DEADLINE_EXCEEDED_NOT_STARTED",
+                    ),
+                    "search_memory",
+                )
             result = await ide_bridge.call("search_memory", {
                 "startAddress": start_address,
                 "pattern": pattern,
@@ -156,22 +154,29 @@ async def search_memory(
                 "searchSize": search_size,
                 "patternFormat": pattern_format,
                 "startOffset": start_offset
-            }, timeout=remaining_tool_timeout(deadline, MEMORY_TIMEOUT_SECONDS) or 1.0)
+            }, timeout=call_timeout)
             return format_result(result)
 
         matches: List[str] = []
         seen_matches = set()
         chunks: List[Dict[str, Any]] = []
         bytes_searched = 0
-        failed_reads = 0
+        bytes_attempted = 0
+        unreadable_bytes = 0
+        covered_until = 0
         pattern_bytes = None
         status = "ok"
         partial = False
         error = None
+        error_code = None
+        continuation_requires_refresh = False
         offset = 0
         overlap = 0
         continuation_expression = None
         continuation_offset = None
+        continuation_remaining = None
+        pinned_target = None
+        capability = None
 
         while offset < search_size:
             remaining_timeout = remaining_tool_timeout(deadline, MEMORY_TIMEOUT_SECONDS)
@@ -184,14 +189,46 @@ async def search_memory(
             chunk_size = min(MAX_MEMORY_SEARCH_CHUNK_SIZE, search_size - offset)
             absolute_offset = start_offset + offset
             chunk_start = start_address if absolute_offset == 0 else f"{start_address} + byte offset 0x{absolute_offset:X}"
-            chunk_result = await ide_bridge.call("search_memory", {
+            chunk_params = {
                 "startAddress": start_address,
                 "pattern": pattern,
                 "maxResults": max_results - len(matches),
                 "searchSize": chunk_size,
                 "patternFormat": pattern_format,
-                "startOffset": absolute_offset
-            }, timeout=remaining_timeout)
+                "startOffset": absolute_offset,
+            }
+            try:
+                if pinned_target is None:
+                    chunk_result, pinned_target = await ide_bridge.call_with_target(
+                        "search_memory",
+                        chunk_params,
+                        timeout=remaining_timeout,
+                    )
+                else:
+                    chunk_result = await vs_bridge.call_pipe_exact(
+                        pinned_target,
+                        "search_memory",
+                        chunk_params,
+                        timeout=remaining_timeout,
+                    )
+            except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as chunk_error:
+                # Before any progress, retain the normal typed tool-error contract.
+                # After progress, preserve the useful prefix and expose an explicit
+                # continuation instead of discarding all previously captured chunks.
+                if not chunks and covered_until == 0:
+                    raise
+                partial = True
+                status = "partial"
+                error_code = getattr(chunk_error, "code", None) or "QUERY_FAILED"
+                error = f"Search stopped after {bytes_searched} bytes: {chunk_error}"
+                continuation_requires_refresh = error_code in {
+                    "STALE_TARGET",
+                    "STALE_DEBUG_CONTEXT",
+                    "STALE_DEBUG_SESSION",
+                    "TARGET_NOT_FOUND",
+                    "UNAUTHENTICATED",
+                }
+                break
 
             if not isinstance(chunk_result, dict):
                 partial = True
@@ -211,47 +248,122 @@ async def search_memory(
                     if len(matches) >= max_results:
                         break
 
-            bytes_searched += int(chunk_result.get("bytesSearched") or 0)
-            failed_reads += int(chunk_result.get("failedReads") or 0)
+            physical_bytes_searched = max(0, min(
+                chunk_size,
+                int(chunk_result.get("bytesSearched") or 0),
+            ))
+            attempted_value = chunk_result.get("bytesAttempted")
+            physical_bytes_attempted = max(
+                physical_bytes_searched,
+                min(
+                    chunk_size,
+                    int(chunk_size if attempted_value is None else attempted_value),
+                ),
+            )
+            unreadable_value = chunk_result.get("unreadableBytes")
+            if unreadable_value is None:
+                unreadable_value = chunk_result.get("failedReads")
+            if unreadable_value is None:
+                unreadable_value = physical_bytes_attempted - physical_bytes_searched
+            physical_unreadable = max(0, min(physical_bytes_attempted, int(unreadable_value)))
+            physical_end = min(search_size, offset + physical_bytes_searched)
+            newly_covered = max(0, physical_end - max(covered_until, offset))
+            physical_attempt_end = min(search_size, offset + physical_bytes_attempted)
+            newly_attempted = max(
+                newly_covered,
+                physical_attempt_end - max(covered_until, offset),
+            )
+            bytes_searched += newly_covered
+            bytes_attempted += newly_attempted
+            unreadable_bytes += max(0, newly_attempted - newly_covered)
+            covered_until = max(covered_until, physical_end)
             chunk_status = str(chunk_result.get("status") or "unavailable").lower()
             chunk_truncated = bool(chunk_result.get("truncated"))
             chunk_partial = bool(chunk_result.get("partial")) or chunk_status not in ("ok",)
             chunk_error = chunk_result.get("error")
+            chunk_capability = chunk_result.get("capability")
+            if capability is None:
+                capability = chunk_capability
+            elif chunk_capability != capability:
+                capability = "mixed_memory_read_strategies"
             chunks.append({
                 "startAddress": chunk_start,
                 "requestedBytes": chunk_size,
                 "bytesSearched": chunk_result.get("bytesSearched", 0),
+                "bytesAttempted": physical_bytes_attempted,
+                "unreadableBytes": physical_unreadable,
+                "unattemptedBytes": max(0, int(
+                    chunk_result.get("unattemptedBytes")
+                    if chunk_result.get("unattemptedBytes") is not None
+                    else chunk_size - physical_bytes_attempted
+                )),
                 "status": chunk_result.get("status", "unavailable"),
                 "partial": bool(chunk_result.get("partial")),
                 "truncated": chunk_truncated,
                 "nextStartAddress": chunk_result.get("nextStartAddress"),
                 "matchCount": len(chunk_matches),
+                "capability": chunk_capability,
                 "error": chunk_error,
             })
 
             if chunk_truncated:
                 partial = True
                 status = "partial"
-                continuation_expression = chunk_result.get("nextStartAddress") or chunk_start
-                continuation_offset = None
-                error = "Search stopped after reaching max_results; continue from nextStartExpression or increase max_results"
+                backend_next_offset = chunk_result.get("nextStartOffset")
+                try:
+                    backend_next_offset = int(backend_next_offset)
+                except (TypeError, ValueError, OverflowError):
+                    backend_next_offset = None
+                range_end_offset = start_offset + search_size
+                if backend_next_offset is not None and start_offset <= backend_next_offset < range_end_offset:
+                    continuation_expression = start_address
+                    continuation_offset = backend_next_offset
+                    consumed = backend_next_offset - start_offset
+                    continuation_remaining = search_size - consumed
+                    error = (
+                        "Search stopped after reaching max_results; continue with the same "
+                        "start address, nextStartOffset and remainingBytes"
+                    )
+                else:
+                    error_code = "INVALID_BACKEND_CONTINUATION"
+                    error = "Search reached max_results but the debugger returned no valid continuation offset"
                 break
 
-            step = max(1, chunk_size - overlap)
-            next_offset = offset + step
+            next_offset = max(offset + 1, covered_until - overlap)
 
             if chunk_partial:
                 partial = True
                 status = "partial"
                 error = chunk_error or f"Chunk at {chunk_start} was partial"
+                backend_next_offset = chunk_result.get("nextStartOffset")
+                if backend_next_offset is not None:
+                    continuation_expression = start_address
+                    continuation_offset = int(backend_next_offset)
+                    consumed = max(0, continuation_offset - start_offset)
+                    continuation_remaining = max(0, search_size - consumed)
                 break
 
             if len(matches) >= max_results:
                 partial = True
                 status = "partial"
-                continuation_expression = chunk_result.get("nextStartAddress") or start_address
-                continuation_offset = None if chunk_result.get("nextStartAddress") else start_offset + next_offset
-                error = "Search stopped after reaching max_results; continue from nextStartExpression or increase max_results"
+                backend_next_offset = chunk_result.get("nextStartOffset")
+                try:
+                    backend_next_offset = int(backend_next_offset)
+                except (TypeError, ValueError, OverflowError):
+                    backend_next_offset = None
+                range_end_offset = start_offset + search_size
+                if backend_next_offset is not None and start_offset <= backend_next_offset < range_end_offset:
+                    continuation_expression = start_address
+                    continuation_offset = backend_next_offset
+                    consumed = backend_next_offset - start_offset
+                    continuation_remaining = search_size - consumed
+                    error = (
+                        "Search stopped after reaching max_results; continue with the same "
+                        "start address, nextStartOffset and remainingBytes"
+                    )
+                else:
+                    error_code = "INVALID_BACKEND_CONTINUATION"
+                    error = "Search reached max_results but the debugger returned no valid continuation offset"
                 break
 
             offset = next_offset
@@ -262,12 +374,21 @@ async def search_memory(
         if continuation_expression:
             next_start_expression = continuation_expression
             next_start_offset = continuation_offset
-            remaining_bytes = None
-        elif offset < search_size:
+            remaining_bytes = continuation_remaining
+        elif covered_until < search_size:
             next_start_expression = start_address
-            next_start_offset = start_offset + offset
-            remaining_bytes = search_size - offset
+            next_start_offset = start_offset + covered_until
+            remaining_bytes = search_size - covered_until
 
+        unattempted_bytes = max(0, search_size - bytes_attempted)
+        failed_reads = unreadable_bytes
+
+        has_more = next_start_expression is not None and (
+            remaining_bytes is None or remaining_bytes > 0
+        )
+        if not has_more:
+            next_start_expression = None
+            next_start_offset = None
         result = {
             "pattern": pattern,
             "patternFormat": pattern_format,
@@ -276,9 +397,13 @@ async def search_memory(
             "matches": matches,
             "totalFound": len(matches),
             "bytesSearched": bytes_searched,
+            "bytesAttempted": bytes_attempted,
             "requestedBytes": search_size,
             "failedReads": failed_reads,
+            "unreadableBytes": unreadable_bytes,
+            "unattemptedBytes": unattempted_bytes,
             "partial": partial,
+            "capability": capability,
             "chunked": True,
             "chunkSize": MAX_MEMORY_SEARCH_CHUNK_SIZE,
             "chunkCount": len(chunks),
@@ -286,9 +411,14 @@ async def search_memory(
             "nextStartExpression": next_start_expression,
             "nextStartOffset": next_start_offset,
             "remainingBytes": remaining_bytes,
+            "hasMore": has_more,
         }
         if error:
             result["error"] = error
+        if error_code:
+            result["errorCode"] = error_code
+        if continuation_requires_refresh:
+            result["continuationRequiresRefresh"] = True
         return format_result(result)
-    except ide_bridge.IDEBridgeError as e:
+    except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as e:
         return handle_ide_error(e, "search_memory")

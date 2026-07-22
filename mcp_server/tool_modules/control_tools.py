@@ -1,14 +1,113 @@
 from typing import Any, Dict, List, Optional
 import asyncio
+import json
+import re
+from mcp.server.fastmcp.exceptions import ToolError
 
 try:
-    from .. import ide_bridge
-    from ..mcp_app import mcp
+    from .. import vs_bridge
+    from ..tool_runtime import backend as ide_bridge, mcp
     from ..tool_context import *
 except ImportError:
-    import ide_bridge
-    from mcp_app import mcp
+    import vs_bridge
+    from tool_runtime import backend as ide_bridge, mcp
     from tool_context import *
+
+
+@mcp.tool()
+async def get_command_status(
+    request_id: str,
+    target_pipe_name: Optional[str] = None,
+    target_server_instance_id: Optional[str] = None,
+    target_process_id: Optional[int] = None,
+    target_process_start_time_utc_ticks: Optional[int] = None,
+) -> str:
+    """查询一次可能丢失响应的修改型命令是否已在 VS 端完成。"""
+    try:
+        target = _build_recovery_target(
+            target_pipe_name,
+            target_server_instance_id,
+            target_process_id,
+            target_process_start_time_utc_ticks,
+        )
+        result = await (
+            vs_bridge.call_pipe_exact(target, "get_request_status", {"requestId": request_id}, timeout=10.0)
+            if target else
+            ide_bridge.call("get_request_status", {"requestId": request_id}, timeout=10.0, preferred_ide="vs")
+        )
+        return format_result(result)
+    except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as e:
+        return handle_ide_error(e, "get_command_status")
+
+
+@mcp.tool()
+async def cancel_debug_request(
+    request_id: str,
+    target_pipe_name: Optional[str] = None,
+    target_server_instance_id: Optional[str] = None,
+    target_process_id: Optional[int] = None,
+    target_process_start_time_utc_ticks: Optional[int] = None,
+) -> str:
+    """请求取消尚未完成的 VS 调试请求；已开始的修改操作会返回结果未知语义。"""
+    try:
+        target = _build_recovery_target(
+            target_pipe_name,
+            target_server_instance_id,
+            target_process_id,
+            target_process_start_time_utc_ticks,
+        )
+        result = await (
+            vs_bridge.call_pipe_exact(target, "cancel_request", {"requestId": request_id}, timeout=10.0)
+            if target else
+            ide_bridge.call("cancel_request", {"requestId": request_id}, timeout=10.0, preferred_ide="vs")
+        )
+        return format_result(result)
+    except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as e:
+        return handle_ide_error(e, "cancel_debug_request")
+
+
+def _build_recovery_target(
+    pipe_name: Optional[str],
+    server_instance_id: Optional[str],
+    process_id: Optional[int],
+    process_start_time_utc_ticks: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    def invalid(message: str) -> ToolError:
+        return ToolError(json.dumps({
+            "code": "INVALID_ARGUMENT",
+            "message": message,
+            "retryable": False,
+            "outcomeUnknown": False,
+        }, ensure_ascii=False, separators=(",", ":")))
+
+    values = (pipe_name, server_instance_id, process_id, process_start_time_utc_ticks)
+    if not any(value is not None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise invalid("Exact recovery requires all target identity fields from the original error")
+    if (
+        isinstance(process_id, bool)
+        or not isinstance(process_id, int)
+        or process_id <= 0
+        or process_id > 0xFFFFFFFF
+        or isinstance(process_start_time_utc_ticks, bool)
+        or not isinstance(process_start_time_utc_ticks, int)
+        or process_start_time_utc_ticks <= 0
+        or process_start_time_utc_ticks > 0x7FFFFFFFFFFFFFFF
+    ):
+        raise invalid("Invalid recovery target process identity")
+    if not isinstance(pipe_name, str) or pipe_name != f"AIDebuggerVS_{process_id}":
+        raise invalid("Recovery target pipe name does not match its process id")
+    if not isinstance(server_instance_id, str) or not re.fullmatch(r"[0-9a-f]{32}", server_instance_id):
+        raise invalid("Recovery target server instance id is invalid")
+    return {
+        "pipeName": pipe_name,
+        "serverInstanceId": server_instance_id,
+        "processId": process_id,
+        "processStartTimeUtcTicks": process_start_time_utc_ticks,
+    }
+
+
 @mcp.tool()
 async def attach_process(
     process_id: Optional[int] = None,
@@ -22,13 +121,31 @@ async def attach_process(
     attach_process(process_id=12345)
     """
     try:
-        result = await ide_bridge.call("attach_process", {
-            "processId": process_id or 0,
-            "processName": process_name
-        }, preferred_ide="vs")
+        result = await ide_bridge.call(
+            "attach_process",
+            _build_attach_process_params(process_id, process_name),
+            preferred_ide="vs",
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "attach_process")
+
+
+def _build_attach_process_params(
+    process_id: Optional[int],
+    process_name: Optional[str],
+) -> dict:
+    if (process_id is None) == (process_name is None):
+        raise ide_bridge.IDEBridgeError(
+            "Exactly one of process_id or process_name is required.",
+            code="INVALID_ARGUMENT",
+        )
+    params = {}
+    if process_id is not None:
+        params["processId"] = validate_int_range("process_id", process_id, 1, 0x7FFFFFFF)
+    if process_name is not None:
+        params["processName"] = validate_nonempty_string("process_name", process_name, 1024)
+    return params
 
 @mcp.tool()
 async def start_debugging(
@@ -46,14 +163,41 @@ async def start_debugging(
     try:
         wait_timeout = clamp_tool_timeout(timeout_seconds, START_DEBUGGING_TIMEOUT_SECONDS)
         deadline = asyncio.get_running_loop().time() + wait_timeout
-        result = await ide_bridge.call("start_debugging", {
-            "executablePath": executable_path,
-            "workingDirectory": working_dir,
-            "arguments": args,
-            "attach": attach
-        }, timeout=wait_timeout, preferred_ide="vs")
-        remaining_timeout = max(1.0, deadline - asyncio.get_running_loop().time())
-        result = await wait_for_debugging_to_start(result, remaining_timeout, attach)
+        launch_params = {}
+        if executable_path is None:
+            if working_dir is not None or args is not None or attach is not True:
+                raise ide_bridge.IDEBridgeError(
+                    "working_dir, args, and attach are valid only with a non-dump executable_path.",
+                    code="INVALID_ARGUMENT",
+                )
+        else:
+            normalized_executable = validate_nonempty_string("executable_path", executable_path, 32768)
+            is_dump = normalized_executable.lower().endswith((".dmp", ".mdmp", ".hdmp"))
+            if is_dump:
+                if working_dir is not None or args is not None or attach is not True:
+                    raise ide_bridge.IDEBridgeError(
+                        "Dump debugging does not accept working_dir, args, or attach overrides.",
+                        code="INVALID_ARGUMENT",
+                    )
+                launch_params["executablePath"] = normalized_executable
+            else:
+                launch_params["executablePath"] = normalized_executable
+                if working_dir is not None:
+                    launch_params["workingDirectory"] = validate_nonempty_string("working_dir", working_dir, 32768)
+                if args is not None:
+                    launch_params["arguments"] = args
+                launch_params["attach"] = attach
+        result, target = await ide_bridge.call_with_target(
+            "start_debugging", launch_params, timeout=wait_timeout, preferred_ide="vs"
+        )
+        remaining_timeout = max(0.0, deadline - asyncio.get_running_loop().time())
+        instance_target = vs_bridge.instance_target(target)
+        result = await wait_for_debugging_to_start(
+            result,
+            remaining_timeout,
+            attach,
+            target=instance_target,
+        )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "start_debugging")
@@ -96,6 +240,12 @@ async def debug_control(action: str) -> str:
     }
     normalized = aliases.get(normalized, normalized)
 
+    normalized = validate_enum(
+        "action",
+        normalized,
+        ("continue", "break", "stop", "step_over", "step_into", "step_out", "detach"),
+    )
+
     if normalized == "continue":
         return await debug_continue()
     if normalized == "break":
@@ -111,14 +261,7 @@ async def debug_control(action: str) -> str:
     if normalized == "detach":
         return await detach_process()
 
-    return format_result({
-        "action": action,
-        "success": False,
-        "message": (
-            "Unsupported debug_control action. Use one of: continue, pause, "
-            "break, stop, step_over, step_into, step_out, detach."
-        ),
-    })
+    raise AssertionError("validated debug_control action was not dispatched")
 
 @mcp.tool()
 async def debug_continue() -> str:
@@ -155,8 +298,8 @@ async def continue_and_wait_for_break(
     include_registers: bool = False,
     include_output: bool = False,
     include_threads: bool = True,
-    include_exception: bool = True,
-    allow_side_effects: bool = False,
+    include_exception: bool = False,
+    evaluation_policy: str = "engine_default",
     thread_include_frames: bool = True,
     thread_max_frames_per_thread: Optional[int] = None,
     thread_max_nodes: Optional[int] = None,
@@ -174,12 +317,15 @@ async def continue_and_wait_for_break(
         max_depth: 表达式展开深度，默认2
         output_tail_lines: Debug Output 末尾行数，默认80
         include_locals/include_modules/include_registers/include_output: 命中后是否抓取重组件，默认False
-        include_threads/include_exception: 命中后是否抓取线程/异常，默认True
-        allow_side_effects: 兼容旧客户端的参数；当前不会因函数调用形态预先拒绝表达式
+        include_threads: 命中后是否抓取预算化线程，默认True
+        include_exception: 命中后是否通过 unsafe evaluation 抓取异常，默认False
+        evaluation_policy: VS 当前仅支持 engine_default；不承诺无副作用
         thread_include_frames/thread_max_frames_per_thread/thread_max_nodes/thread_budget_ms: 命中后线程帧抓取预算
     """
-    timeout_seconds = max(1, min(timeout_seconds, 1800))
-    poll_interval_ms = max(50, min(poll_interval_ms, 1000))
+    timeout_seconds = validate_int_range("timeout_seconds", timeout_seconds, 1, 1800)
+    poll_interval_ms = validate_int_range("poll_interval_ms", poll_interval_ms, 50, 1000)
+    max_depth = validate_int_range("max_depth", max_depth, 0, 4)
+    output_tail_lines = validate_int_range("output_tail_lines", output_tail_lines, 0, 500)
     normalized_expressions = expressions or []
     try:
         params = add_thread_capture_params({
@@ -195,10 +341,22 @@ async def continue_and_wait_for_break(
             "includeOutput": include_output,
             "includeThreads": include_threads,
             "includeException": include_exception,
-            "allowSideEffects": allow_side_effects,
+            "evaluationPolicy": evaluation_policy,
         }, thread_include_frames, thread_max_frames_per_thread, thread_max_nodes, thread_budget_ms)
+        backend_method = "continue_and_wait_for_break_safe" if use_vs_safe_backend(
+            normalized_expressions,
+            include_locals=include_locals,
+            include_registers=include_registers,
+            include_exception=include_exception,
+        ) else "continue_and_wait_for_break"
+        if backend_method == "continue_and_wait_for_break_safe":
+            for unsafe_parameter in (
+                "expressions", "expandChildren", "maxDepth", "evaluationPolicy",
+                "includeLocals", "includeRegisters", "includeException",
+            ):
+                params.pop(unsafe_parameter, None)
         result = await ide_bridge.call(
-            "continue_and_wait_for_break",
+            backend_method,
             params,
             timeout=float(timeout_seconds + tool_timeout_for_budget(None, 15.0, thread_budget_ms)),
         )
@@ -221,16 +379,16 @@ async def continue_and_capture_native(
     normalized current address, registers, nearby disassembly, stack memory,
     callstack, and optionally loaded modules.
     """
-    timeout_seconds = max(1, min(timeout_seconds, 1800))
-    poll_interval_ms = max(50, min(poll_interval_ms, 1000))
+    timeout_seconds = validate_int_range("timeout_seconds", timeout_seconds, 1, 1800)
+    poll_interval_ms = validate_int_range("poll_interval_ms", poll_interval_ms, 50, 1000)
     try:
         result = await ide_bridge.call(
             "continue_and_capture_native",
             {
                 "timeoutMs": timeout_seconds * 1000,
                 "pollIntervalMs": poll_interval_ms,
-                "disassemblyCount": max(1, min(disassembly_count, 256)),
-                "stackBytes": max(16, min(stack_bytes, 4096)),
+                "disassemblyCount": validate_int_range("disassembly_count", disassembly_count, 1, 256),
+                "stackBytes": validate_int_range("stack_bytes", stack_bytes, 16, 4096),
                 "includeModules": include_modules,
             },
             timeout=float(timeout_seconds + NATIVE_CONTEXT_TIMEOUT_SECONDS),

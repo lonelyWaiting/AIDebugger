@@ -4,7 +4,7 @@
   "mcpServers": {
     "AIDebuggerVS": {
       "command": "python",
-      "args": ["<auto-detected-by-extension>/mcp_server/server.py"],
+      "args": ["<user-home>/.ai-debugger/mcp_server_vs/vs_server.py"],
       "env": {
         "AIDB_PREFERRED_IDE": "vs"
       }

@@ -1,0 +1,72 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+    <PackageReference Include="MSTest" Version="4.3.2" />
+    <Reference Include="System.Web.Extensions" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="..\mcp_server\debug_method_manifest.json">
+      <Link>Production\DebugMethodManifest.json</Link>
+      <LogicalName>VSDebuggerMCP.Protocol.DebugMethodManifest.json</LogicalName>
+    </EmbeddedResource>
+    <Compile Include="..\VSDebuggerMCP\JsonConfigEditor.cs" Link="Production\JsonConfigEditor.cs" />
+    <Compile Include="..\VSDebuggerMCP\Registration\BundlePathPolicy.cs" Link="Production\BundlePathPolicy.cs" />
+    <Compile Include="..\VSDebuggerMCP\Registration\BundleSignature.cs" Link="Production\BundleSignature.cs" />
+    <Compile Include="..\VSDebuggerMCP\Registration\ConfigPathPolicy.cs" Link="Production\ConfigPathPolicy.cs" />
+    <Compile Include="..\VSDebuggerMCP\Registration\TomlConfigEditor.cs" Link="Production\TomlConfigEditor.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\LengthPrefixedFrameCodec.cs" Link="Production\LengthPrefixedFrameCodec.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\LongRunningDebugOperationGate.cs" Link="Production\LongRunningDebugOperationGate.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\PipeSecurityFactory.cs" Link="Production\PipeSecurityFactory.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\ProcessIntegrityValidator.cs" Link="Production\ProcessIntegrityValidator.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\AuthenticodeTrustValidator.cs" Link="Production\AuthenticodeTrustValidator.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\CommandResultStore.cs" Link="Production\CommandResultStore.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\ClientLaneRecovery.cs" Link="Production\ClientLaneRecovery.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\ActiveRequest.cs" Link="Production\ActiveRequest.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\DebugRequestSchemaValidator.cs" Link="Production\DebugRequestSchemaValidator.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\DebuggerParameterValidationException.cs" Link="Production\DebuggerParameterValidationException.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\DebuggerExceptions.cs" Link="Production\DebuggerExceptions.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\SearchPatternParser.cs" Link="Production\SearchPatternParser.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\StrictJsonRequestValidator.cs" Link="Production\StrictJsonRequestValidator.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\DebugSessionActor.cs" Link="Production\DebugSessionActor.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\RequestOutcomePolicy.cs" Link="Production\RequestOutcomePolicy.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\OperationResultPolicy.cs" Link="Production\OperationResultPolicy.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\CommandResponseCompactor.cs" Link="Production\CommandResponseCompactor.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\ControlRequestValidator.cs" Link="Production\ControlRequestValidator.cs" />
+    <Compile Include="..\VSDebuggerMCP\DebuggerRequestContext.cs" Link="Production\DebuggerRequestContext.cs" />
+    <Compile Include="..\VSDebuggerMCP\Protocol\DebugModels.cs" Link="Production\DebugModels.cs" />
+    <Compile Include="..\VSDebuggerMCP\Protocol\DebugRequest.cs" Link="Production\DebugRequest.cs" />
+    <Compile Include="..\VSDebuggerMCP\Protocol\DebugResponse.cs" Link="Production\DebugResponse.cs" />
+    <Compile Include="..\VSDebuggerMCP\Protocol\DebugResponseJsonSerializer.cs" Link="Production\DebugResponseJsonSerializer.cs" />
+    <Compile Include="..\VSDebuggerMCP\Protocol\DebugMethodCatalog.cs" Link="Production\DebugMethodCatalog.cs" />
+    <Compile Include="..\VSDebuggerMCP\Protocol\CanonicalJson.cs" Link="Production\CanonicalJson.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\BuildErrorCodeParser.cs" Link="Production\BuildErrorCodeParser.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\BuildErrorCaptureBudget.cs" Link="Production\BuildErrorCaptureBudget.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\BreakpointCaptureBudget.cs" Link="Production\BreakpointCaptureBudget.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\CancelableSingleFlight.cs" Link="Production\CancelableSingleFlight.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\ManagedInspectionJob.cs" Link="Production\ManagedInspectionJob.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\ManagedInspectionProcess.cs" Link="Production\ManagedInspectionProcess.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\ProcessLaunchBoundary.cs" Link="Production\ProcessLaunchBoundary.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\OutputContentBudget.cs" Link="Production\OutputContentBudget.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\OutputSearchBudget.cs" Link="Production\OutputSearchBudget.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\CallStackCaptureBudget.cs" Link="Production\CallStackCaptureBudget.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\CompositeCaptureBudget.cs" Link="Production\CompositeCaptureBudget.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\VariableCaptureBudget.cs" Link="Production\VariableCaptureBudget.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\ThreadCaptureBudget.cs" Link="Production\ThreadCaptureBudget.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\TargetArchitecture.cs" Link="Production\TargetArchitecture.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\RegisterCapturePolicy.cs" Link="Production\RegisterCapturePolicy.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\SnapshotCompletenessPolicy.cs" Link="Production\SnapshotCompletenessPolicy.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\ModuleCaptureBudget.cs" Link="Production\ModuleCaptureBudget.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\ModuleSnapshotPager.cs" Link="Production\ModuleSnapshotPager.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\ExceptionCaptureBudget.cs" Link="Production\ExceptionCaptureBudget.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\UiOperationAdmission.cs" Link="Production\UiOperationAdmission.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\tests\fixtures\ManagedInspectionEdgeCases\ManagedInspectionEdgeCases.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+</Project>
