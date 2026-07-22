@@ -67,6 +67,7 @@ Important semantic differences:
 |---|---|---|
 | Output | Multiple named panes | Debug console only |
 | Watch | Persists in the VS Watch window | Evaluate-only |
+| Same-session process selection | Enumerates `Debugger.DebuggedProcesses`; `switch_process` selects an existing PID while paused | No equivalent multi-process selection contract exposed |
 | Source location | Official debugger document context; explicit unavailable status when absent | Rider debugger position APIs |
 | Native/dump inspection | VS-specific native, memory, disassembly, module, and dump workflows | Capability-dependent and more limited |
 | Command recovery | AIDB/2 request ledger and exact target handle | Rider-specific transport semantics |
@@ -83,8 +84,8 @@ are not used as substitutes. A frame reports `sourceLocationStatus` and omits
 default file/line fields when no authoritative context exists.
 
 Multi-slice results report snapshot stability. Debug context handles become
-stale after continue, step, stop, thread/frame changes, unsafe evaluation, or a
-new debug session. A stale handle produces a typed error instead of silently
+stale after continue, step, stop, process/thread/frame changes, unsafe
+evaluation, or a new debug session. A stale handle produces a typed error instead of silently
 reading a different context.
 
 ## Validation gates

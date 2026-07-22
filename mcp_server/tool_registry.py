@@ -77,6 +77,7 @@ VS_ONLY_BACKEND_METHODS = frozenset({
     "continue_and_capture_native",
     "continue_and_wait_for_break_safe",
     "get_breakpoint_bindings",
+    "get_debug_processes",
     "get_module_layout",
     "get_request_status",
     "cancel_request",
@@ -88,6 +89,7 @@ VS_ONLY_BACKEND_METHODS = frozenset({
     "set_data_breakpoint",
     "set_watchpoint",
     "start_debugging",
+    "switch_process",
 })
 
 METHOD_BACKENDS: Dict[str, Tuple[str, ...]] = {
@@ -275,6 +277,10 @@ TOOLS: Dict[str, ToolSpec] = {
 
     # Execution control
     "attach_process": _spec("attach_process", "control", "attach_process", timeout_class="control"),
+    "get_debug_processes": _spec("get_debug_processes", "control", "get_debug_processes", timeout_class="control"),
+    "list_debug_processes": _spec("list_debug_processes", "control", "get_debug_processes", timeout_class="control", alias_for="get_debug_processes"),
+    "switch_process": _spec("switch_process", "control", "switch_process", timeout_class="control"),
+    "select_process": _spec("select_process", "control", "switch_process", timeout_class="control", alias_for="switch_process"),
     "start_debugging": _spec("start_debugging", "control", "start_debugging", timeout_class="start_debugging"),
     "debug_control": _spec("debug_control", "control", "continue", "step_over", "step_into", "step_out", "break", "stop", "detach"),
     "debug_continue": _spec("debug_continue", "control", "continue"),

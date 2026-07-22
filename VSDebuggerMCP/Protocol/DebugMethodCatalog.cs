@@ -51,7 +51,7 @@ namespace VSDebuggerMCP.Protocol
             "get_disassembly_at", "get_exception", "get_full_context", "get_locals", "get_registers",
             "read_memory", "resolve_address", "search_memory", "set_address_breakpoint", "set_data_breakpoint",
             "run_to_cursor", "set_next_statement", "set_watchpoint", "step_into", "step_out", "step_over",
-            "switch_stack_frame", "switch_thread",
+            "switch_process", "switch_stack_frame", "switch_thread",
         };
 
         private static readonly HashSet<string> RunningState = new HashSet<string>(StringComparer.Ordinal)
@@ -62,7 +62,7 @@ namespace VSDebuggerMCP.Protocol
         private static readonly HashSet<string> DebuggingState = new HashSet<string>(StringComparer.Ordinal)
         {
             "continue_and_capture_breakpoint", "continue_and_capture_native",
-            "continue_and_wait_for_break", "continue_and_wait_for_break_safe", "detach", "stop",
+            "continue_and_wait_for_break", "continue_and_wait_for_break_safe", "detach", "get_debug_processes", "stop",
         };
 
         private static readonly HashSet<string> LongRunningWait = new HashSet<string>(StringComparer.Ordinal)
@@ -227,6 +227,8 @@ namespace VSDebuggerMCP.Protocol
             Add(specs, "continue_and_capture_breakpoint", "", "timeoutMs pollIntervalMs disassemblyCount stackBytes includeNative includeModules includeThreads includeBreakpoints threadIncludeFrames threadMaxFramesPerThread threadMaxNodes threadBudgetMs");
             Add(specs, "get_full_context", "", "threadIncludeFrames threadMaxFramesPerThread threadMaxNodes threadBudgetMs");
             Add(specs, "attach_process", "", "processId processName");
+            Add(specs, "get_debug_processes", "", "startIndex maxNodes budgetMs");
+            Add(specs, "switch_process", "processId", "processLookupBudgetMs");
             Add(specs, "start_debugging", "", "executablePath workingDirectory arguments attach");
             Add(specs, "step_into step_over step_out", "", "waitTimeoutMs");
             Add(specs, "continue_and_wait_for_break", "", "expressions expandChildren maxDepth evaluationPolicy outputTailLines timeoutMs pollIntervalMs includeLocals includeModules includeRegisters includeOutput includeThreads includeException threadIncludeFrames threadMaxFramesPerThread threadMaxNodes threadBudgetMs");

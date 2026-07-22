@@ -514,6 +514,30 @@ class ThreadsPayload(StrictPayload):
     error: Optional[str] = None
 
 
+class DebugProcessInfoPayload(StrictPayload):
+    processId: int
+    name: str
+    isCurrent: bool
+    programCount: int
+
+
+class DebugProcessesPayload(StrictPayload):
+    processes: List[DebugProcessInfoPayload]
+    currentProcessId: int
+    capability: str
+    behavior: str
+    totalAvailable: int
+    startIndex: int
+    nextIndex: int
+    hasMore: bool
+    partial: bool
+    snapshotStable: bool
+    snapshotStatus: str
+    maxNodes: int
+    budgetMs: int
+    error: Optional[str] = None
+
+
 class ModulesPayload(StrictPayload):
     modules: List[ModulePayload]
     totalCount: int
@@ -1038,6 +1062,8 @@ _MODEL_BY_TOOL: Dict[str, Type[StrictPayload]] = {
     "evaluate_expressions_batch": BatchEvaluationPayload,
     "get_threads": ThreadsPayload,
     "list_threads": ThreadsPayload,
+    "get_debug_processes": DebugProcessesPayload,
+    "list_debug_processes": DebugProcessesPayload,
     "get_modules": ModulesPayload,
     "get_exception": ExceptionPayload,
     "get_build_errors": BuildErrorsPayload,
@@ -1068,7 +1094,7 @@ _MODEL_BY_TOOL: Dict[str, Type[StrictPayload]] = {
     "get_registers": RegistersPayload,
     "add_watch": WatchPayload,
     **{name: ProcessDebugPayload for name in (
-        "attach_process", "start_debugging",
+        "attach_process", "start_debugging", "switch_process", "select_process",
     )},
     **{name: DebugControlPayload for name in (
         "debug_control", "debug_continue", "continue",

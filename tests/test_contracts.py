@@ -361,6 +361,10 @@ print(json.dumps({
         for tool_name in (
             "debug_capabilities",
             "attach_process",
+            "get_debug_processes",
+            "list_debug_processes",
+            "switch_process",
+            "select_process",
             "start_debugging",
             "debug_control",
             'name="continue"',
@@ -424,6 +428,8 @@ print(json.dumps({
 
         for method_name in (
             '"attach_process"',
+            '"get_debug_processes"',
+            '"switch_process"',
             '"start_debugging"',
             '"clear_breakpoint"',
             '"set_data_breakpoint"',
@@ -437,6 +443,11 @@ print(json.dumps({
         self.assertNotIn('"set_logpoint"', vs_pipe)
         for symbol in (
             "AttachProcess",
+            "GetDebugProcesses",
+            "SwitchProcess",
+            "debugger.DebuggedProcesses",
+            "debugger.CurrentProcess = targetProcess",
+            '_sessionTracker.InvalidateContext("switch_process")',
             "StartDebugging",
             "Detach",
             "process.Detach(false)",
@@ -449,6 +460,8 @@ print(json.dumps({
         self.assertNotIn("SetLogpoint", vs_service)
         self.assertIn("ProcessDebugResult", vs_models)
         self.assertIn("KnownType(typeof(ProcessDebugResult))", vs_response)
+        self.assertIn("DebugProcessesResult", vs_models)
+        self.assertIn("KnownType(typeof(DebugProcessesResult))", vs_response)
 
     def test_no_source_native_tools_are_exposed_without_patch_surface(self) -> None:
         server_py = read("mcp_server/server.py")
@@ -2090,6 +2103,8 @@ print(json.dumps({
         self.assertEqual([], registry.validate_tool_specs(vs_methods, rider_methods, tool_names))
         self.assertEqual("vs", registry.preferred_ide_for_backend_method("attach_process"))
         self.assertEqual("vs", registry.preferred_ide_for_backend_method("start_debugging"))
+        self.assertEqual("vs", registry.preferred_ide_for_backend_method("get_debug_processes"))
+        self.assertEqual("vs", registry.preferred_ide_for_backend_method("switch_process"))
         self.assertIsNone(registry.preferred_ide_for_backend_method("delete_breakpoint"))
         self.assertEqual("delete_breakpoint", registry.TOOLS["clear_breakpoint"].alias_for)
         self.assertEqual("set_data_breakpoint", registry.TOOLS["set_watchpoint"].alias_for)
@@ -2103,6 +2118,9 @@ print(json.dumps({
         self.assertEqual(["rider"], summary["toolSupport"]["detach_process"]["unsupportedBackends"])
         self.assertEqual(["vs"], summary["toolSupport"]["detach_process"]["supportedBackends"])
         self.assertIn("detach_process", summary["vsOnlyTools"])
+        self.assertIn("switch_process", summary["vsOnlyTools"])
+        self.assertEqual(["vs"], summary["toolSupport"]["get_debug_processes"]["supportedBackends"])
+        self.assertEqual(["vs"], summary["toolSupport"]["switch_process"]["routableBackends"])
 
         from mcp_server.tool_modules import capability_tools
 
@@ -2113,9 +2131,20 @@ print(json.dumps({
     def test_vs_only_active_debugging_tools_do_not_route_to_rider(self) -> None:
         server_py = read("mcp_server/server.py")
 
-        for tool_name in ("attach_process", "start_debugging", "detach_process"):
+        for tool_name in (
+            "attach_process", "get_debug_processes", "switch_process",
+            "start_debugging", "detach_process",
+        ):
             with self.subTest(tool_name=tool_name):
                 self.assertIn('preferred_ide="vs"', function_source(server_py, tool_name))
+
+        for alias_name, canonical_name in (
+            ("list_debug_processes", "get_debug_processes"),
+            ("select_process", "switch_process"),
+        ):
+            alias = function_source(server_py, alias_name)
+            self.assertIn(f"return await {canonical_name}(", alias)
+            self.assertNotIn("ide_bridge.call", alias)
 
         clear_breakpoint = function_source(server_py, "clear_breakpoint")
         self.assertIn("return await delete_breakpoint(file_path, line_number)", clear_breakpoint)

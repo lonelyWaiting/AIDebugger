@@ -131,6 +131,90 @@ async def attach_process(
         return handle_ide_error(e, "attach_process")
 
 
+@mcp.tool()
+async def get_debug_processes(
+    start_index: int = 0,
+    max_nodes: Optional[int] = None,
+    budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+) -> str:
+    """
+    List processes already participating in the current Visual Studio debug session.
+
+    Use the returned processId with switch_process. This never lists unattached
+    local processes and never starts or attaches to another process.
+    """
+    try:
+        params = add_bounded_collection_params({}, start_index, max_nodes, budget_ms)
+        result = await ide_bridge.call(
+            "get_debug_processes",
+            params,
+            preferred_ide="vs",
+            timeout=tool_timeout_for_budget(
+                timeout_seconds, THREADS_TIMEOUT_SECONDS, budget_ms
+            ),
+        )
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_debug_processes")
+
+
+@mcp.tool()
+async def list_debug_processes(
+    start_index: int = 0,
+    max_nodes: Optional[int] = None,
+    budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+) -> str:
+    """Alias for get_debug_processes."""
+    return await get_debug_processes(start_index, max_nodes, budget_ms, timeout_seconds)
+
+
+@mcp.tool()
+async def switch_process(
+    process_id: int,
+    process_lookup_budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+) -> str:
+    """
+    Switch the current target process inside the same paused Visual Studio debug session.
+
+    Call get_debug_processes first. The target PID must already be present in
+    Debugger.DebuggedProcesses; this tool never attaches to a new process.
+    """
+    try:
+        params = {
+            "processId": validate_int_range(
+                "process_id", process_id, 1, 0x7FFFFFFF
+            )
+        }
+        if process_lookup_budget_ms is not None:
+            params["processLookupBudgetMs"] = validate_int_range(
+                "process_lookup_budget_ms", process_lookup_budget_ms, 0, 120000
+            )
+        result = await ide_bridge.call(
+            "switch_process",
+            params,
+            preferred_ide="vs",
+            timeout=tool_timeout_for_budget(
+                timeout_seconds, THREADS_TIMEOUT_SECONDS, process_lookup_budget_ms
+            ),
+        )
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "switch_process")
+
+
+@mcp.tool()
+async def select_process(
+    process_id: int,
+    process_lookup_budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+) -> str:
+    """Alias for switch_process."""
+    return await switch_process(process_id, process_lookup_budget_ms, timeout_seconds)
+
+
 def _build_attach_process_params(
     process_id: Optional[int],
     process_name: Optional[str],

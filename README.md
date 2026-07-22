@@ -63,8 +63,9 @@ Important files:
 - `Protocol/DebugModels.cs` - response models shared with the bridge contract tests.
 
 Visual Studio has the richest backend. VS-only tools include attach/start,
-detach, data/address breakpoints, native address/module inspection, managed IL
-inspection, and hybrid no-source capture flows.
+same-session debug-process enumeration/selection, detach, data/address
+breakpoints, native address/module inspection, managed IL inspection, and
+hybrid no-source capture flows.
 
 ### Rider Plugin
 
@@ -79,8 +80,9 @@ Important files:
 - `protocol/DebugModels.kt` - response models aligned with the VS contracts.
 
 Rider supports the common snapshot, stepping, breakpoint, memory, disassembly,
-and stop flows. Rider detach and the VS-only no-source/native-managed tools are
-not exposed as supported Rider backends.
+and stop flows. Rider detach, same-session multi-process selection, and the
+VS-only no-source/native-managed tools are not exposed as supported Rider
+backends.
 
 ### Python MCP Server
 
@@ -113,8 +115,8 @@ assuming a fixed flat tool list.
 
 ## Tool Domains
 
-The combined entry point exposes 79 MCP tools. The VS-only entry point exposes
-63 canonical tools by default: cross-IDE selectors and deprecated compatibility
+The combined entry point exposes 83 MCP tools. The VS-only entry point exposes
+65 canonical tools by default: cross-IDE selectors and deprecated compatibility
 aliases are omitted. Set `AIDB_ENABLE_LEGACY_ALIASES=1` only for migration.
 The registry in `mcp_server/tool_registry.py` is the source of truth for tool
 names, aliases, backend support, and timeout classes. Backend method kind and
@@ -160,6 +162,8 @@ captured in one immutable snapshot; they never silently start another scan.
 ### Execution Control
 
 - `attach_process` (Visual Studio only)
+- `get_debug_processes`, `list_debug_processes` (Visual Studio only)
+- `switch_process`, `select_process` (Visual Studio only)
 - `start_debugging` (Visual Studio only)
 - `debug_control`
 - `debug_continue`, `continue`
@@ -174,8 +178,13 @@ captured in one immutable snapshot; they never silently start another scan.
 - `debug_run_to_cursor`
 - `debug_set_next_statement`
 
-For Rider, use stop tools to terminate the current debugging session; detach is
-not advertised as supported.
+`get_debug_processes` lists only processes already in the current Visual Studio
+debug session. While paused, pass one returned PID to `switch_process`; it does
+not enumerate ordinary local processes or attach a new target. The switch
+invalidates previously captured thread/frame context handles.
+
+For Rider, use stop tools to terminate the current debugging session; detach and
+same-session multi-process switching are not advertised as supported.
 
 ### Breakpoints and Navigation
 
@@ -363,10 +372,12 @@ It never downloads packages with `pip`.
 2. Invoke **Tools > Start AIDebugger MCP Server** (and run the setup command once).
 3. Start or attach to a debug session.
 4. Ask the MCP client to call `detect_debug_sessions`.
-5. Use `debug_capabilities` when unsure which tool is appropriate.
-6. For repro loops, use `continue_and_wait_for_break` or the more focused
+5. In a multi-process Visual Studio session, call `get_debug_processes` and then
+   `switch_process(process_id)` while paused before reading target-specific state.
+6. Use `debug_capabilities` when unsure which tool is appropriate.
+7. For repro loops, use `continue_and_wait_for_break` or the more focused
    `continue_and_capture_*` tools.
-7. For first-pass crash/bug diagnosis, prefer `capture_debug_bundle()` in its
+8. For first-pass crash/bug diagnosis, prefer `capture_debug_bundle()` in its
    default low-blocking mode and opt in to heavier data only when needed.
 
 When multiple Visual Studio instances are running through the VS-only entry,

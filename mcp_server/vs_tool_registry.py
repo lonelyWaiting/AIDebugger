@@ -23,6 +23,8 @@ LEGACY_ALIASES = {
     "clear_breakpoint": "delete_breakpoint",
     "select_stack_frame": "switch_stack_frame",
     "select_thread": "switch_thread",
+    "list_debug_processes": "get_debug_processes",
+    "select_process": "switch_process",
 }
 
 VS_TOOL_DOMAINS: Dict[str, List[str]] = {
@@ -43,7 +45,8 @@ VS_TOOL_DOMAINS: Dict[str, List[str]] = {
         "capture_hybrid_context",
     ],
     "control": [
-        "get_command_status", "cancel_debug_request", "attach_process", "start_debugging",
+        "get_command_status", "cancel_debug_request", "attach_process", "get_debug_processes",
+        "list_debug_processes", "switch_process", "select_process", "start_debugging",
         "debug_control", "debug_continue", "continue", "continue_and_wait_for_break",
         "continue_and_capture_native", "debug_step_over", "step_over", "debug_step_into",
         "step_into", "debug_step_out", "step_out", "debug_break", "pause", "debug_stop",

@@ -269,6 +269,8 @@ class VSBridgeResponseTests(unittest.TestCase):
         self.assertEqual("debug.evaluate.unsafe", tool_registry.backend_method_capability("evaluate_expression"))
         self.assertEqual("debug.memory.read", tool_registry.backend_method_capability("read_memory"))
         self.assertEqual("debug.context.write", tool_registry.backend_method_capability("switch_thread"))
+        self.assertEqual("debug.read", tool_registry.backend_method_capability("get_debug_processes"))
+        self.assertEqual("debug.context.write", tool_registry.backend_method_capability("switch_process"))
         self.assertEqual("server.control", tool_registry.backend_method_capability("cancel_request"))
         self.assertEqual("command", tool_registry.backend_method_kind("cancel_request"))
         cancel_annotations = vs_tool_registry.tool_annotation_values("cancel_debug_request")

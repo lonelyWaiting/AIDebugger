@@ -140,6 +140,10 @@ def _categories_with_registry_coverage(registry: Dict[str, Any]) -> Dict[str, Li
             "get_disassembly_at",
         ],
         "navigation": [
+            "get_debug_processes",
+            "list_debug_processes",
+            "switch_process",
+            "select_process",
             "get_threads",
             "list_threads",
             "switch_thread",
@@ -208,6 +212,7 @@ def _recommended_workflow_for_access(effective_instance: Optional[Dict[str, Any]
         return [
             "detect_debug_sessions(prefer_ide='vs') or list_vs_instances()",
             "attach_process(...) or start_debugging(...) if no debug session is active",
+            "Visual Studio multi-process session: get_debug_processes(), then switch_process(process_id) while paused",
             "set_breakpoint(...) / set_function_breakpoint(...) / set_data_breakpoint(...)",
             "Visual Studio only: for no-source native debugging use resolve_address, get_module_layout, set_address_breakpoint, capture_native_context, and continue_and_capture_native",
             "Visual Studio only: for no-source managed analysis use inspect_managed_assembly, inspect_managed_type, and inspect_managed_method_il against the target assembly path",
@@ -226,7 +231,7 @@ def _recommended_workflow_for_access(effective_instance: Optional[Dict[str, Any]
         "list_vs_instances() to re-check the exact target access before changing debugger state.",
     ]
     if "debug.read" in allowed:
-        workflow.append("Available read path: get_debug_status/get_callstack/get_threads/get_breakpoints/get_build_errors/get_debug_output and default capture_debug_bundle().")
+        workflow.append("Available read path: get_debug_status/get_callstack/get_threads/get_breakpoints/get_build_errors/get_debug_output and default capture_debug_bundle(); Visual Studio also provides get_debug_processes for same-session targets.")
     if "debug.memory.read" in allowed:
         workflow.append("Memory capability is enabled: read_memory/get_disassembly/get_registers may be used.")
         if "debug.read" in allowed:
@@ -241,6 +246,8 @@ def _recommended_workflow_for_access(effective_instance: Optional[Dict[str, Any]
             workflow.append("Combined debug.breakpoint.write + debug.evaluate.unsafe additionally enables conditional source/function/address breakpoints and data/watchpoint expressions.")
     if "debug.execution.control" in allowed:
         workflow.append("Execution-control capability is enabled: continue/pause/step/stop/detach may be used in a compatible debugger state.")
+    if "debug.context.write" in allowed:
+        workflow.append("Context-write capability is enabled: switch_thread/switch_stack_frame and Visual Studio same-session switch_process may be used while paused.")
     if "debug.session.write" in allowed:
         workflow.append("Session-write capability is enabled: attach_process/start_debugging may be used.")
     if access_mode == "read_only":
@@ -253,7 +260,7 @@ async def debug_capabilities() -> str:
     """
     Return a categorized index of AIDebugger tools. Use this first when unsure which
     debugger tool to call, especially for active debugging workflows such as attach,
-    start, breakpoints, stepping, stack/thread selection, expression evaluation,
+    start, breakpoints, stepping, process/thread/stack selection, expression evaluation,
     memory inspection, stop debugging, detach, or data breakpoints.
 
     Use this before concluding a debugger capability is missing.
@@ -319,6 +326,7 @@ async def debug_capabilities() -> str:
             "expression_evaluation": "Expressions are attempted by default with bounded IDE timeouts. If a function call is unavailable or unsafe in the debug engine, the IDE result is returned instead of pre-rejecting it.",
             "stop": "Supported. Use debug_stop, stop_debugging, or debug_control(action='stop') to stop debugging / terminate the current debug session.",
             "detach": "Visual Studio detach is supported for the current debugged process via detach_process or debug_control(action='detach'). Rider is not exposed as a supported detach backend because no reliable public detach path is available here.",
+            "same_session_process_selection": "Visual Studio only: call get_debug_processes, then switch_process(process_id). Only Debugger.DebuggedProcesses entries are eligible, so switching never attaches a new local process. Rider exposes no equivalent multi-process selection contract.",
             "set_data_breakpoint": "Uses Visual Studio native data breakpoints/watchpoints where supported by the active debug engine.",
             "breakpoint_binding_verification": "Breakpoint results include bindingVerificationStatus, isRelocated, nearbyProbeAttempted, optimizedCodeSuspected, and verificationStatus so optimized-away or unbound source locations are explicit instead of treated as successful hits.",
             "no_source_native": "Information-only native debugging surface: normalize addresses as module+RVA, inspect PE layout, set address breakpoints, capture registers/disassembly/stack memory/modules, and let the AI decide the next probe. No write-memory or patching tool is exposed.",

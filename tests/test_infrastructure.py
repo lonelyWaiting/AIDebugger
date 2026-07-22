@@ -419,6 +419,51 @@ asyncio.run(check())
             _build_attach_process_params(12345, None),
         )
 
+    def test_same_session_process_tools_route_only_to_visual_studio(self) -> None:
+        from mcp_server import bootstrap
+
+        bootstrap.ensure_deps()
+        from mcp_server.tool_modules import control_tools
+
+        list_call = mock.AsyncMock(return_value={
+            "processes": [],
+            "currentProcessId": 0,
+            "capability": "same_debug_session_process_selection",
+            "behavior": "visual_studio_debugged_processes_only",
+            "totalAvailable": 0,
+            "startIndex": 2,
+            "nextIndex": 2,
+            "hasMore": False,
+            "partial": False,
+            "snapshotStable": True,
+            "snapshotStatus": "ok",
+            "maxNodes": 4,
+            "budgetMs": 500,
+        })
+        with mock.patch.object(control_tools.ide_bridge, "call", list_call):
+            asyncio.run(control_tools.get_debug_processes(2, 4, 500, 10.0))
+        self.assertEqual("get_debug_processes", list_call.await_args.args[0])
+        self.assertEqual(
+            {"startIndex": 2, "maxNodes": 4, "budgetMs": 500},
+            list_call.await_args.args[1],
+        )
+        self.assertEqual("vs", list_call.await_args.kwargs["preferred_ide"])
+
+        switch_call = mock.AsyncMock(return_value={
+            "success": True,
+            "message": "selected",
+            "action": "SwitchProcess",
+            "processId": 12345,
+        })
+        with mock.patch.object(control_tools.ide_bridge, "call", switch_call):
+            asyncio.run(control_tools.switch_process(12345, 750, 10.0))
+        self.assertEqual("switch_process", switch_call.await_args.args[0])
+        self.assertEqual(
+            {"processId": 12345, "processLookupBudgetMs": 750},
+            switch_call.await_args.args[1],
+        )
+        self.assertEqual("vs", switch_call.await_args.kwargs["preferred_ide"])
+
     def test_version_dry_run_tracks_nearest_semver_tag(self) -> None:
         description = subprocess.run(
             ["git", "describe", "--tags", "--long", "--match", "v[0-9]*.[0-9]*.[0-9]*", "HEAD"],
@@ -733,6 +778,29 @@ asyncio.run(check())
                 "action": "switch_stack_frame",
                 "newLocation": {"functionName": "main", "lineNumber": 7, "columnNumber": 0},
             },
+            "get_debug_processes": {
+                "processes": [{"processId": 42, "name": "app.exe", "isCurrent": True, "programCount": 1}],
+                "currentProcessId": 42,
+                "capability": "same_debug_session_process_selection",
+                "behavior": "visual_studio_debugged_processes_only",
+                "totalAvailable": 1,
+                "startIndex": 0,
+                "nextIndex": 1,
+                "hasMore": False,
+                "partial": False,
+                "snapshotStable": True,
+                "snapshotStatus": "ok",
+                "maxNodes": 512,
+                "budgetMs": 10000,
+            },
+            "switch_process": {
+                "success": True,
+                "message": "selected",
+                "action": "SwitchProcess",
+                "processId": 42,
+                "processName": "app.exe",
+                "outcome": "process_selected",
+            },
         }
         for tool_name, payload in valid_cases.items():
             with self.subTest(tool=tool_name):
@@ -755,6 +823,7 @@ asyncio.run(check())
             "get_callstack": "StackFramePayload",
             "get_locals": "VariablePayload",
             "get_threads": "ThreadPayload",
+            "get_debug_processes": "DebugProcessInfoPayload",
             "get_modules": "ModulePayload",
             "get_breakpoints": "BreakpointPayload",
             "capture_native_context": "NativeAddressDetailPayload",

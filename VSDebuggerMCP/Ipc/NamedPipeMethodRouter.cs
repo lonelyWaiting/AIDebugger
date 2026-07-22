@@ -35,6 +35,14 @@ namespace VSDebuggerMCP
                 case "get_debug_status":
                     return _debuggerService.GetDebugStatus();
 
+                case "get_debug_processes":
+                    {
+                        int startIndex = GetParam<int>(request.Params, "startIndex", 0);
+                        int maxNodes = GetParam<int>(request.Params, "maxNodes", -1);
+                        int budgetMs = GetParam<int>(request.Params, "budgetMs", -1);
+                        return _debuggerService.GetDebugProcesses(startIndex, maxNodes, budgetMs);
+                    }
+
                 case "get_request_status":
                     {
                         string requestId = GetParam<string>(request.Params, "requestId", "");
@@ -614,11 +622,18 @@ namespace VSDebuggerMCP
                         return _debuggerService.SearchMemory(startAddress, pattern, maxResults, searchSize, patternFormat, startOffset);
                     }
 
-                // Stack Frame Navigation
+                // Debug Context Navigation
                 case "switch_stack_frame":
                     {
                         int frameIndex = GetParam<int>(request.Params, "frameIndex", 0);
                         return _debuggerService.SwitchStackFrame(frameIndex);
+                    }
+
+                case "switch_process":
+                    {
+                        int processId = GetParam<int>(request.Params, "processId", 0);
+                        int processLookupBudgetMs = GetParam<int>(request.Params, "processLookupBudgetMs", -1);
+                        return _debuggerService.SwitchProcess(processId, processLookupBudgetMs);
                     }
 
                 case "switch_thread":

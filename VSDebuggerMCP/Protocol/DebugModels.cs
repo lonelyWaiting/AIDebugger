@@ -415,6 +415,72 @@ namespace VSDebuggerMCP.Protocol
 
     #endregion
 
+    #region Debug Processes
+
+    [DataContract]
+    public class DebugProcessesResult
+    {
+        [DataMember(Name = "processes")]
+        public List<DebugProcessInfo> Processes { get; set; } = new List<DebugProcessInfo>();
+
+        [DataMember(Name = "currentProcessId")]
+        public int CurrentProcessId { get; set; }
+
+        [DataMember(Name = "capability")]
+        public string Capability { get; set; }
+
+        [DataMember(Name = "behavior")]
+        public string Behavior { get; set; }
+
+        [DataMember(Name = "totalAvailable")]
+        public int TotalAvailable { get; set; }
+
+        [DataMember(Name = "startIndex")]
+        public int StartIndex { get; set; }
+
+        [DataMember(Name = "nextIndex")]
+        public int NextIndex { get; set; }
+
+        [DataMember(Name = "hasMore")]
+        public bool HasMore { get; set; }
+
+        [DataMember(Name = "partial")]
+        public bool Partial { get; set; }
+
+        [DataMember(Name = "snapshotStable")]
+        public bool SnapshotStable { get; set; }
+
+        [DataMember(Name = "snapshotStatus")]
+        public string SnapshotStatus { get; set; }
+
+        [DataMember(Name = "maxNodes")]
+        public int MaxNodes { get; set; }
+
+        [DataMember(Name = "budgetMs")]
+        public int BudgetMs { get; set; }
+
+        [DataMember(Name = "error", EmitDefaultValue = false)]
+        public string Error { get; set; }
+    }
+
+    [DataContract]
+    public class DebugProcessInfo
+    {
+        [DataMember(Name = "processId")]
+        public int ProcessId { get; set; }
+
+        [DataMember(Name = "name")]
+        public string Name { get; set; }
+
+        [DataMember(Name = "isCurrent")]
+        public bool IsCurrent { get; set; }
+
+        [DataMember(Name = "programCount")]
+        public int ProgramCount { get; set; }
+    }
+
+    #endregion
+
     #region Modules
 
     [DataContract]

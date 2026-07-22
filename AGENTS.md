@@ -112,7 +112,7 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 - `McpClientRegistration.kt` - MCP registration with Python version check
 
 **MCP Server:**
-- `server.py` - Combined thin entry point for all 79 MCP tools
+- `server.py` - Combined thin entry point for all 83 MCP tools
 - `vs_server.py` - VS-only entry point; never imports or discovers Rider
 - `ide_bridge.py` - Unified bridge with auto-selection logic for multiple IDE instances
 - `vs_bridge.py` / `rider_bridge.py` - Named Pipe clients with overlapped I/O and timeout handling

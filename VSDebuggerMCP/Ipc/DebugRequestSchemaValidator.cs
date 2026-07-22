@@ -23,7 +23,7 @@ namespace VSDebuggerMCP.Ipc
         };
         private static readonly HashSet<string> IntegerParameters = new HashSet<string>(StringComparer.Ordinal)
         {
-            "depth", "maxDepth", "threadId", "frameIndex", "processId", "threadLookupBudgetMs",
+            "depth", "maxDepth", "threadId", "frameIndex", "processId", "threadLookupBudgetMs", "processLookupBudgetMs",
             "maxFramesPerThread", "maxFrames", "maxFramesScanned", "maxNodes", "budgetMs", "startThreadIndex", "startFrameIndex", "startModuleIndex",
             "startIndex", "outputTailLines", "threadMaxFramesPerThread", "threadMaxNodes", "threadBudgetMs",
             "size", "linesBefore", "linesAfter", "count", "maxImportFunctions", "maxExports", "disassemblyCount",
@@ -309,7 +309,7 @@ namespace VSDebuggerMCP.Ipc
                 case "maxFramesPerThread": case "threadMaxFramesPerThread": minimum = 0; maximum = 256; break;
                 case "maxFrames": case "maxFramesScanned": minimum = 0; maximum = 4096; break;
                 case "maxNodes": case "threadMaxNodes": minimum = 0; maximum = 4096; break;
-                case "budgetMs": case "threadBudgetMs": case "threadLookupBudgetMs": case "breakpointLookupBudgetMs": minimum = 0; maximum = 120000; break;
+                case "budgetMs": case "threadBudgetMs": case "threadLookupBudgetMs": case "processLookupBudgetMs": case "breakpointLookupBudgetMs": minimum = 0; maximum = 120000; break;
                 case "startIndex": case "startModuleIndex": minimum = 0; maximum = 1000000; break;
                 case "startThreadIndex": minimum = 1; maximum = 1000000; break;
                 case "startFrameIndex": minimum = 0; maximum = 1000000; break;

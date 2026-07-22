@@ -893,6 +893,11 @@ namespace VSDebuggerMCP.Tests
                 Assert.IsTrue(DebugMethodCatalog.Get(unsafeInspection).RequiresStableDebugContext);
             }
             Assert.AreEqual("debug.context.write", DebugMethodCatalog.Get("switch_stack_frame").Capability);
+            Assert.AreEqual("debug.read", DebugMethodCatalog.Get("get_debug_processes").Capability);
+            Assert.AreEqual("debugging", DebugMethodCatalog.Get("get_debug_processes").RequiredState);
+            Assert.AreEqual("debug.context.write", DebugMethodCatalog.Get("switch_process").Capability);
+            Assert.AreEqual("paused", DebugMethodCatalog.Get("switch_process").RequiredState);
+            Assert.IsTrue(DebugMethodCatalog.Get("switch_process").RequiresStableDebugContext);
             CollectionAssert.AreEquivalent(
                 new[] { "debug.context.write", "debug.execution.control" },
                 DebugMethodCatalog.Get("set_next_statement").RequiredCapabilities.ToArray());
@@ -1196,6 +1201,67 @@ namespace VSDebuggerMCP.Tests
                 var error = Assert.ThrowsExactly<DebugRequestSchemaException>(() =>
                     DebugRequestSchemaValidator.Validate(
                         Request("start_debugging", "debug.session.write", parameters), 1000));
+                Assert.AreEqual("INVALID_ARGUMENT", error.Code);
+            }
+        }
+
+        [TestMethod]
+        public void RequestSchemaValidatesSameSessionProcessNavigation()
+        {
+            DebugRequest Request(
+                string method,
+                string kind,
+                string capability,
+                Dictionary<string, object> parameters) => new DebugRequest
+                {
+                    Method = method,
+                    Params = parameters,
+                    Meta = new DebugRequestMetadata { Kind = kind, Capability = capability },
+                };
+
+            DebugRequestSchemaValidator.Validate(
+                Request(
+                    "get_debug_processes",
+                    "query",
+                    "debug.read",
+                    new Dictionary<string, object>
+                    {
+                        ["startIndex"] = 0,
+                        ["maxNodes"] = 16,
+                        ["budgetMs"] = 500,
+                    }),
+                1000,
+                validateDeadline: false);
+
+            DebugRequestSchemaValidator.Validate(
+                Request(
+                    "switch_process",
+                    "command",
+                    "debug.context.write",
+                    new Dictionary<string, object>
+                    {
+                        ["processId"] = 42,
+                        ["processLookupBudgetMs"] = 500,
+                    }),
+                1000,
+                validateDeadline: false);
+
+            foreach (var parameters in new[]
+            {
+                new Dictionary<string, object>(),
+                new Dictionary<string, object> { ["processId"] = 0 },
+                new Dictionary<string, object>
+                {
+                    ["processId"] = 42,
+                    ["processLookupBudgetMs"] = 120001,
+                },
+            })
+            {
+                var error = Assert.ThrowsExactly<DebugRequestSchemaException>(() =>
+                    DebugRequestSchemaValidator.Validate(
+                        Request("switch_process", "command", "debug.context.write", parameters),
+                        1000,
+                        validateDeadline: false));
                 Assert.AreEqual("INVALID_ARGUMENT", error.Code);
             }
         }
