@@ -102,6 +102,13 @@ namespace VSDebuggerMCP.Ipc
                 throw new DebugRequestSchemaException(
                     "INVALID_ARGUMENT", "params.processName must be a non-empty string.");
             }
+            if (descriptor.Name == "switch_process" &&
+                parameters.ContainsKey("processHandle") == parameters.ContainsKey("processId"))
+            {
+                throw new DebugRequestSchemaException(
+                    "INVALID_ARGUMENT",
+                    "switch_process requires exactly one of 'params.processHandle' or legacy 'params.processId'.");
+            }
             if (descriptor.Name == "start_debugging")
             {
                 if (parameters.ContainsKey("executablePath") &&
@@ -346,6 +353,7 @@ namespace VSDebuggerMCP.Ipc
             switch (key)
             {
                 case "requestId": maximum = 64; break;
+                case "processHandle": maximum = 64; break;
                 case "moduleSnapshotId": case "scanContinuationToken": maximum = 128; break;
                 case "pane": case "patternFormat": case "evaluationPolicy": case "hitCountType": case "conditionType": maximum = 256; break;
                 case "address": case "startAddress": maximum = 1024; break;
@@ -360,6 +368,10 @@ namespace VSDebuggerMCP.Ipc
                 string.IsNullOrWhiteSpace(value))
                 throw new DebugRequestSchemaException(
                     "INVALID_ARGUMENT", $"params.{key} must not be blank.");
+            if (key == "processHandle" &&
+                !Regex.IsMatch(value, "^dph_[0-9a-f]{32}$", RegexOptions.CultureInvariant))
+                throw new DebugRequestSchemaException(
+                    "INVALID_ARGUMENT", "params.processHandle is not a valid opaque debug-process handle.");
             string normalized = value.Trim().ToLowerInvariant();
             if (key == "hitCountType" && normalized != "equal" && normalized != "greater_or_equal" && normalized != "multiple")
                 throw new DebugRequestSchemaException("INVALID_ARGUMENT", "params.hitCountType is not supported.");

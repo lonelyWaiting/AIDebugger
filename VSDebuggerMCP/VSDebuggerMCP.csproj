@@ -86,6 +86,9 @@
     <Compile Include="Services\ExceptionCaptureBudget.cs" />
     <Compile Include="Services\VisualStudioSourceLocationAdapter.cs" />
     <Compile Include="Services\VisualStudioDebuggerAdapter.cs" />
+    <Compile Include="Services\CommandEffectExecutor.cs" />
+    <Compile Include="Services\UiOperationCircuit.cs" />
+    <Compile Include="Services\DebugProcessHandleStore.cs" />
     <Compile Include="Services\UiOperationAdmission.cs" />
     <Compile Include="NamedPipeServer.cs" />
     <Compile Include="Ipc\LengthPrefixedFrameCodec.cs" />
@@ -105,6 +108,8 @@
     <Compile Include="Ipc\ProcessIntegrityValidator.cs" />
     <Compile Include="Ipc\AuthenticodeTrustValidator.cs" />
     <Compile Include="Ipc\CommandResultStore.cs" />
+    <Compile Include="Ipc\UuidV7RequestIdPolicy.cs" />
+    <Compile Include="Ipc\QueryResultStore.cs" />
     <Compile Include="Ipc\ActiveRequest.cs" />
     <Compile Include="Ipc\OperationResultPolicy.cs" />
     <Compile Include="Ipc\CommandResponseCompactor.cs" />

@@ -214,7 +214,6 @@ namespace VSDebuggerMCP
                 try
                 {
                     result.CommandIssued = true;
-                    DebuggerRequestContext.MarkSideEffectIssued();
                     var breakpoint = AddFileBreakpoint(
                         debugger,
                         filePath,
@@ -233,7 +232,16 @@ namespace VSDebuggerMCP
                     }
                     result.AffectedCount = 1;
 
-                    try { breakpoint.Tag = originalTag; }
+                    try
+                    {
+                        CommandEffectExecutor.Issue(
+                            "breakpoint.assign_cleanup_tag",
+                            () =>
+                            {
+                                ThreadHelper.ThrowIfNotOnUIThread();
+                                breakpoint.Tag = originalTag;
+                            });
+                    }
                     catch { originalTag = null; }
 
                     IsBreakpointBound(debugger, breakpoint);
@@ -321,20 +329,25 @@ namespace VSDebuggerMCP
                 try
                 {
                     result.CommandIssued = true;
-                    DebuggerRequestContext.MarkSideEffectIssued();
-                    EnvDTE.Breakpoints bps = debugger.Breakpoints.Add(
-                        functionName,
-                        "",
-                        0,
-                        0,
-                        normalizedCondition ?? string.Empty,
-                        breakpointConditionType,
-                        string.Empty,
-                        string.Empty,
-                        1,
-                        string.Empty,
-                        normalizedHitCount,
-                        breakpointHitCountType);
+                    EnvDTE.Breakpoints bps = CommandEffectExecutor.Issue(
+                        "breakpoint.add_function",
+                        () =>
+                        {
+                            ThreadHelper.ThrowIfNotOnUIThread();
+                            return debugger.Breakpoints.Add(
+                                functionName,
+                                "",
+                                0,
+                                0,
+                                normalizedCondition ?? string.Empty,
+                                breakpointConditionType,
+                                string.Empty,
+                                string.Empty,
+                                1,
+                                string.Empty,
+                                normalizedHitCount,
+                                breakpointHitCountType);
+                        });
 
                     if (bps != null && bps.Count > 0)
                     {
@@ -411,20 +424,25 @@ namespace VSDebuggerMCP
                 try
                 {
                     result.CommandIssued = true;
-                    DebuggerRequestContext.MarkSideEffectIssued();
-                    EnvDTE.Breakpoints bps = debugger.Breakpoints.Add(
-                        string.Empty,
-                        string.Empty,
-                        0,
-                        0,
-                        normalizedCondition ?? string.Empty,
-                        breakpointConditionType,
-                        string.Empty,
-                        normalizedExpression,
-                        normalizedByteCount,
-                        string.Empty,
-                        normalizedHitCount,
-                        breakpointHitCountType);
+                    EnvDTE.Breakpoints bps = CommandEffectExecutor.Issue(
+                        "breakpoint.add_data",
+                        () =>
+                        {
+                            ThreadHelper.ThrowIfNotOnUIThread();
+                            return debugger.Breakpoints.Add(
+                                string.Empty,
+                                string.Empty,
+                                0,
+                                0,
+                                normalizedCondition ?? string.Empty,
+                                breakpointConditionType,
+                                string.Empty,
+                                normalizedExpression,
+                                normalizedByteCount,
+                                string.Empty,
+                                normalizedHitCount,
+                                breakpointHitCountType);
+                        });
 
                     if (bps == null || bps.Count == 0)
                     {
@@ -502,8 +520,7 @@ namespace VSDebuggerMCP
                             "Breakpoint collection changed before the breakpoint could be deleted.");
                     }
                     result.CommandIssued = true;
-                    DebuggerRequestContext.MarkSideEffectIssued();
-                    bp.Delete();
+                    CommandEffectExecutor.Issue("breakpoint.delete", bp.Delete);
                     result.AffectedCount = 1;
                     result.Success = true;
                     result.Outcome = "deleted";
@@ -603,8 +620,13 @@ namespace VSDebuggerMCP
                             "Breakpoint collection changed before the breakpoint could be updated.");
                     }
                     result.CommandIssued = true;
-                    DebuggerRequestContext.MarkSideEffectIssued();
-                    bp.Enabled = enabled;
+                    CommandEffectExecutor.Issue(
+                        enabled ? "breakpoint.enable" : "breakpoint.disable",
+                        () =>
+                        {
+                            ThreadHelper.ThrowIfNotOnUIThread();
+                            bp.Enabled = enabled;
+                        });
                     result.AffectedCount = 1;
                     result.Success = true;
                     result.Outcome = enabled ? "enabled" : "disabled";
@@ -632,8 +654,7 @@ namespace VSDebuggerMCP
             EnvDTE.Breakpoint breakpoint = breakpoints.Item(1);
             if (breakpoint == null) throw new InvalidOperationException("Breakpoint item 1 is unavailable.");
             result.CommandIssued = true;
-            DebuggerRequestContext.MarkSideEffectIssued();
-            breakpoint.Delete();
+            CommandEffectExecutor.Issue("breakpoint.delete_all_item", breakpoint.Delete);
             result.AffectedCount++;
             return Debugger?.Breakpoints?.Count ?? Math.Max(0, count - 1);
         }
@@ -940,7 +961,13 @@ namespace VSDebuggerMCP
 
             try
             {
-                breakpoint.Tag = AddressBreakpointTagPrefix + addressText.Trim();
+                CommandEffectExecutor.Issue(
+                    "breakpoint.assign_address_tag",
+                    () =>
+                    {
+                        ThreadHelper.ThrowIfNotOnUIThread();
+                        breakpoint.Tag = AddressBreakpointTagPrefix + addressText.Trim();
+                    });
             }
             catch (Exception ex)
             {
@@ -1151,19 +1178,25 @@ namespace VSDebuggerMCP
         {
             ThreadHelper.ThrowIfNotOnUIThread();
 
-            EnvDTE.Breakpoints breakpoints = debugger.Breakpoints.Add(
-                string.Empty,
-                filePath,
-                lineNumber,
-                1,
-                condition ?? string.Empty,
-                conditionType,
-                language ?? string.Empty,
-                string.Empty,
-                1,
-                string.Empty,
-                Math.Max(0, hitCount),
-                hitCountType);
+            EnvDTE.Breakpoints breakpoints = CommandEffectExecutor.Issue(
+                "breakpoint.add_file",
+                () =>
+                {
+                    ThreadHelper.ThrowIfNotOnUIThread();
+                    return debugger.Breakpoints.Add(
+                        string.Empty,
+                        filePath,
+                        lineNumber,
+                        1,
+                        condition ?? string.Empty,
+                        conditionType,
+                        language ?? string.Empty,
+                        string.Empty,
+                        1,
+                        string.Empty,
+                        Math.Max(0, hitCount),
+                        hitCountType);
+                });
 
             return breakpoints != null && breakpoints.Count > 0 ? breakpoints.Item(1) : null;
         }
@@ -1441,11 +1474,23 @@ namespace VSDebuggerMCP
             string candidateTag = "AIDB_NEARBY=" + Guid.NewGuid().ToString("N");
             try
             {
-                candidate.Tag = candidateTag;
+                CommandEffectExecutor.Issue(
+                    "breakpoint.assign_probe_tag",
+                    () =>
+                    {
+                        ThreadHelper.ThrowIfNotOnUIThread();
+                        candidate.Tag = candidateTag;
+                    });
             }
             catch (Exception ex)
             {
-                try { candidate.Delete(); } catch { }
+                try
+                {
+                    CommandEffectExecutor.Issue(
+                        "breakpoint.delete_untagged_probe",
+                        candidate.Delete);
+                }
+                catch { }
                 throw new InvalidOperationException(
                     "Nearby breakpoint candidate could not be assigned a cleanup identity.",
                     ex);
@@ -1478,7 +1523,7 @@ namespace VSDebuggerMCP
             string expectedTag)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            candidate.Delete();
+            CommandEffectExecutor.Issue("breakpoint.delete_probe", candidate.Delete);
             EnvDTE.Breakpoints breakpoints = debugger?.Breakpoints;
             int count = breakpoints?.Count ?? 0;
             for (int index = 1; index <= count; index++)
@@ -1526,7 +1571,7 @@ namespace VSDebuggerMCP
                 {
                     return false;
                 }
-                breakpoint.Delete();
+                CommandEffectExecutor.Issue("breakpoint.delete_by_tag", breakpoint.Delete);
                 return true;
             }
             catch
@@ -1626,7 +1671,7 @@ namespace VSDebuggerMCP
 
             try
             {
-                breakpoint.Delete();
+                CommandEffectExecutor.Issue("breakpoint.cleanup", breakpoint.Delete);
             }
             catch (Exception ex)
             {

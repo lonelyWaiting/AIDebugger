@@ -390,10 +390,17 @@ def _decode_response(
         server,
         frozenset({
             "processId", "processStartTimeUtcTicks", "serverInstanceId",
-            "debugSessionGeneration", "breakSequence", "contextEpoch",
+            "protocolCatalogHash", "debugSessionGeneration", "breakSequence", "contextEpoch",
         }),
         "server identity",
     )
+    catalog_hash = server.get("protocolCatalogHash")
+    if not isinstance(catalog_hash, str) or re.fullmatch(r"[0-9a-f]{64}", catalog_hash) is None:
+        raise VSBridgeError(
+            "Response server identity has invalid protocolCatalogHash",
+            code="INVALID_RESPONSE",
+            outcome_unknown=True,
+        )
     if expected_server:
         for key in ("processId", "processStartTimeUtcTicks", "serverInstanceId"):
             if server.get(key) != expected_server.get(key):
@@ -402,6 +409,12 @@ def _decode_response(
                     code="STALE_TARGET",
                     outcome_unknown=True,
                 )
+        if catalog_hash != expected_server.get("protocolCatalogHash"):
+            raise VSBridgeError(
+                "Response protocol catalog does not match the selected Visual Studio registration",
+                code="PROTOCOL_CATALOG_MISMATCH",
+                outcome_unknown=True,
+            )
     for key in ("debugSessionGeneration", "breakSequence", "contextEpoch"):
         if not isinstance(server.get(key), int) or server[key] < 0:
             raise VSBridgeError(
@@ -530,6 +543,7 @@ def _copy_registration_snapshot(registration: Dict[str, Any]) -> Dict[str, Any]:
         "processId": registration.get("processId"),
         "processStartTimeUtcTicks": registration.get("processStartTimeUtcTicks"),
         "serverInstanceId": registration.get("serverInstanceId"),
+        "protocolCatalogHash": registration.get("protocolCatalogHash"),
         "authToken": registration.get("authToken"),
         "capabilities": list(registration.get("capabilities") or []),
     }

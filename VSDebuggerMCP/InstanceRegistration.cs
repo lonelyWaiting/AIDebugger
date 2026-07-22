@@ -24,6 +24,7 @@ namespace VSDebuggerMCP
             int processId,
             long processStartTimeUtcTicks,
             string serverInstanceId,
+            string protocolCatalogHash,
             string[] capabilities,
             Action<string> log)
         {
@@ -56,6 +57,7 @@ namespace VSDebuggerMCP
                 ProcessId = processId,
                 ProcessStartTimeUtcTicks = processStartTimeUtcTicks,
                 ServerInstanceId = serverInstanceId,
+                ProtocolCatalogHash = protocolCatalogHash,
                 AuthToken = AuthToken,
                 Capabilities = capabilities ?? new string[0],
             };
@@ -284,6 +286,7 @@ namespace VSDebuggerMCP
             public int ProcessId { get; set; }
             public long ProcessStartTimeUtcTicks { get; set; }
             public string ServerInstanceId { get; set; }
+            public string ProtocolCatalogHash { get; set; }
             public string AuthToken { get; set; }
             public string[] Capabilities { get; set; }
         }

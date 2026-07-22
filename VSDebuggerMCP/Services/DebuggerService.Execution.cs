@@ -74,10 +74,11 @@ namespace VSDebuggerMCP
                     {
                         ClearDumpSessionState();
                         result.CommandIssued = true;
-                        DebuggerRequestContext.MarkSideEffectIssued();
                         try
                         {
-                            targetProcess.Attach();
+                            CommandEffectExecutor.Issue(
+                                "debugger.attach_process",
+                                targetProcess.Attach);
                         }
                         finally
                         {
@@ -174,10 +175,15 @@ namespace VSDebuggerMCP
 
                         ClearDumpSessionState();
                         result.CommandIssued = true;
-                        DebuggerRequestContext.MarkSideEffectIssued();
                         try
                         {
-                            debugger.Go(false);
+                            CommandEffectExecutor.Issue(
+                                "debugger.start",
+                                () =>
+                                {
+                                    ThreadHelper.ThrowIfNotOnUIThread();
+                                    debugger.Go(false);
+                                });
                         }
                         finally
                         {
@@ -254,7 +260,9 @@ namespace VSDebuggerMCP
                 UseShellExecute = false,
             };
             IntPtr launchedProcessIdentityHandle = IntPtr.Zero;
-            using (var process = System.Diagnostics.Process.Start(startInfo))
+            using (var process = CommandEffectExecutor.Issue(
+                "process.start",
+                () => System.Diagnostics.Process.Start(startInfo)))
             {
                 if (process == null)
                 {
@@ -270,7 +278,6 @@ namespace VSDebuggerMCP
                         {
                             result.CommandIssued = true;
                             result.ProcessStarted = true;
-                            DebuggerRequestContext.MarkSideEffectIssued();
                         },
                         launched =>
                         {
@@ -383,7 +390,9 @@ namespace VSDebuggerMCP
                             {
                                 try
                                 {
-                                    targetProcess.Attach();
+                                    CommandEffectExecutor.Issue(
+                                        "debugger.attach_started_process",
+                                        targetProcess.Attach);
                                 }
                                 finally
                                 {
@@ -460,8 +469,9 @@ namespace VSDebuggerMCP
             {
                 BeginPendingDumpSession(dumpPath);
                 result.UiNavigationIssued = true;
-                DebuggerRequestContext.MarkSideEffectIssued();
-                OpenAndVerifyTargetDocument(dumpPath);
+                CommandEffectExecutor.Issue(
+                    "visual_studio.open_dump_document",
+                    () => OpenAndVerifyTargetDocument(dumpPath));
                 if (!TryStartActiveDumpDebuggingCommand(
                     out string startError,
                     out bool commandIssued,
@@ -617,14 +627,23 @@ namespace VSDebuggerMCP
                 Guid commandSet = VisualStudioDebuggerCommandSet;
                 object argument = null;
                 dispatchAttempted = true;
-                int hr = uiShell.PostExecCommand(ref commandSet, DebugDumpFileCommandId, 0, ref argument);
+                int hr = CommandEffectExecutor.Issue(
+                    "debugger.start_dump",
+                    () =>
+                    {
+                        ThreadHelper.ThrowIfNotOnUIThread();
+                        return uiShell.PostExecCommand(
+                            ref commandSet,
+                            DebugDumpFileCommandId,
+                            0,
+                            ref argument);
+                    });
                 if (hr < 0)
                 {
                     error = $"Visual Studio rejected the official dump debugging command (HRESULT 0x{hr:X8})";
                     return false;
                 }
                 commandIssued = true;
-                DebuggerRequestContext.MarkSideEffectIssued();
                 return true;
             }
             catch (Exception ex)
@@ -1018,10 +1037,15 @@ namespace VSDebuggerMCP
                 try
                 {
                     result.CommandIssued = true;
-                    DebuggerRequestContext.MarkSideEffectIssued();
                     try
                     {
-                        debugger.Go(false); // false = don't wait for break
+                        CommandEffectExecutor.Issue(
+                            "debugger.continue",
+                            () =>
+                            {
+                                ThreadHelper.ThrowIfNotOnUIThread();
+                                debugger.Go(false);
+                            }); // false = don't wait for break
                     }
                     finally
                     {
@@ -1249,25 +1273,28 @@ namespace VSDebuggerMCP
                 }
 
                 issued.CommandIssued = true;
-                DebuggerRequestContext.MarkSideEffectIssued();
                 try
                 {
                     try
                     {
-                        switch (action)
+                        CommandEffectExecutor.Issue("debugger.step:" + action, () =>
                         {
-                            case "StepInto":
-                                debugger.StepInto(false);
-                                break;
-                            case "StepOver":
-                                debugger.StepOver(false);
-                                break;
-                            case "StepOut":
-                                debugger.StepOut(false);
-                                break;
-                            default:
-                                throw new InvalidOperationException("Unknown debugger step action: " + action);
-                        }
+                            ThreadHelper.ThrowIfNotOnUIThread();
+                            switch (action)
+                            {
+                                case "StepInto":
+                                    debugger.StepInto(false);
+                                    break;
+                                case "StepOver":
+                                    debugger.StepOver(false);
+                                    break;
+                                case "StepOut":
+                                    debugger.StepOut(false);
+                                    break;
+                                default:
+                                    throw new InvalidOperationException("Unknown debugger step action: " + action);
+                            }
+                        });
                     }
                     finally
                     {
@@ -1377,10 +1404,15 @@ namespace VSDebuggerMCP
                 try
                 {
                     result.CommandIssued = true;
-                    DebuggerRequestContext.MarkSideEffectIssued();
                     try
                     {
-                        debugger.Break(false);
+                        CommandEffectExecutor.Issue(
+                            "debugger.break",
+                            () =>
+                            {
+                                ThreadHelper.ThrowIfNotOnUIThread();
+                                debugger.Break(false);
+                            });
                     }
                     finally
                     {
@@ -1423,10 +1455,15 @@ namespace VSDebuggerMCP
                 try
                 {
                     result.CommandIssued = true;
-                    DebuggerRequestContext.MarkSideEffectIssued();
                     try
                     {
-                        debugger.Stop(false);
+                        CommandEffectExecutor.Issue(
+                            "debugger.stop",
+                            () =>
+                            {
+                                ThreadHelper.ThrowIfNotOnUIThread();
+                                debugger.Stop(false);
+                            });
                     }
                     finally
                     {
@@ -1480,10 +1517,15 @@ namespace VSDebuggerMCP
                     string processName = process.Name;
                     int processId = process.ProcessID;
                     result.CommandIssued = true;
-                    DebuggerRequestContext.MarkSideEffectIssued();
                     try
                     {
-                        process.Detach(false);
+                        CommandEffectExecutor.Issue(
+                            "debugger.detach_process",
+                            () =>
+                            {
+                                ThreadHelper.ThrowIfNotOnUIThread();
+                                process.Detach(false);
+                            });
                     }
                     finally
                     {
@@ -1532,13 +1574,20 @@ namespace VSDebuggerMCP
                 try
                 {
                     result.UiNavigationIssued = true;
-                    DebuggerRequestContext.MarkSideEffectIssued();
-                    PositionDebuggerCommandTarget(filePath, lineNumber);
+                    CommandEffectExecutor.Issue(
+                        "visual_studio.position_command_target",
+                        () => PositionDebuggerCommandTarget(filePath, lineNumber));
 
                     result.CommandIssued = true;
                     try
                     {
-                        debugger.RunToCursor(false);
+                        CommandEffectExecutor.Issue(
+                            "debugger.run_to_cursor",
+                            () =>
+                            {
+                                ThreadHelper.ThrowIfNotOnUIThread();
+                                debugger.RunToCursor(false);
+                            });
                     }
                     finally
                     {
@@ -1595,13 +1644,16 @@ namespace VSDebuggerMCP
                 try
                 {
                     result.UiNavigationIssued = true;
-                    DebuggerRequestContext.MarkSideEffectIssued();
-                    PositionDebuggerCommandTarget(filePath, lineNumber);
+                    CommandEffectExecutor.Issue(
+                        "visual_studio.position_command_target",
+                        () => PositionDebuggerCommandTarget(filePath, lineNumber));
 
                     result.CommandIssued = true;
                     try
                     {
-                        debugger.SetNextStatement();
+                        CommandEffectExecutor.Issue(
+                            "debugger.set_next_statement",
+                            debugger.SetNextStatement);
                     }
                     finally
                     {

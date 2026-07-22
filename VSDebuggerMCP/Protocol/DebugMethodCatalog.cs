@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Web.Script.Serialization;
 
 namespace VSDebuggerMCP.Protocol
@@ -32,6 +33,7 @@ namespace VSDebuggerMCP.Protocol
     internal static class DebugMethodCatalog
     {
         private const string ManifestResourceName = "VSDebuggerMCP.Protocol.DebugMethodManifest.json";
+        public static string CatalogHash { get; } = ComputeCatalogHash();
         private static readonly IReadOnlyDictionary<string, DebugMethodManifestEntry> ManifestMethods = LoadManifest();
         private static readonly IReadOnlyCollection<string> NoParameters = new string[0];
         private static readonly Dictionary<string, ParameterSpec> ParameterSpecs = BuildParameterSpecs();
@@ -200,6 +202,22 @@ namespace VSDebuggerMCP.Protocol
             }
         }
 
+        private static string ComputeCatalogHash()
+        {
+            Assembly assembly = typeof(DebugMethodCatalog).Assembly;
+            using (Stream stream = assembly.GetManifestResourceStream(ManifestResourceName))
+            {
+                if (stream == null)
+                    throw new InvalidOperationException("Embedded debugger method manifest is missing: " + ManifestResourceName);
+                using (var sha256 = SHA256.Create())
+                {
+                    return BitConverter.ToString(sha256.ComputeHash(stream))
+                        .Replace("-", string.Empty)
+                        .ToLowerInvariant();
+                }
+            }
+        }
+
         private static Dictionary<string, ParameterSpec> BuildParameterSpecs()
         {
             var specs = new Dictionary<string, ParameterSpec>(StringComparer.Ordinal);
@@ -228,7 +246,7 @@ namespace VSDebuggerMCP.Protocol
             Add(specs, "get_full_context", "", "threadIncludeFrames threadMaxFramesPerThread threadMaxNodes threadBudgetMs");
             Add(specs, "attach_process", "", "processId processName");
             Add(specs, "get_debug_processes", "", "startIndex maxNodes budgetMs");
-            Add(specs, "switch_process", "processId", "processLookupBudgetMs");
+            Add(specs, "switch_process", "", "processHandle processId processLookupBudgetMs");
             Add(specs, "start_debugging", "", "executablePath workingDirectory arguments attach");
             Add(specs, "step_into step_over step_out", "", "waitTimeoutMs");
             Add(specs, "continue_and_wait_for_break", "", "expressions expandChildren maxDepth evaluationPolicy outputTailLines timeoutMs pollIntervalMs includeLocals includeModules includeRegisters includeOutput includeThreads includeException threadIncludeFrames threadMaxFramesPerThread threadMaxNodes threadBudgetMs");

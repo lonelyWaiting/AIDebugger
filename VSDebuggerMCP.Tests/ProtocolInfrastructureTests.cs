@@ -403,10 +403,9 @@ namespace VSDebuggerMCP.Tests
                 Assert.AreEqual(currentSid, rule.IdentityReference);
                 Assert.AreEqual(AccessControlType.Allow, rule.AccessControlType);
                 var required = System.IO.Pipes.PipeAccessRights.ReadWrite |
-                    System.IO.Pipes.PipeAccessRights.Synchronize;
+                    System.IO.Pipes.PipeAccessRights.Synchronize |
+                    System.IO.Pipes.PipeAccessRights.CreateNewInstance;
                 Assert.AreEqual(required, rule.PipeAccessRights & required);
-                Assert.AreEqual((System.IO.Pipes.PipeAccessRights)0,
-                    rule.PipeAccessRights & System.IO.Pipes.PipeAccessRights.CreateNewInstance);
                 Assert.AreEqual((System.IO.Pipes.PipeAccessRights)0,
                     rule.PipeAccessRights & System.IO.Pipes.PipeAccessRights.ChangePermissions);
                 Assert.AreEqual((System.IO.Pipes.PipeAccessRights)0,
@@ -419,28 +418,71 @@ namespace VSDebuggerMCP.Tests
         }
 
         [TestMethod]
-        public async Task PipeSecurityAllowsClientIoButDeniesSameNameServerCreation()
+        [Timeout(10000)]
+        public async Task PipeSecurityAllowsConfiguredSameNameListenerPoolAndConcurrentClients()
         {
             string pipeName = "AIDebuggerTest_" + Guid.NewGuid().ToString("N");
             PipeSecurity security = PipeSecurityFactory.Create();
-            using (var first = new NamedPipeServerStream(
-                pipeName, PipeDirection.InOut, 2, PipeTransmissionMode.Byte,
-                PipeOptions.Asynchronous, 4096, 4096, security))
-            using (var client = new NamedPipeClientStream(
-                ".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+            const int listenerCount = 8;
+            var servers = new List<NamedPipeServerStream>();
+            var clients = new List<NamedPipeClientStream>();
+            try
             {
-                Task accept = Task.Factory.FromAsync(
-                    first.BeginWaitForConnection,
-                    first.EndWaitForConnection,
-                    null);
-                client.Connect(3000);
-                await accept;
-                Assert.IsTrue(client.IsConnected);
+                for (int index = 0; index < listenerCount; index++)
+                {
+                    servers.Add(new NamedPipeServerStream(
+                        pipeName,
+                        PipeDirection.InOut,
+                        listenerCount,
+                        PipeTransmissionMode.Byte,
+                        PipeOptions.Asynchronous,
+                        4096,
+                        4096,
+                        security));
+                }
 
-                Assert.ThrowsExactly<UnauthorizedAccessException>(() =>
-                    new NamedPipeServerStream(
-                        pipeName, PipeDirection.InOut, 2, PipeTransmissionMode.Byte,
-                        PipeOptions.Asynchronous, 4096, 4096, security));
+                Task[] accepts = servers.Select(server => Task.Factory.FromAsync(
+                    server.BeginWaitForConnection,
+                    server.EndWaitForConnection,
+                    null)).ToArray();
+
+                for (int index = 0; index < listenerCount; index++)
+                {
+                    var client = new NamedPipeClientStream(
+                        ".",
+                        pipeName,
+                        PipeDirection.InOut,
+                        PipeOptions.Asynchronous);
+                    clients.Add(client);
+                    client.Connect(3000);
+                }
+
+                await Task.WhenAll(accepts);
+                Assert.IsTrue(servers.All(server => server.IsConnected));
+                Assert.IsTrue(clients.All(client => client.IsConnected));
+
+                Task[] exchanges = Enumerable.Range(0, listenerCount).Select(async index =>
+                {
+                    string payload = "listener-" + index;
+                    var clientCodec = new LengthPrefixedFrameCodec(clients[index]);
+                    await clientCodec.WriteFrameAsync(payload, 1024, CancellationToken.None);
+                }).ToArray();
+                await Task.WhenAll(exchanges);
+
+                var received = new HashSet<string>(StringComparer.Ordinal);
+                foreach (NamedPipeServerStream server in servers)
+                {
+                    var codec = new LengthPrefixedFrameCodec(server);
+                    received.Add(await codec.ReadFrameAsync(1024, CancellationToken.None));
+                }
+                CollectionAssert.AreEquivalent(
+                    Enumerable.Range(0, listenerCount).Select(index => "listener-" + index).ToArray(),
+                    received.ToArray());
+            }
+            finally
+            {
+                foreach (NamedPipeClientStream client in clients) client.Dispose();
+                foreach (NamedPipeServerStream server in servers) server.Dispose();
             }
         }
 
@@ -776,6 +818,99 @@ namespace VSDebuggerMCP.Tests
         }
 
         [TestMethod]
+        public void CommandResultStoreReclaimsOnlyCompletedTombstonesAfterDedupeWindow()
+        {
+            DateTime now = new DateTime(2026, 7, 22, 0, 0, 0, DateTimeKind.Utc);
+            var store = new CommandResultStore(
+                responseCapacity: 1,
+                responseTtl: TimeSpan.FromMinutes(1),
+                utcNow: () => now,
+                tombstoneCapacity: 2,
+                tombstoneTtl: TimeSpan.FromMinutes(2));
+
+            Assert.AreEqual(CommandReservationStatus.ReservedByCaller,
+                store.ReserveOrLookup("old", "old", out _, out CommandReservationLease old));
+            store.Complete(old, "old-result");
+            Assert.AreEqual(CommandReservationStatus.ReservedByCaller,
+                store.ReserveOrLookup("pending", "pending", out _, out CommandReservationLease pending));
+
+            CommandLedgerSnapshot beforeReclaim = store.Snapshot();
+            Assert.AreEqual(2, beforeReclaim.TombstoneCount);
+            Assert.AreEqual(2, beforeReclaim.TombstoneCapacity);
+            Assert.AreEqual(1, beforeReclaim.RetainedResponseCount);
+
+            now = now.AddMinutes(3);
+            Assert.AreEqual(CommandReservationStatus.ReservedByCaller,
+                store.ReserveOrLookup("replacement", "replacement", out _, out _));
+            Assert.IsFalse(store.TryGetById("old", out _, out _, out _));
+            Assert.AreEqual(CommandReservationStatus.InProgress,
+                store.ReserveOrLookup("pending", "pending", out _, out _));
+            store.ReleaseReservation(pending);
+        }
+
+        [TestMethod]
+        public void UuidV7PolicyEnforcesBoundedAtMostOnceWindow()
+        {
+            DateTime now = new DateTime(2026, 7, 22, 0, 0, 0, DateTimeKind.Utc);
+            string ValidId(DateTime timestamp)
+            {
+                string milliseconds = new DateTimeOffset(timestamp).ToUnixTimeMilliseconds().ToString("x12");
+                return milliseconds.Substring(0, 8) + "-" +
+                    milliseconds.Substring(8, 4) + "-7000-8000-000000000001";
+            }
+
+            Assert.IsTrue(UuidV7RequestIdPolicy.TryValidate(
+                ValidId(now.AddHours(-23)), now, TimeSpan.FromHours(24), TimeSpan.FromMinutes(5),
+                out _, out _));
+            Assert.IsFalse(UuidV7RequestIdPolicy.TryValidate(
+                ValidId(now.AddHours(-25)), now, TimeSpan.FromHours(24), TimeSpan.FromMinutes(5),
+                out string expiredCode, out _));
+            Assert.AreEqual("REQUEST_ID_EXPIRED", expiredCode);
+            Assert.IsFalse(UuidV7RequestIdPolicy.TryValidate(
+                ValidId(now.AddMinutes(6)), now, TimeSpan.FromHours(24), TimeSpan.FromMinutes(5),
+                out string futureCode, out _));
+            Assert.AreEqual("INVALID_REQUEST_ID", futureCode);
+            Assert.IsFalse(UuidV7RequestIdPolicy.TryValidate(
+                "00000000-0000-4000-8000-000000000001", now,
+                TimeSpan.FromHours(24), TimeSpan.FromMinutes(5), out string versionCode, out _));
+            Assert.AreEqual("INVALID_REQUEST_ID", versionCode);
+        }
+
+        [TestMethod]
+        public void QueryResultStoreRecoversLateResultsWithinBoundedTtl()
+        {
+            DateTime now = new DateTime(2026, 7, 22, 0, 0, 0, DateTimeKind.Utc);
+            var store = new QueryResultStore(
+                capacity: 2,
+                byteCapacity: 64,
+                ttl: TimeSpan.FromMinutes(5),
+                utcNow: () => now);
+
+            store.Complete("one", "client-a", "result-one");
+            Assert.IsTrue(store.TryGet("one", out string response, out DateTime completed));
+            Assert.AreEqual("result-one", response);
+            Assert.AreEqual(now, completed);
+            QueryJournalSnapshot initial = store.Snapshot();
+            Assert.AreEqual(1, initial.EntryCount);
+            Assert.AreEqual(2, initial.EntryCapacity);
+            Assert.AreEqual(10L, initial.RetainedBytes);
+
+            now = now.AddMinutes(1);
+            store.Complete("two", "client-a", "result-two");
+            store.Complete("three", "client-a", "result-three");
+            Assert.IsFalse(store.TryGet("one", out _, out _));
+            Assert.IsTrue(store.TryGet("two", out _, out _));
+            Assert.IsTrue(store.TryGet("three", out _, out _));
+
+            now = now.AddMinutes(6);
+            Assert.IsFalse(store.TryGet("two", out _, out _));
+            Assert.IsFalse(store.TryGet("three", out _, out _));
+
+            store.Complete("oversized", "client-a", new string('x', 65));
+            Assert.IsFalse(store.TryGet("oversized", out _, out _));
+        }
+
+        [TestMethod]
         public void CommandResultStoreNeverEvictsLateCompletionTombstones()
         {
             DateTime now = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
@@ -868,6 +1003,7 @@ namespace VSDebuggerMCP.Tests
         [TestMethod]
         public void MethodCatalogDefinesRiskAndControlSemantics()
         {
+            StringAssert.Matches(DebugMethodCatalog.CatalogHash, new System.Text.RegularExpressions.Regex("^[0-9a-f]{64}$"));
             Assert.AreEqual("command", DebugMethodCatalog.Get("continue").Kind);
             Assert.AreEqual("debug.execution.control", DebugMethodCatalog.Get("continue").Capability);
             CollectionAssert.AreEquivalent(
@@ -1533,6 +1669,8 @@ namespace VSDebuggerMCP.Tests
 
                 Assert.IsTrue(DebuggerRequestContext.MarkUnsafeEvaluationIssued(() => invalidations++));
                 Assert.IsTrue(DebuggerRequestContext.SideEffectIssued);
+                Assert.AreEqual("debugger.evaluate_user_code", DebuggerRequestContext.EffectOperation);
+                Assert.AreEqual("issued", DebuggerRequestContext.EffectStage);
                 Assert.AreEqual(1, invalidations);
                 Assert.AreEqual(1, sideEffects);
 
@@ -1540,6 +1678,227 @@ namespace VSDebuggerMCP.Tests
                 Assert.AreEqual(1, invalidations);
                 Assert.AreEqual(1, sideEffects);
             }
+        }
+
+        [TestMethod]
+        public void CommandEffectBoundaryRecordsIssuedBeforeCallAndConfirmedAfterReturn()
+        {
+            var stages = new List<string>();
+            using (DebuggerRequestContext.Push(
+                DateTimeOffset.UtcNow.AddSeconds(5).ToUnixTimeMilliseconds(),
+                "effect-test",
+                "command",
+                1,
+                true,
+                2,
+                3,
+                true,
+                CancellationToken.None,
+                onEffectStageChanged: (operation, stage) => stages.Add(operation + ":" + stage)))
+            {
+                bool observedIssuedInsideEffect = false;
+                int result = CommandEffectExecutor.Issue("debugger.test_effect", () =>
+                {
+                    observedIssuedInsideEffect = DebuggerRequestContext.SideEffectIssued &&
+                        DebuggerRequestContext.EffectStage == "issued";
+                    return 42;
+                });
+
+                Assert.AreEqual(42, result);
+                Assert.IsTrue(observedIssuedInsideEffect);
+                Assert.AreEqual("debugger.test_effect", DebuggerRequestContext.EffectOperation);
+                Assert.AreEqual("confirmed", DebuggerRequestContext.EffectStage);
+                CollectionAssert.AreEqual(
+                    new[] { "debugger.test_effect:issued", "debugger.test_effect:confirmed" },
+                    stages);
+            }
+        }
+
+        [TestMethod]
+        public void CommandEffectBoundaryLeavesThrowingCallIssuedButUnconfirmed()
+        {
+            using (DebuggerRequestContext.Push(
+                DateTimeOffset.UtcNow.AddSeconds(5).ToUnixTimeMilliseconds(),
+                "effect-failure-test",
+                "command",
+                1,
+                true,
+                2,
+                3,
+                true,
+                CancellationToken.None))
+            {
+                Assert.ThrowsExactly<InvalidOperationException>(() =>
+                    CommandEffectExecutor.Issue(
+                        "debugger.throwing_effect",
+                        () => throw new InvalidOperationException("failure")));
+                Assert.IsTrue(DebuggerRequestContext.SideEffectIssued);
+                Assert.AreEqual("debugger.throwing_effect", DebuggerRequestContext.EffectOperation);
+                Assert.AreEqual("issued", DebuggerRequestContext.EffectStage);
+            }
+        }
+
+        [TestMethod]
+        public void CommandEffectBoundaryRejectsEffectsFromQueries()
+        {
+            using (DebuggerRequestContext.Push(
+                DateTimeOffset.UtcNow.AddSeconds(5).ToUnixTimeMilliseconds(),
+                "query-effect-test",
+                "query",
+                1,
+                true,
+                2,
+                3,
+                true,
+                CancellationToken.None))
+            {
+                Assert.ThrowsExactly<InvalidOperationException>(() =>
+                    CommandEffectExecutor.Issue("debugger.illegal_query_effect", () => { }));
+                Assert.IsFalse(DebuggerRequestContext.SideEffectIssued);
+            }
+        }
+
+        [TestMethod]
+        public void ProductionServicesCannotCallRawSideEffectMarker()
+        {
+            string serviceRoot = Path.Combine(FindRepositoryRoot(), "VSDebuggerMCP", "Services");
+            string[] offenders = Directory.GetFiles(serviceRoot, "*.cs", SearchOption.AllDirectories)
+                .Where(path => !string.Equals(
+                    Path.GetFileName(path),
+                    "CommandEffectExecutor.cs",
+                    StringComparison.OrdinalIgnoreCase))
+                .Where(path => File.ReadAllText(path).Contains(
+                    "DebuggerRequestContext.MarkSideEffectIssued"))
+                .Select(Path.GetFileName)
+                .ToArray();
+            Assert.AreEqual(
+                0,
+                offenders.Length,
+                "Only CommandEffectExecutor may call the raw marker: " + string.Join(", ", offenders));
+        }
+
+        [TestMethod]
+        public void RequestSchemaIsTheSingleOwnerOfParameterRanges()
+        {
+            string root = FindRepositoryRoot();
+            string router = File.ReadAllText(Path.Combine(
+                root,
+                "VSDebuggerMCP",
+                "Ipc",
+                "NamedPipeMethodRouter.cs"));
+            string schema = File.ReadAllText(Path.Combine(
+                root,
+                "VSDebuggerMCP",
+                "Ipc",
+                "DebugRequestSchemaValidator.cs"));
+
+            Assert.IsFalse(router.Contains("ValidateIntegerRange"));
+            Assert.IsFalse(router.Contains("ValidateLongRange"));
+            Assert.IsFalse(router.Contains("ValidateStringRange"));
+            StringAssert.Contains(schema, "processLookupBudgetMs");
+        }
+
+        [TestMethod]
+        public void UiOperationCircuitPoisonsDeterministicallyAndSurvivesReplacementOwners()
+        {
+            DateTime now = new DateTime(2026, 7, 22, 12, 0, 0, DateTimeKind.Utc);
+            var circuit = new UiOperationCircuit(1000, () => now);
+            Assert.IsTrue(circuit.TryAcquire(
+                "request-1", "evaluate_expression", out UiOperationLease first, out _));
+            circuit.MarkUiAdmitted(first);
+            circuit.RecordEffectStage(
+                "request-1", "debugger.evaluate_user_code", "issued");
+            circuit.MarkOutcomeUnknown(first);
+
+            now = now.AddMilliseconds(999);
+            DispatcherHealthSnapshot draining = circuit.Snapshot();
+            Assert.AreEqual("draining_unknown", draining.State);
+            Assert.IsTrue(draining.SideEffectIssued);
+            Assert.AreEqual("debugger.evaluate_user_code", draining.EffectOperation);
+            Assert.AreEqual("issued", draining.EffectStage);
+            Assert.AreEqual("request-1", draining.ActiveRequestId);
+            Assert.AreEqual("evaluate_expression", draining.ActiveMethod);
+            Assert.AreEqual("debugger.evaluate_user_code", draining.EffectOperation);
+            Assert.AreEqual("issued", draining.EffectStage);
+            Assert.IsTrue(draining.SideEffectIssued);
+            Assert.IsFalse(circuit.TryAcquire(
+                "request-2", "get_debug_status", out _, out DispatcherHealthSnapshot conflict));
+            Assert.AreEqual("draining_unknown", conflict.State);
+
+            now = now.AddMilliseconds(1);
+            DispatcherHealthSnapshot poisoned = circuit.Snapshot();
+            Assert.AreEqual("poisoned", poisoned.State);
+            Assert.IsNotNull(poisoned.PoisonedUtc);
+            Assert.IsFalse(circuit.TryAcquire(
+                "request-3", "get_debug_status", out _, out conflict));
+            Assert.AreEqual("poisoned", conflict.State);
+
+            // Only definitive completion by the original owner releases the
+            // process-wide lease; constructing a replacement server/adapter cannot.
+            circuit.Release(first);
+            Assert.AreEqual("healthy", circuit.Snapshot().State);
+            Assert.IsTrue(circuit.TryAcquire(
+                "request-4", "get_debug_status", out UiOperationLease replacement, out _));
+            circuit.Release(replacement);
+        }
+
+        [TestMethod]
+        public void DebugProcessHandlesBindGenerationPidAndCreationTime()
+        {
+            var handles = new DebugProcessHandleStore(capacity: 2);
+            string first = handles.GetOrCreate(1234, 5678, 9);
+            Assert.IsNotNull(first);
+            StringAssert.StartsWith(first, "dph_");
+            Assert.AreEqual(first, handles.GetOrCreate(1234, 5678, 9));
+            Assert.IsTrue(handles.TryResolve(first, 9, out DebugProcessIdentity identity));
+            Assert.AreEqual(1234, identity.ProcessId);
+            Assert.AreEqual(5678, identity.ProcessStartTimeUtcTicks);
+            Assert.AreEqual(9, identity.DebugSessionGeneration);
+
+            Assert.IsFalse(handles.TryResolve(first, 10, out _));
+            Assert.IsNull(handles.GetOrCreate(1234, 0, 10));
+            string replacement = handles.GetOrCreate(1234, 9999, 10);
+            Assert.AreNotEqual(first, replacement);
+        }
+
+        [TestMethod]
+        public void SwitchProcessSchemaPrefersOpaqueHandleAndRejectsAmbiguity()
+        {
+            DebugRequest Request(Dictionary<string, object> parameters) => new DebugRequest
+            {
+                Method = "switch_process",
+                Params = parameters,
+                Meta = new DebugRequestMetadata
+                {
+                    Kind = "command",
+                    Capability = "debug.context.write",
+                    DeadlineUnixMs = DateTimeOffset.UtcNow.AddSeconds(5).ToUnixTimeMilliseconds(),
+                },
+            };
+
+            DebugMethodDescriptor descriptor = DebugRequestSchemaValidator.Validate(
+                Request(new Dictionary<string, object>
+                {
+                    ["processHandle"] = "dph_0123456789abcdef0123456789abcdef",
+                }),
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            Assert.AreEqual("switch_process", descriptor.Name);
+
+            var ambiguous = Assert.ThrowsExactly<DebugRequestSchemaException>(() =>
+                DebugRequestSchemaValidator.Validate(
+                    Request(new Dictionary<string, object>
+                    {
+                        ["processHandle"] = "dph_0123456789abcdef0123456789abcdef",
+                        ["processId"] = 1234,
+                    }),
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+            Assert.AreEqual("INVALID_ARGUMENT", ambiguous.Code);
+
+            var malformed = Assert.ThrowsExactly<DebugRequestSchemaException>(() =>
+                DebugRequestSchemaValidator.Validate(
+                    Request(new Dictionary<string, object> { ["processHandle"] = "dph_bad" }),
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+            Assert.AreEqual("INVALID_ARGUMENT", malformed.Code);
         }
 
         [TestMethod]

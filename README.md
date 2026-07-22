@@ -373,7 +373,9 @@ It never downloads packages with `pip`.
 3. Start or attach to a debug session.
 4. Ask the MCP client to call `detect_debug_sessions`.
 5. In a multi-process Visual Studio session, call `get_debug_processes` and then
-   `switch_process(process_id)` while paused before reading target-specific state.
+   `switch_process(process_handle=...)` while paused before reading target-specific state.
+   The opaque handle binds the debug-session generation and immutable OS process
+   creation time; `process_id` remains a deprecated compatibility fallback.
 6. Use `debug_capabilities` when unsure which tool is appropriate.
 7. For repro loops, use `continue_and_wait_for_break` or the more focused
    `continue_and_capture_*` tools.
@@ -463,7 +465,7 @@ operations (for example execution control plus read access):
 ```json
 {
   "protocol":"aidb/2",
-  "id":"4eb7d887-3799-43ee-8c7c-79ef509ef15a",
+  "id":"019f8a0b-f758-7722-888f-83c5dce0c096",
   "method":"get_callstack",
   "params":{},
   "meta":{
@@ -485,6 +487,11 @@ operations (for example execution control plus read access):
 }
 ```
 
+The owner-only instance registration and every response also carry a
+`protocolCatalogHash` (SHA-256 of the shared method manifest). Discovery fails
+with `PROTOCOL_CATALOG_MISMATCH` when the deployed VSIX and Python bundle do not
+describe the same protocol surface.
+
 Successful response:
 
 ```json
@@ -497,11 +504,25 @@ Error response:
 {"protocol":"aidb/2","id":"...","status":"error","server":{},"error":{"code":"STALE_DEBUG_SESSION","message":"..."}}
 ```
 
-Mutating commands are deduplicated by request ID for the entire VS server-instance
-lifetime; response bodies have a separate bounded cache and eviction never permits
-re-execution. Transport loss after command
-acceptance returns `OUTCOME_UNKNOWN`; clients query `get_command_status` rather
-than replaying the command. `AIDB_ALLOWED_CAPABILITIES` can restrict the server
+Mutating commands require canonical UUIDv7 request IDs and are deduplicated for
+a bounded 24-hour acceptance window. Completed tombstones remain fail-closed for
+that whole window; expired IDs are rejected before they can execute, so bounded
+reclamation never permits replay. Response bodies have a separate bounded cache.
+Transport loss after command acceptance returns `OUTCOME_UNKNOWN`; clients query
+`get_command_status` rather than replaying the command. Queries that finish after
+the transport deadline are retained in a bounded five-minute result journal and
+are recoverable through the same status tool.
+
+The VSIX maintains 8 data, 4 interrupt, and 2 recovery listeners. Their protected
+current-user ACL includes `CreateNewInstance` only so the owning VS process can
+create the configured same-name listener pool; no other SID is granted access.
+An admitted UI/COM operation that remains unresolved after the poison threshold
+puts the process-wide dispatcher into `poisoned`. Use `get_dispatcher_health` for
+the active request/effect state plus actor queue depth, configured listener pool,
+command-ledger capacity, and query-journal usage; recovery requires restarting
+that Visual Studio process and cannot be bypassed by toggling the MCP server.
+
+`AIDB_ALLOWED_CAPABILITIES` can restrict the server
 to a comma-separated subset. Pipe and instance-registration ACLs are always
 protected current-user owner-only ACLs; there is no world-access compatibility mode.
 This is intentionally a same-Windows-user trust boundary, not a defense against a

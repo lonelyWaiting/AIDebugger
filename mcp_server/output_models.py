@@ -407,6 +407,38 @@ class CommandStatusPayload(StrictPayload):
     cancellationRequested: Optional[bool] = None
     cancellationIssued: Optional[bool] = None
     sideEffectIssued: Optional[bool] = None
+    effectOperation: Optional[str] = None
+    effectStage: Optional[str] = None
+
+
+class DispatcherHealthPayload(StrictPayload):
+    state: Literal["healthy", "dispatching", "executing", "draining_unknown", "poisoned"]
+    activeRequestId: Optional[str] = None
+    activeMethod: Optional[str] = None
+    dispatchStartedAtUtc: Optional[str] = None
+    uiAdmittedAtUtc: Optional[str] = None
+    poisonedAtUtc: Optional[str] = None
+    elapsedMs: int
+    poisonAfterMs: int
+    pendingUiOperations: bool
+    sideEffectIssued: bool
+    effectOperation: Optional[str] = None
+    effectStage: Optional[str] = None
+    recoveryAction: Optional[Literal["restart_visual_studio"]] = None
+    activeRequestCount: int
+    actorQueueDepth: int
+    dataListenerCount: int
+    interruptListenerCount: int
+    recoveryListenerCount: int
+    commandTombstoneCount: int
+    commandTombstoneCapacity: int
+    commandResultCount: int
+    commandResultBytes: int
+    oldestCommandAgeMs: int
+    queryResultCount: int
+    queryResultCapacity: int
+    queryResultBytes: int
+    queryResultByteCapacity: int
 
 
 class DebugStatusPayload(StrictPayload):
@@ -516,6 +548,10 @@ class ThreadsPayload(StrictPayload):
 
 class DebugProcessInfoPayload(StrictPayload):
     processId: int
+    processHandle: Optional[str] = None
+    processStartTimeUtcTicks: Optional[int] = None
+    identityStatus: Literal["verified", "unavailable"]
+    debugSessionGeneration: int
     name: str
     isCurrent: bool
     programCount: int
@@ -881,6 +917,7 @@ class ProcessDebugPayload(OperationPayload):
     attachCompleted: Optional[bool] = None
     outcome: Optional[str] = None
     processId: Optional[int] = None
+    processHandle: Optional[str] = None
     processStartTimeUtcTicks: Optional[int] = None
     processName: Optional[str] = None
     executablePath: Optional[str] = None
@@ -1046,6 +1083,7 @@ class HybridContextPayload(StrictPayload):
 
 _MODEL_BY_TOOL: Dict[str, Type[StrictPayload]] = {
     "debug_capabilities": CapabilityPayload,
+    "get_dispatcher_health": DispatcherHealthPayload,
     "get_command_status": CommandStatusPayload,
     "cancel_debug_request": CommandStatusPayload,
     **{name: InstanceListPayload for name in (

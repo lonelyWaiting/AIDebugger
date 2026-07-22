@@ -35,6 +35,7 @@ class VSBridgeResponseTests(unittest.TestCase):
                 "processId": 42,
                 "processStartTimeUtcTicks": 123456,
                 "serverInstanceId": "instance",
+                "protocolCatalogHash": vs_tool_registry.DEBUG_METHOD_CATALOG_HASH,
                 "debugSessionGeneration": 7,
                 "breakSequence": 11,
                 "contextEpoch": 13,
@@ -61,6 +62,21 @@ class VSBridgeResponseTests(unittest.TestCase):
             self.request_id,
         )
         self.assertEqual({"isPaused": True}, result)
+
+    def test_response_rejects_protocol_catalog_mismatch(self) -> None:
+        expected = {
+            "processId": 42,
+            "processStartTimeUtcTicks": 123456,
+            "serverInstanceId": "instance",
+            "protocolCatalogHash": "0" * 64,
+        }
+        with self.assertRaises(vs_bridge.VSBridgeError) as raised:
+            vs_bridge._decode_response(
+                self.encode({"id": self.request_id, "result": {}}),
+                self.request_id,
+                expected_server=expected,
+            )
+        self.assertEqual("PROTOCOL_CATALOG_MISMATCH", raised.exception.code)
 
     def test_response_id_mismatch_is_rejected(self) -> None:
         with self.assertRaises(vs_bridge.VSBridgeError) as raised:
@@ -669,6 +685,7 @@ class IDEBridgeRetryTests(unittest.IsolatedAsyncioTestCase):
             "processId": 42,
             "processStartTimeUtcTicks": 123456,
             "serverInstanceId": "instance",
+            "protocolCatalogHash": vs_tool_registry.DEBUG_METHOD_CATALOG_HASH,
             "debugSessionGeneration": 7,
             "breakSequence": 11,
             "contextEpoch": 13,

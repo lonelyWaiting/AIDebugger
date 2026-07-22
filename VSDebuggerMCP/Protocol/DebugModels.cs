@@ -42,6 +42,97 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "sideEffectIssued")]
         public bool SideEffectIssued { get; set; }
+
+        [DataMember(Name = "effectOperation", EmitDefaultValue = false)]
+        public string EffectOperation { get; set; }
+
+        [DataMember(Name = "effectStage", EmitDefaultValue = false)]
+        public string EffectStage { get; set; }
+    }
+
+    [DataContract]
+    public class DispatcherHealthResult
+    {
+        [DataMember(Name = "state")]
+        public string State { get; set; }
+
+        [DataMember(Name = "activeRequestId", EmitDefaultValue = false)]
+        public string ActiveRequestId { get; set; }
+
+        [DataMember(Name = "activeMethod", EmitDefaultValue = false)]
+        public string ActiveMethod { get; set; }
+
+        [DataMember(Name = "dispatchStartedAtUtc", EmitDefaultValue = false)]
+        public string DispatchStartedAtUtc { get; set; }
+
+        [DataMember(Name = "uiAdmittedAtUtc", EmitDefaultValue = false)]
+        public string UiAdmittedAtUtc { get; set; }
+
+        [DataMember(Name = "poisonedAtUtc", EmitDefaultValue = false)]
+        public string PoisonedAtUtc { get; set; }
+
+        [DataMember(Name = "elapsedMs")]
+        public long ElapsedMs { get; set; }
+
+        [DataMember(Name = "poisonAfterMs")]
+        public int PoisonAfterMs { get; set; }
+
+        [DataMember(Name = "pendingUiOperations")]
+        public bool PendingUiOperations { get; set; }
+
+        [DataMember(Name = "sideEffectIssued")]
+        public bool SideEffectIssued { get; set; }
+
+        [DataMember(Name = "effectOperation", EmitDefaultValue = false)]
+        public string EffectOperation { get; set; }
+
+        [DataMember(Name = "effectStage", EmitDefaultValue = false)]
+        public string EffectStage { get; set; }
+
+        [DataMember(Name = "recoveryAction", EmitDefaultValue = false)]
+        public string RecoveryAction { get; set; }
+
+        [DataMember(Name = "activeRequestCount")]
+        public int ActiveRequestCount { get; set; }
+
+        [DataMember(Name = "actorQueueDepth")]
+        public int ActorQueueDepth { get; set; }
+
+        [DataMember(Name = "dataListenerCount")]
+        public int DataListenerCount { get; set; }
+
+        [DataMember(Name = "interruptListenerCount")]
+        public int InterruptListenerCount { get; set; }
+
+        [DataMember(Name = "recoveryListenerCount")]
+        public int RecoveryListenerCount { get; set; }
+
+        [DataMember(Name = "commandTombstoneCount")]
+        public int CommandTombstoneCount { get; set; }
+
+        [DataMember(Name = "commandTombstoneCapacity")]
+        public int CommandTombstoneCapacity { get; set; }
+
+        [DataMember(Name = "commandResultCount")]
+        public int CommandResultCount { get; set; }
+
+        [DataMember(Name = "commandResultBytes")]
+        public long CommandResultBytes { get; set; }
+
+        [DataMember(Name = "oldestCommandAgeMs")]
+        public long OldestCommandAgeMs { get; set; }
+
+        [DataMember(Name = "queryResultCount")]
+        public int QueryResultCount { get; set; }
+
+        [DataMember(Name = "queryResultCapacity")]
+        public int QueryResultCapacity { get; set; }
+
+        [DataMember(Name = "queryResultBytes")]
+        public long QueryResultBytes { get; set; }
+
+        [DataMember(Name = "queryResultByteCapacity")]
+        public long QueryResultByteCapacity { get; set; }
     }
 
     #region Debug Status
@@ -468,6 +559,18 @@ namespace VSDebuggerMCP.Protocol
     {
         [DataMember(Name = "processId")]
         public int ProcessId { get; set; }
+
+        [DataMember(Name = "processHandle", EmitDefaultValue = false)]
+        public string ProcessHandle { get; set; }
+
+        [DataMember(Name = "processStartTimeUtcTicks", EmitDefaultValue = false)]
+        public long ProcessStartTimeUtcTicks { get; set; }
+
+        [DataMember(Name = "identityStatus")]
+        public string IdentityStatus { get; set; }
+
+        [DataMember(Name = "debugSessionGeneration")]
+        public long DebugSessionGeneration { get; set; }
 
         [DataMember(Name = "name")]
         public string Name { get; set; }
@@ -1973,6 +2076,9 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "processId")]
         public int ProcessId { get; set; }
+
+        [DataMember(Name = "processHandle", EmitDefaultValue = false)]
+        public string ProcessHandle { get; set; }
 
         [DataMember(Name = "processStartTimeUtcTicks", EmitDefaultValue = false)]
         public long ProcessStartTimeUtcTicks { get; set; }

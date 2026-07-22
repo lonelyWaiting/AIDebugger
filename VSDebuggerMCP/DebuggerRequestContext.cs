@@ -14,8 +14,12 @@ namespace VSDebuggerMCP
         public static bool RequiresStableDebugContext => CurrentState.Value?.RequiresStableDebugContext ?? false;
         public static CancellationToken CancellationToken => CurrentState.Value?.CancellationToken ?? System.Threading.CancellationToken.None;
         public static bool IsCommand => string.Equals(CurrentState.Value?.Kind, "command", StringComparison.Ordinal);
+        public static string RequestId => CurrentState.Value?.RequestId;
+        public static string Method => CurrentState.Value?.Method;
         public static bool MayEvaluateUserCode => CurrentState.Value?.MayEvaluateUserCode ?? false;
         public static bool SideEffectIssued => CurrentState.Value?.SideEffectIssued ?? false;
+        public static string EffectOperation => CurrentState.Value?.EffectOperation;
+        public static string EffectStage => CurrentState.Value?.EffectStage ?? "none";
 
         public static bool MarkUnsafeEvaluationIssued(Action invalidateContext)
         {
@@ -26,21 +30,47 @@ namespace VSDebuggerMCP
                 state.UnsafeEvaluationContextInvalidated = true;
                 invalidateContext?.Invoke();
             }
-            MarkSideEffectIssued();
+            MarkSideEffectIssued("debugger.evaluate_user_code");
             return true;
         }
 
-        public static void MarkSideEffectIssued()
+        internal static void MarkSideEffectIssued(string operation)
         {
             RequestState state = CurrentState.Value;
             if (state != null && string.Equals(state.Kind, "command", StringComparison.Ordinal))
             {
+                if (!string.IsNullOrWhiteSpace(operation))
+                {
+                    state.EffectOperation = operation;
+                }
+                state.EffectStage = "issued";
                 if (!state.SideEffectIssued)
                 {
                     state.SideEffectIssued = true;
                     state.OnSideEffectIssued?.Invoke();
                 }
+                state.OnEffectStageChanged?.Invoke(state.EffectOperation, state.EffectStage);
             }
+        }
+
+        internal static void MarkSideEffectConfirmed(string operation)
+        {
+            RequestState state = CurrentState.Value;
+            if (state == null || !string.Equals(state.Kind, "command", StringComparison.Ordinal))
+            {
+                return;
+            }
+            if (!state.SideEffectIssued)
+            {
+                throw new InvalidOperationException(
+                    "A command effect cannot be confirmed before it is issued.");
+            }
+            if (!string.IsNullOrWhiteSpace(operation))
+            {
+                state.EffectOperation = operation;
+            }
+            state.EffectStage = "confirmed";
+            state.OnEffectStageChanged?.Invoke(state.EffectOperation, state.EffectStage);
         }
 
         public static DebuggerIdentitySnapshot CaptureIdentity()
@@ -142,13 +172,16 @@ namespace VSDebuggerMCP
             bool requiresStableDebugContext,
             CancellationToken cancellationToken,
             bool mayEvaluateUserCode = false,
-            Action onSideEffectIssued = null)
+            Action onSideEffectIssued = null,
+            Action<string, string> onEffectStageChanged = null,
+            string method = null)
         {
             RequestState previous = CurrentState.Value;
             CurrentState.Value = new RequestState
             {
                 DeadlineUnixMs = deadlineUnixMs,
                 RequestId = requestId,
+                Method = method,
                 Kind = kind,
                 ExpectedDebugSessionGeneration = expectedDebugSessionGeneration,
                 RequiresStableDebugSession = requiresStableDebugSession,
@@ -158,6 +191,7 @@ namespace VSDebuggerMCP
                 CancellationToken = cancellationToken,
                 MayEvaluateUserCode = mayEvaluateUserCode,
                 OnSideEffectIssued = onSideEffectIssued,
+                OnEffectStageChanged = onEffectStageChanged,
             };
             return new Scope(() => CurrentState.Value = previous);
         }
@@ -171,6 +205,7 @@ namespace VSDebuggerMCP
         {
             public long DeadlineUnixMs { get; set; }
             public string RequestId { get; set; }
+            public string Method { get; set; }
             public string Kind { get; set; }
             public long ExpectedDebugSessionGeneration { get; set; }
             public bool RequiresStableDebugSession { get; set; }
@@ -183,6 +218,9 @@ namespace VSDebuggerMCP
             public bool MayEvaluateUserCode { get; set; }
             public bool UnsafeEvaluationContextInvalidated { get; set; }
             public Action OnSideEffectIssued { get; set; }
+            public string EffectOperation { get; set; }
+            public string EffectStage { get; set; }
+            public Action<string, string> OnEffectStageChanged { get; set; }
         }
 
         private sealed class Scope : IDisposable

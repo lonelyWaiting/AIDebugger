@@ -54,6 +54,7 @@ namespace VSDebuggerMCP.Protocol
     [KnownType(typeof(DebugBundleResult))]
     [KnownType(typeof(ContinueAndWaitResult))]
     [KnownType(typeof(CommandRequestStatusResult))]
+    [KnownType(typeof(DispatcherHealthResult))]
     public class DebugResponse
     {
         [DataMember(Name = "protocol")]
@@ -100,6 +101,9 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "serverInstanceId")]
         public string ServerInstanceId { get; set; }
+
+        [DataMember(Name = "protocolCatalogHash")]
+        public string ProtocolCatalogHash { get; set; }
 
         [DataMember(Name = "debugSessionGeneration")]
         public long DebugSessionGeneration { get; set; }

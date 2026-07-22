@@ -10,6 +10,8 @@ namespace VSDebuggerMCP
         private string _state = "queued";
         private DateTime? _startedUtc;
         private bool _sideEffectIssued;
+        private string _effectOperation;
+        private string _effectStage = "none";
 
         public CancellationTokenSource Cancellation { get; set; }
         public string Fingerprint { get; set; }
@@ -32,6 +34,16 @@ namespace VSDebuggerMCP
             lock (_sync)
             {
                 _sideEffectIssued = true;
+            }
+        }
+
+        public void MarkEffectStage(string operation, string stage)
+        {
+            lock (_sync)
+            {
+                _sideEffectIssued = true;
+                if (!string.IsNullOrWhiteSpace(operation)) _effectOperation = operation;
+                if (!string.IsNullOrWhiteSpace(stage)) _effectStage = stage;
             }
         }
 
@@ -96,6 +108,8 @@ namespace VSDebuggerMCP
                     StartedUtc = _startedUtc,
                     CancellationRequested = Cancellation.IsCancellationRequested,
                     SideEffectIssued = _sideEffectIssued,
+                    EffectOperation = _effectOperation,
+                    EffectStage = _effectStage,
                 };
             }
         }
@@ -120,5 +134,7 @@ namespace VSDebuggerMCP
         public DateTime? StartedUtc { get; set; }
         public bool CancellationRequested { get; set; }
         public bool SideEffectIssued { get; set; }
+        public string EffectOperation { get; set; }
+        public string EffectStage { get; set; }
     }
 }

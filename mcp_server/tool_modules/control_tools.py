@@ -15,6 +15,33 @@ except ImportError:
 
 
 @mcp.tool()
+async def get_dispatcher_health(
+    target_pipe_name: Optional[str] = None,
+    target_server_instance_id: Optional[str] = None,
+    target_process_id: Optional[int] = None,
+    target_process_start_time_utc_ticks: Optional[int] = None,
+) -> str:
+    """Return process-wide VS UI/COM dispatcher health through the recovery lane."""
+    try:
+        target = _build_recovery_target(
+            target_pipe_name,
+            target_server_instance_id,
+            target_process_id,
+            target_process_start_time_utc_ticks,
+        )
+        result = await (
+            vs_bridge.call_pipe_exact(
+                target, "get_dispatcher_health", {}, timeout=10.0)
+            if target else
+            ide_bridge.call(
+                "get_dispatcher_health", {}, timeout=10.0, preferred_ide="vs")
+        )
+        return format_result(result)
+    except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as e:
+        return handle_ide_error(e, "get_dispatcher_health")
+
+
+@mcp.tool()
 async def get_command_status(
     request_id: str,
     target_pipe_name: Optional[str] = None,
@@ -141,8 +168,8 @@ async def get_debug_processes(
     """
     List processes already participating in the current Visual Studio debug session.
 
-    Use the returned processId with switch_process. This never lists unattached
-    local processes and never starts or attaches to another process.
+    Use the returned processHandle with switch_process. Handles bind the debug
+    session, PID, and OS process creation time; processId remains a legacy fallback.
     """
     try:
         params = add_bounded_collection_params({}, start_index, max_nodes, budget_ms)
@@ -172,22 +199,37 @@ async def list_debug_processes(
 
 @mcp.tool()
 async def switch_process(
-    process_id: int,
+    process_id: Optional[int] = None,
     process_lookup_budget_ms: Optional[int] = None,
     timeout_seconds: Optional[float] = None,
+    process_handle: Optional[str] = None,
 ) -> str:
     """
     Switch the current target process inside the same paused Visual Studio debug session.
 
-    Call get_debug_processes first. The target PID must already be present in
-    Debugger.DebuggedProcesses; this tool never attaches to a new process.
+    Call get_debug_processes first and pass its processHandle. Legacy process_id
+    is accepted only as an explicit fallback. This never attaches a new process.
     """
     try:
-        params = {
-            "processId": validate_int_range(
+        if (process_id is None) == (process_handle is None):
+            raise ide_bridge.IDEBridgeError(
+                "Provide exactly one of process_handle or legacy process_id",
+                code="INVALID_ARGUMENT",
+            )
+        params = {}
+        if process_handle is not None:
+            if not isinstance(process_handle, str) or not re.fullmatch(
+                r"dph_[0-9a-f]{32}", process_handle
+            ):
+                raise ide_bridge.IDEBridgeError(
+                    "process_handle is not a valid opaque debug-process handle",
+                    code="INVALID_ARGUMENT",
+                )
+            params["processHandle"] = process_handle
+        else:
+            params["processId"] = validate_int_range(
                 "process_id", process_id, 1, 0x7FFFFFFF
             )
-        }
         if process_lookup_budget_ms is not None:
             params["processLookupBudgetMs"] = validate_int_range(
                 "process_lookup_budget_ms", process_lookup_budget_ms, 0, 120000
@@ -207,12 +249,18 @@ async def switch_process(
 
 @mcp.tool()
 async def select_process(
-    process_id: int,
+    process_id: Optional[int] = None,
     process_lookup_budget_ms: Optional[int] = None,
     timeout_seconds: Optional[float] = None,
+    process_handle: Optional[str] = None,
 ) -> str:
     """Alias for switch_process."""
-    return await switch_process(process_id, process_lookup_budget_ms, timeout_seconds)
+    return await switch_process(
+        process_id=process_id,
+        process_lookup_budget_ms=process_lookup_budget_ms,
+        timeout_seconds=timeout_seconds,
+        process_handle=process_handle,
+    )
 
 
 def _build_attach_process_params(

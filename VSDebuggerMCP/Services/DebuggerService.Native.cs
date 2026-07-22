@@ -142,20 +142,25 @@ namespace VSDebuggerMCP
                 {
                     string addressText = resolvedAddress.VirtualAddress;
                     result.CommandIssued = true;
-                    DebuggerRequestContext.MarkSideEffectIssued();
-                    EnvDTE.Breakpoints breakpoints = debugger.Breakpoints.Add(
-                        string.Empty,
-                        string.Empty,
-                        0,
-                        0,
-                        normalizedCondition ?? string.Empty,
-                        breakpointConditionType,
-                        "C++",
-                        string.Empty,
-                        1,
-                        addressText,
-                        normalizedHitCount,
-                        breakpointHitCountType);
+                    EnvDTE.Breakpoints breakpoints = CommandEffectExecutor.Issue(
+                        "breakpoint.add_address",
+                        () =>
+                        {
+                            ThreadHelper.ThrowIfNotOnUIThread();
+                            return debugger.Breakpoints.Add(
+                                string.Empty,
+                                string.Empty,
+                                0,
+                                0,
+                                normalizedCondition ?? string.Empty,
+                                breakpointConditionType,
+                                "C++",
+                                string.Empty,
+                                1,
+                                addressText,
+                                normalizedHitCount,
+                                breakpointHitCountType);
+                        });
 
                     if (breakpoints == null || breakpoints.Count == 0)
                     {

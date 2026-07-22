@@ -14,25 +14,27 @@ development entry remains available for explicit cross-IDE use, but it is not
 the VSIX production path.
 
 ```text
-VSIX -> AIDebuggerVS_<PID> + AIDebuggerVS_<PID>_control
+VSIX -> AIDebuggerVS_<PID> + _control + _recovery
      -> authenticated AIDB/2 -> VS-only FastMCP server
 
 Rider plugin -> AIDebuggerRider_<PID>
              -> Rider FastMCP server
 ```
 
-The `_control` pipe is paired with one VS instance; it is not a separately
-selectable instance. It exposes only immutable health/request-status and
-cancellation operations. Debugger and solution state use the ordinary pipe and
+The `_control` and `_recovery` pipes are paired with one VS instance; neither is
+a separately selectable instance. Interrupt operations use `_control`, while
+immutable dispatcher health, request-status, and cancellation recovery remain
+available on `_recovery`. Debugger and solution state use the ordinary pipe and
 the per-instance actor.
 
 ## Visual Studio security and command semantics
 
 The current VS transport has these mandatory properties:
 
-- protected current-user DACL with read/write/synchronize only; each public pipe
-  name has exactly one reconnecting server instance, so clients never receive
-  `FILE_CREATE_PIPE_INSTANCE`/`CreateNewInstance`;
+- protected current-user DACL with read/write/synchronize/create-instance for
+  the current user SID only. The create-instance right is required for the
+  configured 8 data, 4 interrupt, and 2 recovery listeners sharing each lane
+  name; no world, permission-change, or ownership right is granted;
 - local-client, same-user SID, process creation time, integrity level, PID,
   server nonce, and per-instance authentication-token validation. Executable
   signing is checked separately when selecting a Python runtime for generated
@@ -40,12 +42,27 @@ The current VS transport has these mandatory properties:
 - length-prefixed UTF-8 frames with byte limits, strict envelopes, duplicate
   property rejection, JSON depth limits, and request/response ID matching;
 - immutable target identity: PID, process creation time, server instance ID,
-  debug session generation, break sequence, and context epoch;
-- bounded command queue and lifetime request-ID tombstones;
+  protocol catalog hash, debug session generation, break sequence, and context
+  epoch. A VSIX/Python catalog mismatch is rejected during discovery and on
+  every response;
+- bounded command queue and UUIDv7 request-ID tombstones covering a 24-hour
+  acceptance window; old IDs are rejected before execution and completed
+  tombstones can then be reclaimed safely;
 - no automatic replay of mutating commands after a transport failure;
 - an accepted command remains owned until its Visual Studio operation reaches a
   definitive result. `get_command_status` is the recovery path after the client
   receives an unknown outcome;
+- queries that finish after their transport deadline enter a bounded five-minute
+  result journal and can be recovered through `get_command_status` instead of
+  being executed again;
+- side effects pass through one structural `CommandEffectExecutor` boundary,
+  which records `issued` before the external call and `confirmed` only after it
+  returns successfully;
+- UI/COM dispatch ownership is process-wide. An unresolved admitted operation
+  transitions from `draining_unknown` to `poisoned`; `get_dispatcher_health`
+  remains available with actor/listener/ledger/journal capacity metrics, and
+  recovery requires restarting Visual Studio, not merely restarting the MCP
+  server;
 - session-scoped capability grants. Read-only startup grants only
   `server.control` and `debug.read`; every additional capability is selected and
   confirmed explicitly.
@@ -57,8 +74,11 @@ explicit Tools-menu actions with per-client preview and confirmation.
 ## Capability contract
 
 The machine-readable source of truth is
-`mcp_server/debug_method_manifest.json`. C# and Python validate against the same
-manifest at build/test time. Public FastMCP tools also have strict output
+`mcp_server/debug_method_manifest.json`. C# and Python load that same manifest,
+publish its SHA-256 catalog hash, and fail closed if deployed hashes differ.
+Parameter range semantics have one C# owner (`DebugRequestSchemaValidator`);
+the method router performs only lossless extraction after schema preflight.
+Public FastMCP tools also have strict output
 models in `mcp_server/output_models.py`.
 
 Important semantic differences:
@@ -67,7 +87,7 @@ Important semantic differences:
 |---|---|---|
 | Output | Multiple named panes | Debug console only |
 | Watch | Persists in the VS Watch window | Evaluate-only |
-| Same-session process selection | Enumerates `Debugger.DebuggedProcesses`; `switch_process` selects an existing PID while paused | No equivalent multi-process selection contract exposed |
+| Same-session process selection | Enumerates `Debugger.DebuggedProcesses`; `switch_process` selects an opaque session/PID/start-time handle while paused (legacy PID fallback remains) | No equivalent multi-process selection contract exposed |
 | Source location | Official debugger document context; explicit unavailable status when absent | Rider debugger position APIs |
 | Native/dump inspection | VS-specific native, memory, disassembly, module, and dump workflows | Capability-dependent and more limited |
 | Command recovery | AIDB/2 request ledger and exact target handle | Rider-specific transport semantics |

@@ -78,6 +78,7 @@ VS_ONLY_BACKEND_METHODS = frozenset({
     "continue_and_wait_for_break_safe",
     "get_breakpoint_bindings",
     "get_debug_processes",
+    "get_dispatcher_health",
     "get_module_layout",
     "get_request_status",
     "cancel_request",
@@ -233,6 +234,8 @@ def _spec(
 TOOLS: Dict[str, ToolSpec] = {
     # Capability / discovery
     "debug_capabilities": _spec("debug_capabilities", "capability"),
+    "get_dispatcher_health": _spec(
+        "get_dispatcher_health", "control", "get_dispatcher_health"),
     "get_command_status": _spec("get_command_status", "control", "get_request_status"),
     "cancel_debug_request": _spec("cancel_debug_request", "control", "cancel_request"),
 

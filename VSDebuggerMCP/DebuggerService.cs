@@ -257,6 +257,7 @@ namespace VSDebuggerMCP
         private readonly IManagedInspectionService _managedInspectionService;
         private readonly VisualStudioSourceLocationAdapter _sourceLocationAdapter;
         private readonly IVisualStudioDebuggerAdapter _visualStudioAdapter;
+        private readonly DebugProcessHandleStore _debugProcessHandles;
         private string _activeDumpFilePath;
         private long _activeDumpSessionGeneration;
         private string _pendingDumpFilePath;
@@ -313,6 +314,7 @@ namespace VSDebuggerMCP
             _managedInspectionService = new ManagedInspectionService(_log);
             _sourceLocationAdapter = new VisualStudioSourceLocationAdapter();
             _visualStudioAdapter = new VisualStudioDebuggerAdapter();
+            _debugProcessHandles = new DebugProcessHandleStore();
             _sessionTracker = new DebugSessionTracker(_dte, _log);
             ObserveDebugContext(Debugger);
         }
@@ -507,6 +509,29 @@ namespace VSDebuggerMCP
 
         internal bool HasPendingUiOperations => _visualStudioAdapter.HasPendingOperations;
 
+        internal DispatcherHealthResult GetDispatcherHealth()
+        {
+            DispatcherHealthSnapshot snapshot = _visualStudioAdapter.GetDispatcherHealth();
+            return new DispatcherHealthResult
+            {
+                State = snapshot.State,
+                ActiveRequestId = snapshot.ActiveRequestId,
+                ActiveMethod = snapshot.ActiveMethod,
+                DispatchStartedAtUtc = snapshot.DispatchStartedUtc?.ToString("O"),
+                UiAdmittedAtUtc = snapshot.UiAdmissionUtc?.ToString("O"),
+                PoisonedAtUtc = snapshot.PoisonedUtc?.ToString("O"),
+                ElapsedMs = snapshot.ElapsedMs,
+                PoisonAfterMs = snapshot.PoisonAfterMs,
+                PendingUiOperations = _visualStudioAdapter.HasPendingOperations,
+                SideEffectIssued = snapshot.SideEffectIssued,
+                EffectOperation = snapshot.EffectOperation,
+                EffectStage = snapshot.EffectStage,
+                RecoveryAction = string.Equals(snapshot.State, "poisoned", StringComparison.Ordinal)
+                    ? "restart_visual_studio"
+                    : null,
+            };
+        }
+
         private void RecordRequestCompletionCandidate()
         {
             StopEventSnapshot current = _sessionTracker.GetStopEventSnapshot();
@@ -567,7 +592,6 @@ namespace VSDebuggerMCP
 
         private void MarkExecutionStateCommandIssued(string reason)
         {
-            DebuggerRequestContext.MarkSideEffectIssued();
             _sessionTracker.InvalidateContext(reason);
             RebaseRequestToCurrentDebuggerIdentity();
         }
@@ -583,7 +607,6 @@ namespace VSDebuggerMCP
 
         private void MarkDebugSessionTransitionCommandIssued(string reason)
         {
-            DebuggerRequestContext.MarkSideEffectIssued();
             _sessionTracker.InvalidateSessionTransition(reason);
             RebaseRequestToCurrentDebuggerIdentity();
         }

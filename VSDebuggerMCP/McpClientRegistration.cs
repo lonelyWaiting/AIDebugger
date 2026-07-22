@@ -61,7 +61,7 @@ namespace VSDebuggerMCP
 - 推荐操作：无会话时先 attach_process(process_name=""UnrealEditor.exe"") 或 start_debugging；按位置用 set_breakpoint(file_path,line_number)，按函数用 set_function_breakpoint；需要线程/栈帧切换时用 get_threads + switch_thread、get_callstack + switch_stack_frame
 - 默认只暴露 canonical 工具名：debug_continue、debug_break、debug_step_over、debug_step_into、debug_step_out；统一入口 debug_control(action) 可用于 continue/break/stop/step/detach
 - For stop debugging / terminate debug session, use debug_stop or debug_control(action=""stop""). To detach without terminating the process, use detach_process or debug_control(action=""detach"").
-- For a multi-process Visual Studio debug session, call get_debug_processes first, then switch_process(process_id) while paused. It selects only an existing Debugger.DebuggedProcesses target and never attaches a new local process.
+- For a multi-process Visual Studio debug session, call get_debug_processes first, then switch_process(process_handle=...) while paused. The opaque handle binds session generation, PID, and OS creation time; it never attaches a new local process.
 - set_breakpoint/set_function_breakpoint 支持 condition、condition_type、hit_count、hit_count_type；删除断点使用 delete_breakpoint
 - 当前不暴露 logpoint 工具：VS EnvDTE 没有可靠公开的非中断 tracepoint action/message API；需要时改用源码 UE_LOG/OutputDebugString 或条件断点+手动求值
 

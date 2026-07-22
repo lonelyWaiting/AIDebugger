@@ -15,6 +15,7 @@ using System.Web.Script.Serialization;
 using Microsoft.Win32.SafeHandles;
 using VSDebuggerMCP.Ipc;
 using VSDebuggerMCP.Protocol;
+using VSDebuggerMCP.Services;
 
 
 namespace VSDebuggerMCP
@@ -75,12 +76,18 @@ namespace VSDebuggerMCP
             CommandReservationLease commandLease = null;
             if (isCommand)
             {
-                if (!IsCanonicalUuidV7(request.Id))
+                if (!UuidV7RequestIdPolicy.TryValidate(
+                    request.Id,
+                    DateTime.UtcNow,
+                    CommandDeduplicationWindow,
+                    CommandRequestFutureSkew,
+                    out string requestIdErrorCode,
+                    out string requestIdErrorMessage))
                 {
                     return SerializeResponse(DebugResponse.Failure(
                         request.Id,
-                        "INVALID_REQUEST_ID",
-                        "Command request ids must be canonical lowercase UUIDv7 values for the server-global at-most-once ledger."));
+                        requestIdErrorCode,
+                        requestIdErrorMessage));
                 }
                 fingerprint = ComputeCommandFingerprint(request);
                 CommandReservationStatus reservation = _commandResults.ReserveOrLookup(
@@ -121,8 +128,8 @@ namespace VSDebuggerMCP
                 {
                     return SerializeResponse(DebugResponse.Failure(
                         request.Id,
-                        "COMMAND_LEDGER_RESTART_REQUIRED",
-                        "The lifetime command-id ledger is full. In Visual Studio run Tools > Disable AIDebugger Server, then Tools > Enable AIDebugger Server to create a new authenticated server instance before issuing commands."));
+                        "COMMAND_LEDGER_WINDOW_CAPACITY_EXCEEDED",
+                        "The 24-hour command-id deduplication window is at capacity. Wait for the oldest command ids to expire or restart Visual Studio before issuing more commands."));
                 }
             }
 
@@ -232,7 +239,16 @@ namespace VSDebuggerMCP
                         methodDescriptor.RequiresStableDebugContext,
                         activeRequest.Cancellation.Token,
                         methodDescriptor.MayEvaluateUserCode,
-                        activeRequest.MarkSideEffectIssued))
+                        activeRequest.MarkSideEffectIssued,
+                        (operation, stage) =>
+                        {
+                            activeRequest.MarkEffectStage(operation, stage);
+                            UiOperationCircuit.ProcessWide.RecordEffectStage(
+                                request.Id,
+                                operation,
+                                stage);
+                        },
+                        methodDescriptor.Name))
                     {
                         if (!methodDescriptor.LongRunningWait)
                         {
@@ -379,6 +395,16 @@ namespace VSDebuggerMCP
                         ? $"The active Visual Studio debugger engine does not support '{request.Method}'."
                         : ex.Message), completionIdentity);
             }
+            catch (DebuggerDispatchPoisonedException ex)
+            {
+                response = SerializeResponse(CreateFailureResponse(
+                    request.Id,
+                    "DEBUGGER_DISPATCH_POISONED",
+                    ex.Message,
+                    CreateDispatcherHealthDetails(ex.Health),
+                    "dispatcher_poisoned",
+                    ex.Health?.SideEffectIssued == true), completionIdentity);
+            }
             catch (MainThreadDispatchTimeoutException ex)
             {
                 string code = RequestOutcomePolicy.ClassifyNotStartedFailure(
@@ -490,6 +516,10 @@ namespace VSDebuggerMCP
                     {
                         _commandResults.Complete(commandLease, response);
                     }
+                    else if (!isCommand && response != null)
+                    {
+                        _queryResults.Complete(request.Id, clientLane, response);
+                    }
                     CompleteActiveRequest(activeRequestKey, activeRequest);
                 }
                 operationAdmissionLease?.Dispose();
@@ -529,7 +559,16 @@ namespace VSDebuggerMCP
                         descriptor.RequiresStableDebugContext,
                         activeRequest.Cancellation.Token,
                         descriptor.MayEvaluateUserCode,
-                        activeRequest.MarkSideEffectIssued))
+                        activeRequest.MarkSideEffectIssued,
+                        (operation, stage) =>
+                        {
+                            activeRequest.MarkEffectStage(operation, stage);
+                            UiOperationCircuit.ProcessWide.RecordEffectStage(
+                                request.Id,
+                                operation,
+                                stage);
+                        },
+                        descriptor.Name))
                     {
                         try
                         {
@@ -542,6 +581,8 @@ namespace VSDebuggerMCP
                         finally
                         {
                             captured.SideEffectIssued = DebuggerRequestContext.SideEffectIssued;
+                            captured.EffectOperation = DebuggerRequestContext.EffectOperation;
+                            captured.EffectStage = DebuggerRequestContext.EffectStage;
                             captured.CompletionIdentity = DebuggerRequestContext.CaptureCompletionIdentity();
                         }
                     }
@@ -550,7 +591,17 @@ namespace VSDebuggerMCP
                 request.Meta.DeadlineUnixMs,
                 activeRequest.Token).GetAwaiter().GetResult();
 
-            if (outcome.SideEffectIssued) DebuggerRequestContext.MarkSideEffectIssued();
+            if (outcome.SideEffectIssued)
+            {
+                CommandEffectExecutor.RecordIssued(
+                    string.IsNullOrWhiteSpace(outcome.EffectOperation)
+                        ? "long_running_actor_phase"
+                        : outcome.EffectOperation);
+                if (string.Equals(outcome.EffectStage, "confirmed", StringComparison.Ordinal))
+                {
+                    CommandEffectExecutor.RecordConfirmed(outcome.EffectOperation);
+                }
+            }
             if (outcome.CompletionIdentity != null)
             {
                 DebuggerRequestContext.RebaseDebuggerIdentity(
@@ -567,6 +618,8 @@ namespace VSDebuggerMCP
             internal object Value { get; set; }
             internal Exception Error { get; set; }
             internal bool SideEffectIssued { get; set; }
+            internal string EffectOperation { get; set; }
+            internal string EffectStage { get; set; }
             internal DebuggerIdentitySnapshot CompletionIdentity { get; set; }
         }
 
@@ -806,6 +859,13 @@ namespace VSDebuggerMCP
                 {
                     _commandResults.Complete(commandLease, finalResponse);
                 }
+                else
+                {
+                    _queryResults.Complete(
+                        requestId,
+                        CreateClientLane(request.Meta),
+                        finalResponse);
+                }
                 CompleteActiveRequest(activeRequestKey, activeRequest);
             }
             finally
@@ -837,6 +897,14 @@ namespace VSDebuggerMCP
                     string.IsNullOrWhiteSpace(unsupported.Message)
                         ? $"The active Visual Studio debugger engine does not support '{request.Method}'."
                         : unsupported.Message);
+            else if (exception is DebuggerDispatchPoisonedException poisoned)
+                failure = CreateFailureResponse(
+                    request.Id,
+                    "DEBUGGER_DISPATCH_POISONED",
+                    poisoned.Message,
+                    CreateDispatcherHealthDetails(poisoned.Health),
+                    "dispatcher_poisoned",
+                    poisoned.Health?.SideEffectIssued == true);
             else if (exception is StaleDebugSessionException)
                 failure = DebugResponse.Failure(request.Id, "STALE_DEBUG_SESSION", exception.Message);
             else if (exception is StaleDebugContextException)
@@ -887,6 +955,26 @@ namespace VSDebuggerMCP
             return SerializeResponse(failure, completionIdentity);
         }
 
+        private static Dictionary<string, object> CreateDispatcherHealthDetails(
+            DispatcherHealthSnapshot health)
+        {
+            if (health == null) return null;
+            return new Dictionary<string, object>(StringComparer.Ordinal)
+            {
+                ["state"] = health.State,
+                ["activeRequestId"] = health.ActiveRequestId,
+                ["activeMethod"] = health.ActiveMethod,
+                ["uiAdmittedAtUtc"] = health.UiAdmissionUtc?.ToString("O"),
+                ["poisonedAtUtc"] = health.PoisonedUtc?.ToString("O"),
+                ["elapsedMs"] = health.ElapsedMs,
+                ["poisonAfterMs"] = health.PoisonAfterMs,
+                ["sideEffectIssued"] = health.SideEffectIssued,
+                ["effectOperation"] = health.EffectOperation,
+                ["effectStage"] = health.EffectStage,
+                ["recoveryAction"] = "restart_visual_studio",
+            };
+        }
+
         private static void ObserveFault(Task task)
         {
             _ = task.ContinueWith(
@@ -920,23 +1008,6 @@ namespace VSDebuggerMCP
             }
         }
 
-        private static bool IsCanonicalUuidV7(string requestId)
-        {
-            if (!Guid.TryParseExact(requestId, "D", out Guid parsedRequestId) ||
-                !string.Equals(parsedRequestId.ToString("D"), requestId, StringComparison.Ordinal))
-            {
-                return false;
-            }
-            string compact = requestId.Replace("-", string.Empty);
-            if (compact.Length != 32 || compact[12] != '7' ||
-                "89ab".IndexOf(compact[16]) < 0 ||
-                compact.Any(character => !Uri.IsHexDigit(character)))
-            {
-                return false;
-            }
-            return true;
-        }
-
         private CommandRequestStatusResult GetCommandRequestStatus(string clientLane, string requestId)
         {
             if (!Guid.TryParseExact(requestId, "D", out Guid parsedRequestId) ||
@@ -965,6 +1036,8 @@ namespace VSDebuggerMCP
                         StartedAtUtc = snapshot.StartedUtc?.ToString("O"),
                         CancellationRequested = snapshot.CancellationRequested,
                         SideEffectIssued = snapshot.SideEffectIssued,
+                        EffectOperation = snapshot.EffectOperation,
+                        EffectStage = snapshot.EffectStage,
                     };
                 }
             }
@@ -979,11 +1052,27 @@ namespace VSDebuggerMCP
                 return new CommandRequestStatusResult
                 {
                     RequestId = requestId,
+                    Kind = "command",
                     State = resultEvicted ? "completed_result_evicted" : "completed",
                     CompletedAtUtc = completedUtc.ToString("O"),
                     Response = resultEvicted
                         ? null
                         : _serializer.DeserializeObject(response) as Dictionary<string, object>,
+                };
+            }
+
+            if (_queryResults.TryGet(
+                requestId,
+                out string queryResponse,
+                out DateTime queryCompletedUtc))
+            {
+                return new CommandRequestStatusResult
+                {
+                    RequestId = requestId,
+                    Kind = "query",
+                    State = "completed",
+                    CompletedAtUtc = queryCompletedUtc.ToString("O"),
+                    Response = _serializer.DeserializeObject(queryResponse) as Dictionary<string, object>,
                 };
             }
 
@@ -1021,7 +1110,7 @@ namespace VSDebuggerMCP
                 // Cancellation callbacks may run synchronously. Never invoke them while the
                 // active-request registry lock is held.
                 bool cancellationIssued = activeRequest.TryCancel(
-                    DebuggerRequestContext.MarkSideEffectIssued);
+                    () => CommandEffectExecutor.RecordIssued("request.cancel"));
                 ActiveRequestSnapshot snapshot = activeRequest.Snapshot();
                 return new CommandRequestStatusResult
                 {
@@ -1033,6 +1122,8 @@ namespace VSDebuggerMCP
                     CancellationRequested = snapshot.CancellationRequested,
                     CancellationIssued = cancellationIssued,
                     SideEffectIssued = snapshot.SideEffectIssued,
+                    EffectOperation = snapshot.EffectOperation,
+                    EffectStage = snapshot.EffectStage,
                 };
             }
             return GetCommandRequestStatus(clientLane, requestId);

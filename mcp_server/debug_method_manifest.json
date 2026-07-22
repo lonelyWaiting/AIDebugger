@@ -176,6 +176,14 @@
       ],
       "kind": "query"
     },
+    "get_dispatcher_health": {
+      "capabilities": [
+        "server.control"
+      ],
+      "controlPlane": true,
+      "kind": "query",
+      "sessionRefresh": true
+    },
     "get_debug_status": {
       "capabilities": [
         "debug.read"

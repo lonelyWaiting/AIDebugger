@@ -35,6 +35,31 @@ namespace VSDebuggerMCP
                 case "get_debug_status":
                     return _debuggerService.GetDebugStatus();
 
+                case "get_dispatcher_health":
+                    {
+                        DispatcherHealthResult health = _debuggerService.GetDispatcherHealth();
+                        CommandLedgerSnapshot ledger = _commandResults.Snapshot();
+                        QueryJournalSnapshot queries = _queryResults.Snapshot();
+                        lock (_activeRequestsLock)
+                        {
+                            health.ActiveRequestCount = _activeRequests.Count;
+                        }
+                        health.ActorQueueDepth = _debugSessionActor.QueueDepth;
+                        health.DataListenerCount = DataPipeInstances;
+                        health.InterruptListenerCount = InterruptPipeInstances;
+                        health.RecoveryListenerCount = RecoveryPipeInstances;
+                        health.CommandTombstoneCount = ledger.TombstoneCount;
+                        health.CommandTombstoneCapacity = ledger.TombstoneCapacity;
+                        health.CommandResultCount = ledger.RetainedResponseCount;
+                        health.CommandResultBytes = ledger.RetainedResponseBytes;
+                        health.OldestCommandAgeMs = ledger.OldestEntryAgeMs;
+                        health.QueryResultCount = queries.EntryCount;
+                        health.QueryResultCapacity = queries.EntryCapacity;
+                        health.QueryResultBytes = queries.RetainedBytes;
+                        health.QueryResultByteCapacity = queries.ByteCapacity;
+                        return health;
+                    }
+
                 case "get_debug_processes":
                     {
                         int startIndex = GetParam<int>(request.Params, "startIndex", 0);
@@ -631,9 +656,13 @@ namespace VSDebuggerMCP
 
                 case "switch_process":
                     {
+                        string processHandle = GetParam<string>(request.Params, "processHandle", null);
                         int processId = GetParam<int>(request.Params, "processId", 0);
                         int processLookupBudgetMs = GetParam<int>(request.Params, "processLookupBudgetMs", -1);
-                        return _debuggerService.SwitchProcess(processId, processLookupBudgetMs);
+                        return _debuggerService.SwitchProcess(
+                            processHandle,
+                            processId,
+                            processLookupBudgetMs);
                     }
 
                 case "switch_thread":
@@ -679,6 +708,9 @@ namespace VSDebuggerMCP
 
         private T GetParam<T>(Dictionary<string, object> parameters, string key, T defaultValue)
         {
+            // DebugRequestSchemaValidator is the single owner of parameter
+            // semantics and ranges. The router performs only lossless JSON type
+            // extraction after that immutable preflight has succeeded.
             if (parameters == null || !parameters.ContainsKey(key))
             {
                 return defaultValue;
@@ -700,13 +732,11 @@ namespace VSDebuggerMCP
                 {
                     if (value is int intValue)
                     {
-                        ValidateIntegerRange(key, intValue);
                         return (T)(object)intValue;
                     }
                     if (value is long longValue && longValue >= int.MinValue && longValue <= int.MaxValue)
                     {
                         int converted = (int)longValue;
-                        ValidateIntegerRange(key, converted);
                         return (T)(object)converted;
                     }
                     throw new InvalidCastException();
@@ -715,13 +745,11 @@ namespace VSDebuggerMCP
                 {
                     if (value is long longValue)
                     {
-                        ValidateLongRange(key, longValue);
                         return (T)(object)longValue;
                     }
                     if (value is int intValue)
                     {
                         long converted = intValue;
-                        ValidateLongRange(key, converted);
                         return (T)(object)converted;
                     }
                     throw new InvalidCastException();
@@ -738,7 +766,6 @@ namespace VSDebuggerMCP
                 {
                     if (value is string stringValue)
                     {
-                        ValidateStringRange(key, stringValue);
                         return (T)(object)stringValue;
                     }
                     throw new InvalidCastException();
@@ -751,106 +778,6 @@ namespace VSDebuggerMCP
                 throw new ParameterValidationException(
                     $"Parameter '{key}' must be a {GetJsonTypeName(typeof(T))}.");
             }
-        }
-
-        private static void ValidateIntegerRange(string key, int value)
-        {
-            int minimum = int.MinValue;
-            int maximum = int.MaxValue;
-            switch (key)
-            {
-                case "depth": case "maxDepth": minimum = 0; maximum = 4; break;
-                case "frameIndex": case "overloadIndex": minimum = 0; maximum = 4096; break;
-                case "threadId": case "processId": case "lineNumber": minimum = 1; break;
-                case "hitCount": minimum = 0; break;
-                case "maxFramesPerThread": case "threadMaxFramesPerThread": minimum = 0; maximum = 256; break;
-                case "maxFrames": minimum = 0; maximum = 4096; break;
-                case "maxNodes": case "threadMaxNodes": minimum = 0; maximum = 4096; break;
-                case "budgetMs": case "threadBudgetMs": case "threadLookupBudgetMs": case "breakpointLookupBudgetMs": minimum = 0; maximum = 120000; break;
-                case "startIndex": minimum = 0; maximum = 1000000; break;
-                case "startModuleIndex": minimum = 0; maximum = 1000000; break;
-                case "startThreadIndex": minimum = 1; maximum = 1000000; break;
-                case "startFrameIndex": minimum = 0; maximum = 1000000; break;
-                case "maxFramesScanned": minimum = 0; maximum = 4096; break;
-                case "outputTailLines": minimum = 0; maximum = 500; break;
-                case "tailLines": minimum = 0; maximum = 10000; break;
-                case "endCharacter": minimum = -1; maximum = int.MaxValue; break;
-                case "expectedCaptureStartCharacter": minimum = -1; maximum = int.MaxValue; break;
-                case "maxBytes": minimum = 4 * 1024; maximum = 3 * 1024 * 1024; break;
-                case "size": minimum = 1; maximum = 4096; break;
-                case "linesBefore": case "linesAfter": minimum = 0; maximum = 256; break;
-                case "count": minimum = 1; maximum = 256; break;
-                case "maxImportFunctions": case "maxExports": minimum = 1; maximum = 4096; break;
-                case "maxTypes": minimum = 1; maximum = 128; break;
-                case "maxMethods": case "maxMethodsPerType": minimum = 1; maximum = 32; break;
-                case "maxInstructions": minimum = 1; maximum = 2048; break;
-                case "maxResults": case "maxMatches": minimum = 1; maximum = 10000; break;
-                case "disassemblyCount": minimum = 1; maximum = 256; break;
-                case "stackBytes": minimum = 16; maximum = 4096; break;
-                case "timeoutMs": minimum = 1000; maximum = 30 * 60 * 1000; break;
-                case "waitTimeoutMs": minimum = 100; maximum = 300000; break;
-                case "pollIntervalMs": minimum = 50; maximum = 1000; break;
-                case "byteCount": minimum = 1; maximum = 64; break;
-                case "searchSize": minimum = 1; maximum = 1024 * 1024; break;
-                case "contextLines": minimum = 0; maximum = 100; break;
-                case "startLine": minimum = 0; maximum = 1000000; break;
-            }
-            if (value < minimum || value > maximum)
-            {
-                throw new ParameterValidationException(
-                    $"Parameter '{key}' must be between {minimum} and {maximum}.");
-            }
-        }
-
-        private static void ValidateLongRange(string key, long value)
-        {
-            if ((key == "debugSessionGeneration" || key == "breakSequence" ||
-                 key == "contextEpoch" || key == "startOffset") && value < 0)
-            {
-                throw new ParameterValidationException($"Parameter '{key}' must be non-negative.");
-            }
-        }
-
-        private static void ValidateStringRange(string key, string value)
-        {
-            int maximum = 64 * 1024;
-            switch (key)
-            {
-                case "requestId": maximum = 64; break;
-                case "moduleSnapshotId": case "scanContinuationToken": maximum = 128; break;
-                case "pane": case "patternFormat": case "evaluationPolicy": case "hitCountType":
-                case "conditionType": maximum = 256; break;
-                case "address": case "startAddress": maximum = 1024; break;
-                case "pattern": case "functionName": case "methodName": case "typeName":
-                case "typeFilter": maximum = 4096; break;
-                case "condition": case "dataExpression": maximum = 16 * 1024; break;
-                case "filePath": case "assemblyPath": case "executablePath": case "workingDirectory":
-                    maximum = 32 * 1024; break;
-            }
-            if (value != null && value.Length > maximum)
-            {
-                throw new ParameterValidationException(
-                    $"Parameter '{key}' exceeds the maximum length of {maximum} characters.");
-            }
-            if (value == null) return;
-            if ((key == "moduleSnapshotId" || key == "scanContinuationToken") &&
-                string.IsNullOrWhiteSpace(value))
-            {
-                throw new ParameterValidationException(
-                    $"Parameter '{key}' must be a non-empty snapshot identifier.");
-            }
-            string normalized = value.Trim().ToLowerInvariant();
-            if (key == "hitCountType" &&
-                normalized != "equal" && normalized != "greater_or_equal" && normalized != "multiple")
-                throw new ParameterValidationException(
-                    "Parameter 'hitCountType' must be equal, greater_or_equal, or multiple.");
-            if (key == "conditionType" && normalized != "when_true" && normalized != "when_changed")
-                throw new ParameterValidationException(
-                    "Parameter 'conditionType' must be when_true or when_changed.");
-            if (key == "patternFormat" && normalized != "auto" && normalized != "hex" &&
-                normalized != "bytes" && normalized != "text" && normalized != "ascii" && normalized != "string")
-                throw new ParameterValidationException(
-                    "Parameter 'patternFormat' is not supported.");
         }
 
         private static bool IsDumpDebugTarget(string path)

@@ -26,6 +26,8 @@
     <Compile Include="..\VSDebuggerMCP\Ipc\ProcessIntegrityValidator.cs" Link="Production\ProcessIntegrityValidator.cs" />
     <Compile Include="..\VSDebuggerMCP\Ipc\AuthenticodeTrustValidator.cs" Link="Production\AuthenticodeTrustValidator.cs" />
     <Compile Include="..\VSDebuggerMCP\Ipc\CommandResultStore.cs" Link="Production\CommandResultStore.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\UuidV7RequestIdPolicy.cs" Link="Production\UuidV7RequestIdPolicy.cs" />
+    <Compile Include="..\VSDebuggerMCP\Ipc\QueryResultStore.cs" Link="Production\QueryResultStore.cs" />
     <Compile Include="..\VSDebuggerMCP\Ipc\ClientLaneRecovery.cs" Link="Production\ClientLaneRecovery.cs" />
     <Compile Include="..\VSDebuggerMCP\Ipc\ActiveRequest.cs" Link="Production\ActiveRequest.cs" />
     <Compile Include="..\VSDebuggerMCP\Ipc\DebugRequestSchemaValidator.cs" Link="Production\DebugRequestSchemaValidator.cs" />
@@ -52,6 +54,9 @@
     <Compile Include="..\VSDebuggerMCP\Services\ManagedInspectionJob.cs" Link="Production\ManagedInspectionJob.cs" />
     <Compile Include="..\VSDebuggerMCP\Services\ManagedInspectionProcess.cs" Link="Production\ManagedInspectionProcess.cs" />
     <Compile Include="..\VSDebuggerMCP\Services\ProcessLaunchBoundary.cs" Link="Production\ProcessLaunchBoundary.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\CommandEffectExecutor.cs" Link="Production\CommandEffectExecutor.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\UiOperationCircuit.cs" Link="Production\UiOperationCircuit.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\DebugProcessHandleStore.cs" Link="Production\DebugProcessHandleStore.cs" />
     <Compile Include="..\VSDebuggerMCP\Services\OutputContentBudget.cs" Link="Production\OutputContentBudget.cs" />
     <Compile Include="..\VSDebuggerMCP\Services\OutputSearchBudget.cs" Link="Production\OutputSearchBudget.cs" />
     <Compile Include="..\VSDebuggerMCP\Services\CallStackCaptureBudget.cs" Link="Production\CallStackCaptureBudget.cs" />

@@ -11,6 +11,7 @@ namespace VSDebuggerMCP.Services
     {
         bool HasPendingOperations { get; }
         Task WaitForIdleAsync();
+        DispatcherHealthSnapshot GetDispatcherHealth();
     }
 
     internal interface IVisualStudioDebuggerAdapter : IUiOperationTracker
@@ -30,7 +31,17 @@ namespace VSDebuggerMCP.Services
     {
         private readonly object _sync = new object();
         private readonly HashSet<Task> _pending = new HashSet<Task>();
-        private int _operationCircuitOpen;
+        private readonly UiOperationCircuit _operationCircuit;
+
+        internal VisualStudioDebuggerAdapter()
+            : this(UiOperationCircuit.ProcessWide)
+        {
+        }
+
+        internal VisualStudioDebuggerAdapter(UiOperationCircuit operationCircuit)
+        {
+            _operationCircuit = operationCircuit ?? throw new ArgumentNullException(nameof(operationCircuit));
+        }
 
         public bool HasPendingOperations
         {
@@ -52,9 +63,23 @@ namespace VSDebuggerMCP.Services
                 requestCancellation.ThrowIfCancellationRequested();
                 return action();
             }
-            if (Volatile.Read(ref _operationCircuitOpen) != 0)
+            if (!_operationCircuit.TryAcquire(
+                DebuggerRequestContext.RequestId,
+                DebuggerRequestContext.Method,
+                out UiOperationLease operationLease,
+                out DispatcherHealthSnapshot conflict))
+            {
+                if (string.Equals(conflict.State, "poisoned", StringComparison.Ordinal))
+                {
+                    throw new DebuggerDispatchPoisonedException(
+                        "A Visual Studio UI/COM operation exceeded the poison threshold and is still unresolved. " +
+                        "Restart this Visual Studio process before issuing another debugger operation.",
+                        conflict);
+                }
                 throw new MainThreadDispatchTimeoutException(
-                    "A previous Visual Studio UI operation is still running; this request was not started.");
+                    $"Visual Studio UI operation '{conflict.ActiveMethod ?? "unknown"}' is still " +
+                    $"{conflict.State}; this request was not started.");
+            }
 
             var admission = new UiOperationAdmission();
             using (var timeoutCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(timeoutMs)))
@@ -70,6 +95,7 @@ namespace VSDebuggerMCP.Services
                     {
                         throw new OperationCanceledException(linkedCts.Token);
                     }
+                    _operationCircuit.MarkUiAdmitted(operationLease);
                     return action();
                 });
                 Task<T> task = operation.Task;
@@ -84,7 +110,7 @@ namespace VSDebuggerMCP.Services
                             throw new MainThreadDispatchTimeoutException(
                                 $"VS UI thread did not accept the operation within {timeoutMs}ms; the operation was not started.");
                         }
-                        Interlocked.Exchange(ref _operationCircuitOpen, 1);
+                        _operationCircuit.MarkOutcomeUnknown(operationLease);
                     }
 
                     // Once accepted, the complete debugger invocation remains owned by
@@ -107,12 +133,12 @@ namespace VSDebuggerMCP.Services
                 {
                     if (task.IsCompleted)
                     {
-                        Complete(task);
+                        Complete(task, operationLease);
                     }
                     else
                     {
                         Task cleanup = task.ContinueWith(
-                            Complete,
+                            completed => Complete(completed, operationLease),
                             CancellationToken.None,
                             TaskContinuationOptions.ExecuteSynchronously,
                             TaskScheduler.Default);
@@ -130,19 +156,24 @@ namespace VSDebuggerMCP.Services
             }
         }
 
+        public DispatcherHealthSnapshot GetDispatcherHealth()
+        {
+            return _operationCircuit.Snapshot();
+        }
+
         private void Track(Task task)
         {
             lock (_sync) _pending.Add(task);
         }
 
-        private void Complete(Task task)
+        private void Complete(Task task, UiOperationLease operationLease)
         {
             if (task.IsFaulted)
             {
                 AggregateException ignored = task.Exception;
             }
             lock (_sync) _pending.Remove(task);
-            Interlocked.Exchange(ref _operationCircuitOpen, 0);
+            _operationCircuit.Release(operationLease);
             try
             {
                 task.Dispose();

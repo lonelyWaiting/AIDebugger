@@ -37,8 +37,13 @@ namespace VSDebuggerMCP
         private const int MaxExpressionCount = 100;
         private const int MaxExpressionLength = 16 * 1024;
         private const int MaxCachedCommandResults = 512;
+        private const int MaxCommandTombstones = 1024 * 1024;
+        private const int MaxCachedQueryResults = 256;
         private const int MaxQueuedDebuggerRequests = 128;
         private static readonly TimeSpan CachedCommandResultTtl = TimeSpan.FromMinutes(10);
+        private static readonly TimeSpan CommandDeduplicationWindow = TimeSpan.FromHours(24);
+        private static readonly TimeSpan CommandRequestFutureSkew = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan CachedQueryResultTtl = TimeSpan.FromMinutes(5);
         
         // Unique pipe name for this VS instance (includes process ID)
         private readonly string _pipeName;
@@ -59,6 +64,7 @@ namespace VSDebuggerMCP
         private readonly SemaphoreSlim _inspectionDispatchGate;
         private readonly object _activeRequestsLock = new object();
         private readonly CommandResultStore _commandResults;
+        private readonly QueryResultStore _queryResults;
         private readonly Dictionary<string, ActiveRequest> _activeRequests;
         private readonly HashSet<string> _allowedCapabilities;
         private volatile bool _isRunning;
@@ -89,7 +95,16 @@ namespace VSDebuggerMCP
             _inspectionDispatchGate = new SemaphoreSlim(2, 2);
             _commandResults = new CommandResultStore(
                 MaxCachedCommandResults,
-                CachedCommandResultTtl);
+                CachedCommandResultTtl,
+                tombstoneCapacity: MaxCommandTombstones,
+                // A command ID may be accepted up to FutureSkew ahead of the
+                // local clock. Retain its tombstone through that entire possible
+                // acceptance interval so a skewed ID can never replay.
+                tombstoneTtl: CommandDeduplicationWindow + CommandRequestFutureSkew);
+            _queryResults = new QueryResultStore(
+                MaxCachedQueryResults,
+                32L * 1024L * 1024L,
+                CachedQueryResultTtl);
             _activeRequests = new Dictionary<string, ActiveRequest>(StringComparer.Ordinal);
             _allowedCapabilities = ResolveAllowedCapabilities(requestedCapabilities);
             
@@ -111,6 +126,7 @@ namespace VSDebuggerMCP
                 _processId,
                 _processStartTimeUtcTicks,
                 _serverInstanceId,
+                DebugMethodCatalog.CatalogHash,
                 _allowedCapabilities.OrderBy(value => value, StringComparer.Ordinal).ToArray(),
                 _log);
         }
@@ -486,6 +502,7 @@ namespace VSDebuggerMCP
                     $"\"processId\":{_processId}," +
                     $"\"processStartTimeUtcTicks\":{_processStartTimeUtcTicks}," +
                     $"\"serverInstanceId\":\"{EscapeJsonString(_serverInstanceId)}\"," +
+                    $"\"protocolCatalogHash\":\"{DebugMethodCatalog.CatalogHash}\"," +
                     $"\"debugSessionGeneration\":{effectiveIdentity.DebugSessionGeneration}," +
                     $"\"breakSequence\":{effectiveIdentity.BreakSequence}," +
                     $"\"contextEpoch\":{effectiveIdentity.ContextEpoch}" +
@@ -501,6 +518,7 @@ namespace VSDebuggerMCP
                 ProcessId = _processId,
                 ProcessStartTimeUtcTicks = _processStartTimeUtcTicks,
                 ServerInstanceId = _serverInstanceId,
+                ProtocolCatalogHash = DebugMethodCatalog.CatalogHash,
                 DebugSessionGeneration = debuggerIdentity?.DebugSessionGeneration ?? 0,
                 BreakSequence = debuggerIdentity?.BreakSequence ?? 0,
                 ContextEpoch = debuggerIdentity?.ContextEpoch ?? 0,

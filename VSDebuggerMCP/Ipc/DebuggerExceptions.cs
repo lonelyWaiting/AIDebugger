@@ -2,6 +2,8 @@ using System;
 
 namespace VSDebuggerMCP
 {
+    using VSDebuggerMCP.Services;
+
     internal sealed class MainThreadDispatchTimeoutException : TimeoutException
     {
         public MainThreadDispatchTimeoutException(string message) : base(message) { }
@@ -36,5 +38,17 @@ namespace VSDebuggerMCP
     internal sealed class RequestCancelledNotStartedException : OperationCanceledException
     {
         public RequestCancelledNotStartedException(string message) : base(message) { }
+    }
+
+    internal sealed class DebuggerDispatchPoisonedException : InvalidOperationException
+    {
+        internal DebuggerDispatchPoisonedException(
+            string message,
+            DispatcherHealthSnapshot health) : base(message)
+        {
+            Health = health;
+        }
+
+        internal DispatcherHealthSnapshot Health { get; }
     }
 }

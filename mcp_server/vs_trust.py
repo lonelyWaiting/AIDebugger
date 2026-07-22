@@ -16,8 +16,10 @@ from typing import Any, Dict, Optional
 
 try:
     from .vs_errors import VSBridgeError
+    from .vs_tool_registry import DEBUG_METHOD_CATALOG_HASH
 except ImportError:
     from vs_errors import VSBridgeError
+    from vs_tool_registry import DEBUG_METHOD_CATALOG_HASH
 
 logger = logging.getLogger(__name__)
 PROTOCOL_VERSION = "aidb/2"
@@ -194,11 +196,17 @@ def _load_instance_registration(pipe_name: str) -> Dict[str, Any]:
         "processId": _registration_value(payload, "processId"),
         "processStartTimeUtcTicks": _registration_value(payload, "processStartTimeUtcTicks"),
         "serverInstanceId": _registration_value(payload, "serverInstanceId"),
+        "protocolCatalogHash": _registration_value(payload, "protocolCatalogHash"),
         "authToken": _registration_value(payload, "authToken"),
         "capabilities": _registration_value(payload, "capabilities"),
     }
     if registration["protocol"] != PROTOCOL_VERSION or registration["pipeName"] != pipe_name:
         raise VSBridgeError("Instance registration protocol or pipe mismatch", code="PROTOCOL_MISMATCH")
+    if registration["protocolCatalogHash"] != DEBUG_METHOD_CATALOG_HASH:
+        raise VSBridgeError(
+            "Visual Studio extension and MCP server protocol catalogs do not match",
+            code="PROTOCOL_CATALOG_MISMATCH",
+        )
     if registration["controlPipeName"] != pipe_name + "_control":
         raise VSBridgeError("Instance registration control pipe mismatch", code="PROTOCOL_MISMATCH")
     if registration["recoveryPipeName"] is None:

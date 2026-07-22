@@ -35,7 +35,7 @@ namespace VSDebuggerMCP
             var result = new DebugProcessesResult
             {
                 Capability = "same_debug_session_process_selection",
-                Behavior = "visual_studio_debugged_processes_only",
+                Behavior = "opaque_session_process_handles_with_legacy_pid_fallback",
                 StartIndex = startIndex,
                 NextIndex = startIndex,
                 MaxNodes = normalizedMaxNodes,
@@ -132,15 +132,48 @@ namespace VSDebuggerMCP
         [SuppressMessage("Usage", "VSTHRD010", Justification = "Process lookup is sliced and the final CurrentProcess assignment runs on the UI thread.")]
         public ProcessDebugResult SwitchProcess(int processId, int processLookupBudgetMs = -1)
         {
+            return SwitchProcess(null, processId, processLookupBudgetMs);
+        }
+
+        [SuppressMessage("Usage", "VSTHRD010", Justification = "Process lookup is sliced and the final CurrentProcess assignment runs on the UI thread.")]
+        public ProcessDebugResult SwitchProcess(
+            string processHandle,
+            int processId = 0,
+            int processLookupBudgetMs = -1)
+        {
+            long expectedProcessStartTimeUtcTicks = 0;
+            if (!string.IsNullOrWhiteSpace(processHandle))
+            {
+                if (!_debugProcessHandles.TryResolve(
+                    processHandle,
+                    DebugSessionGeneration,
+                    out DebugProcessIdentity identity))
+                {
+                    return CreateProcessSelectionResult(
+                        processId,
+                        processHandle,
+                        false,
+                        "STALE_DEBUG_CONTEXT",
+                        "switch_process_not_started",
+                        "The process handle is unknown or belongs to an expired debug session. Call get_debug_processes again.");
+                }
+                processId = identity.ProcessId;
+                expectedProcessStartTimeUtcTicks = identity.ProcessStartTimeUtcTicks;
+            }
+
             int processIndex;
             try
             {
-                processIndex = FindDebuggedProcessIndexByIdSliced(processId, processLookupBudgetMs);
+                processIndex = FindDebuggedProcessIndexByIdSliced(
+                    processId,
+                    expectedProcessStartTimeUtcTicks,
+                    processLookupBudgetMs);
             }
             catch (DebugContextNotFoundException ex)
             {
                 return CreateProcessSelectionResult(
                     processId,
+                    processHandle,
                     false,
                     "DEBUG_CONTEXT_NOT_FOUND",
                     "switch_process_not_started",
@@ -153,6 +186,7 @@ namespace VSDebuggerMCP
                 var debugger = Debugger;
                 var result = CreateProcessSelectionResult(
                     processId,
+                    processHandle,
                     false,
                     null,
                     "switch_process_not_started",
@@ -173,6 +207,12 @@ namespace VSDebuggerMCP
                         throw new StaleDebugContextException(
                             $"Debugged process {processId} changed before it could be selected.");
                     }
+                    if (expectedProcessStartTimeUtcTicks > 0 &&
+                        TryGetProcessStartTimeUtcTicks(processId) != expectedProcessStartTimeUtcTicks)
+                    {
+                        throw new StaleDebugContextException(
+                            $"Debugged process handle for {processId} no longer matches the original OS process identity.");
+                    }
 
                     result.ProcessName = targetProcess.Name ?? $"Process {processId}";
                     if (debugger.CurrentProcess?.ProcessID == processId)
@@ -185,8 +225,13 @@ namespace VSDebuggerMCP
                     }
 
                     result.CommandIssued = true;
-                    DebuggerRequestContext.MarkSideEffectIssued();
-                    debugger.CurrentProcess = targetProcess;
+                    CommandEffectExecutor.Issue(
+                        "debugger.select_process",
+                        () =>
+                        {
+                            ThreadHelper.ThrowIfNotOnUIThread();
+                            debugger.CurrentProcess = targetProcess;
+                        });
                     _sessionTracker.InvalidateContext("switch_process");
                     ObserveDebugContext(debugger);
                     RebaseRequestToCurrentDebuggerIdentity();
@@ -221,6 +266,7 @@ namespace VSDebuggerMCP
 
         private ProcessDebugResult CreateProcessSelectionResult(
             int processId,
+            string processHandle,
             bool success,
             string errorCode,
             string outcome,
@@ -232,6 +278,7 @@ namespace VSDebuggerMCP
                 Capability = "same_debug_session_process_selection",
                 Behavior = "select_existing_visual_studio_debugged_process",
                 ProcessId = processId,
+                ProcessHandle = processHandle,
                 Success = success,
                 ErrorCode = errorCode,
                 Outcome = outcome,
@@ -240,7 +287,10 @@ namespace VSDebuggerMCP
         }
 
         [SuppressMessage("Usage", "VSTHRD010", Justification = "Reads one DebuggedProcesses identity per bounded UI slice.")]
-        private int FindDebuggedProcessIndexByIdSliced(int processId, int budgetMs)
+        private int FindDebuggedProcessIndexByIdSliced(
+            int processId,
+            long expectedProcessStartTimeUtcTicks,
+            int budgetMs)
         {
             if (processId <= 0)
                 throw new DebugContextNotFoundException("A positive process id is required.");
@@ -268,7 +318,16 @@ namespace VSDebuggerMCP
                 int capturedProcessId = ExecuteOnMainThread(
                     () => CaptureDebugProcessId(capturedIndex),
                     DefaultMainThreadTimeoutMs);
-                if (capturedProcessId == processId) return index;
+                if (capturedProcessId == processId)
+                {
+                    if (expectedProcessStartTimeUtcTicks <= 0 ||
+                        TryGetProcessStartTimeUtcTicks(processId) == expectedProcessStartTimeUtcTicks)
+                    {
+                        return index;
+                    }
+                    throw new DebugContextNotFoundException(
+                        $"Process {processId} was reused after the process handle was issued.");
+                }
             }
 
             DebugProcessCollectionHeader finalHeader = ExecuteOnMainThread(CaptureDebugProcessCollectionHeader);
@@ -313,6 +372,7 @@ namespace VSDebuggerMCP
                 EnvDTE.Process process = Debugger?.DebuggedProcesses?.Item(collectionIndex);
                 if (process == null) return new DebugProcessCapture { Error = "Debugged process unavailable." };
                 int processId = process.ProcessID;
+                long processStartTimeUtcTicks = TryGetProcessStartTimeUtcTicks(processId);
                 int programCount = 0;
                 try { programCount = process.Programs?.Count ?? 0; } catch { }
                 return new DebugProcessCapture
@@ -320,6 +380,15 @@ namespace VSDebuggerMCP
                     Process = new DebugProcessInfo
                     {
                         ProcessId = processId,
+                        ProcessHandle = _debugProcessHandles.GetOrCreate(
+                            processId,
+                            processStartTimeUtcTicks,
+                            DebugSessionGeneration),
+                        ProcessStartTimeUtcTicks = processStartTimeUtcTicks,
+                        IdentityStatus = processStartTimeUtcTicks > 0
+                            ? "verified"
+                            : "unavailable",
+                        DebugSessionGeneration = DebugSessionGeneration,
                         Name = process.Name ?? $"Process {processId}",
                         IsCurrent = processId == currentProcessId,
                         ProgramCount = programCount,
@@ -387,8 +456,13 @@ namespace VSDebuggerMCP
                         if (frame != null)
                         {
                             result.CommandIssued = true;
-                            DebuggerRequestContext.MarkSideEffectIssued();
-                            debugger.CurrentStackFrame = frame;
+                            CommandEffectExecutor.Issue(
+                                "debugger.select_stack_frame",
+                                () =>
+                                {
+                                    ThreadHelper.ThrowIfNotOnUIThread();
+                                    debugger.CurrentStackFrame = frame;
+                                });
                             _sessionTracker.InvalidateContext("switch_stack_frame");
                             RebaseRequestToCurrentDebuggerIdentity();
                             result.Success = true;
@@ -464,8 +538,13 @@ namespace VSDebuggerMCP
                     }
 
                     result.CommandIssued = true;
-                    DebuggerRequestContext.MarkSideEffectIssued();
-                    debugger.CurrentThread = thread;
+                    CommandEffectExecutor.Issue(
+                        "debugger.select_thread",
+                        () =>
+                        {
+                            ThreadHelper.ThrowIfNotOnUIThread();
+                            debugger.CurrentThread = thread;
+                        });
                     _sessionTracker.InvalidateContext("switch_thread");
                     RebaseRequestToCurrentDebuggerIdentity();
                     result.Success = true;

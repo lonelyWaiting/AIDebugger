@@ -5,6 +5,7 @@ to decide which tools exist.  This catalog describes only its own public surface
 """
 
 import json
+import hashlib
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -45,7 +46,8 @@ VS_TOOL_DOMAINS: Dict[str, List[str]] = {
         "capture_hybrid_context",
     ],
     "control": [
-        "get_command_status", "cancel_debug_request", "attach_process", "get_debug_processes",
+        "get_dispatcher_health", "get_command_status", "cancel_debug_request",
+        "attach_process", "get_debug_processes",
         "list_debug_processes", "switch_process", "select_process", "start_debugging",
         "debug_control", "debug_continue", "continue", "continue_and_wait_for_break",
         "continue_and_capture_native", "debug_step_over", "step_over", "debug_step_into",
@@ -124,8 +126,12 @@ _PARAMETER_CONDITIONAL_ROUTES = {
 }
 
 
+_METHOD_MANIFEST_PATH = Path(__file__).with_name("debug_method_manifest.json")
+DEBUG_METHOD_CATALOG_HASH = hashlib.sha256(_METHOD_MANIFEST_PATH.read_bytes()).hexdigest()
+
+
 def _method_manifest() -> Dict[str, object]:
-    payload = json.loads(Path(__file__).with_name("debug_method_manifest.json").read_text(encoding="utf-8"))
+    payload = json.loads(_METHOD_MANIFEST_PATH.read_text(encoding="utf-8"))
     if payload.get("protocol") != "aidb/2" or not isinstance(payload.get("methods"), dict):
         raise RuntimeError("Invalid Visual Studio debug method manifest")
     return payload["methods"]

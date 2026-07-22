@@ -142,6 +142,7 @@ class InfrastructureBehaviorTests(unittest.TestCase):
             "processId": 42,
             "processStartTimeUtcTicks": 123456,
             "serverInstanceId": "a" * 32,
+            "protocolCatalogHash": vs_trust.DEBUG_METHOD_CATALOG_HASH,
             "authToken": base64.b64encode(b"x" * 32).decode("ascii"),
             "capabilities": ["server.control", "debug.read"],
         }
@@ -156,6 +157,34 @@ class InfrastructureBehaviorTests(unittest.TestCase):
 
         self.assertEqual(payload["authToken"], registration["authToken"])
         self.assertEqual(payload["capabilities"], registration["capabilities"])
+
+    def test_instance_registration_rejects_protocol_catalog_mismatch(self) -> None:
+        from mcp_server import vs_trust
+
+        pipe_name = "AIDebuggerVS_42"
+        payload = {
+            "protocol": "aidb/2",
+            "pipeName": pipe_name,
+            "controlPipeName": pipe_name + "_control",
+            "recoveryPipeName": pipe_name + "_recovery",
+            "processId": 42,
+            "processStartTimeUtcTicks": 123456,
+            "serverInstanceId": "a" * 32,
+            "protocolCatalogHash": "0" * 64,
+            "authToken": base64.b64encode(b"x" * 32).decode("ascii"),
+            "capabilities": ["server.control", "debug.read"],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "AIDebugger" / "instances" / f"{pipe_name}.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"LOCALAPPDATA": temporary}), \
+                 mock.patch.object(vs_trust, "_validate_registration_security"), \
+                 mock.patch.object(vs_trust, "_validate_visual_studio_process"):
+                with self.assertRaises(vs_trust.VSBridgeError) as raised:
+                    vs_trust._load_instance_registration(pipe_name)
+
+        self.assertEqual("PROTOCOL_CATALOG_MISMATCH", raised.exception.code)
 
     def test_vs_instance_summary_is_an_exclusive_partition(self) -> None:
         from mcp_server.tool_modules import vs_instance_tools
@@ -235,12 +264,13 @@ class InfrastructureBehaviorTests(unittest.TestCase):
 import asyncio, os
 os.environ["AIDB_SERVER_SCOPE"] = "vs"
 os.environ["AIDB_PREFERRED_IDE"] = "vs"
-import vs_server, vs_bridge, vs_session
+import vs_server, vs_bridge, vs_session, vs_tool_registry
 
 registration = {
     "protocol": "aidb/2", "pipeName": "AIDebuggerVS_42",
     "controlPipeName": "AIDebuggerVS_42_control", "processId": 42,
     "processStartTimeUtcTicks": 42000, "serverInstanceId": "a" * 32,
+    "protocolCatalogHash": vs_tool_registry.DEBUG_METHOD_CATALOG_HASH,
     "authToken": "private", "capabilities": list(vs_bridge._all_vs_capabilities()),
 }
 instance = vs_bridge.VSInstance("AIDebuggerVS_42", {
@@ -429,7 +459,7 @@ asyncio.run(check())
             "processes": [],
             "currentProcessId": 0,
             "capability": "same_debug_session_process_selection",
-            "behavior": "visual_studio_debugged_processes_only",
+            "behavior": "opaque_session_process_handles_with_legacy_pid_fallback",
             "totalAvailable": 0,
             "startIndex": 2,
             "nextIndex": 2,
@@ -463,6 +493,15 @@ asyncio.run(check())
             switch_call.await_args.args[1],
         )
         self.assertEqual("vs", switch_call.await_args.kwargs["preferred_ide"])
+
+        handle = "dph_0123456789abcdef0123456789abcdef"
+        switch_call.reset_mock()
+        with mock.patch.object(control_tools.ide_bridge, "call", switch_call):
+            asyncio.run(control_tools.switch_process(process_handle=handle))
+        self.assertEqual(
+            {"processHandle": handle},
+            switch_call.await_args.args[1],
+        )
 
     def test_version_dry_run_tracks_nearest_semver_tag(self) -> None:
         description = subprocess.run(
@@ -779,10 +818,19 @@ asyncio.run(check())
                 "newLocation": {"functionName": "main", "lineNumber": 7, "columnNumber": 0},
             },
             "get_debug_processes": {
-                "processes": [{"processId": 42, "name": "app.exe", "isCurrent": True, "programCount": 1}],
+                "processes": [{
+                    "processId": 42,
+                    "processHandle": "dph_0123456789abcdef0123456789abcdef",
+                    "processStartTimeUtcTicks": 638887392000000000,
+                    "identityStatus": "verified",
+                    "debugSessionGeneration": 7,
+                    "name": "app.exe",
+                    "isCurrent": True,
+                    "programCount": 1,
+                }],
                 "currentProcessId": 42,
                 "capability": "same_debug_session_process_selection",
-                "behavior": "visual_studio_debugged_processes_only",
+                "behavior": "opaque_session_process_handles_with_legacy_pid_fallback",
                 "totalAvailable": 1,
                 "startIndex": 0,
                 "nextIndex": 1,

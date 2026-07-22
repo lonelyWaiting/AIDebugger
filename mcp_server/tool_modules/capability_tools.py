@@ -212,7 +212,7 @@ def _recommended_workflow_for_access(effective_instance: Optional[Dict[str, Any]
         return [
             "detect_debug_sessions(prefer_ide='vs') or list_vs_instances()",
             "attach_process(...) or start_debugging(...) if no debug session is active",
-            "Visual Studio multi-process session: get_debug_processes(), then switch_process(process_id) while paused",
+            "Visual Studio multi-process session: get_debug_processes(), then switch_process(process_handle=...) while paused",
             "set_breakpoint(...) / set_function_breakpoint(...) / set_data_breakpoint(...)",
             "Visual Studio only: for no-source native debugging use resolve_address, get_module_layout, set_address_breakpoint, capture_native_context, and continue_and_capture_native",
             "Visual Studio only: for no-source managed analysis use inspect_managed_assembly, inspect_managed_type, and inspect_managed_method_il against the target assembly path",
@@ -326,7 +326,7 @@ async def debug_capabilities() -> str:
             "expression_evaluation": "Expressions are attempted by default with bounded IDE timeouts. If a function call is unavailable or unsafe in the debug engine, the IDE result is returned instead of pre-rejecting it.",
             "stop": "Supported. Use debug_stop, stop_debugging, or debug_control(action='stop') to stop debugging / terminate the current debug session.",
             "detach": "Visual Studio detach is supported for the current debugged process via detach_process or debug_control(action='detach'). Rider is not exposed as a supported detach backend because no reliable public detach path is available here.",
-            "same_session_process_selection": "Visual Studio only: call get_debug_processes, then switch_process(process_id). Only Debugger.DebuggedProcesses entries are eligible, so switching never attaches a new local process. Rider exposes no equivalent multi-process selection contract.",
+            "same_session_process_selection": "Visual Studio only: call get_debug_processes, then switch_process(process_handle=...). The opaque handle binds session generation, PID, and OS creation time; switching never attaches a new local process. Rider exposes no equivalent multi-process selection contract.",
             "set_data_breakpoint": "Uses Visual Studio native data breakpoints/watchpoints where supported by the active debug engine.",
             "breakpoint_binding_verification": "Breakpoint results include bindingVerificationStatus, isRelocated, nearbyProbeAttempted, optimizedCodeSuspected, and verificationStatus so optimized-away or unbound source locations are explicit instead of treated as successful hits.",
             "no_source_native": "Information-only native debugging surface: normalize addresses as module+RVA, inspect PE layout, set address breakpoints, capture registers/disassembly/stack memory/modules, and let the AI decide the next probe. No write-memory or patching tool is exposed.",

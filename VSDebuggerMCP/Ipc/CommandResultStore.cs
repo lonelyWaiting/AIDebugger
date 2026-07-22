@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 
 namespace VSDebuggerMCP.Ipc
@@ -37,6 +38,7 @@ namespace VSDebuggerMCP.Ipc
         private readonly int _tombstoneCapacity;
         private readonly long _responseByteCapacity;
         private readonly TimeSpan _responseTtl;
+        private readonly TimeSpan _tombstoneTtl;
         private readonly Func<DateTime> _utcNow;
         private int _retainedResponseCount;
         private long _retainedResponseBytes;
@@ -46,17 +48,22 @@ namespace VSDebuggerMCP.Ipc
             TimeSpan responseTtl,
             Func<DateTime> utcNow = null,
             int tombstoneCapacity = 65536,
-            long responseByteCapacity = 32L * 1024L * 1024L)
+            long responseByteCapacity = 32L * 1024L * 1024L,
+            TimeSpan? tombstoneTtl = null)
         {
             if (responseCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(responseCapacity));
             if (responseTtl <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(responseTtl));
             if (tombstoneCapacity < responseCapacity) throw new ArgumentOutOfRangeException(nameof(tombstoneCapacity));
             if (responseByteCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(responseByteCapacity));
+            TimeSpan resolvedTombstoneTtl = tombstoneTtl ?? TimeSpan.FromHours(24);
+            if (resolvedTombstoneTtl < responseTtl)
+                throw new ArgumentOutOfRangeException(nameof(tombstoneTtl));
             _responseCapacity = responseCapacity;
             _responseTtl = responseTtl;
             _utcNow = utcNow ?? (() => DateTime.UtcNow);
             _tombstoneCapacity = tombstoneCapacity;
             _responseByteCapacity = responseByteCapacity;
+            _tombstoneTtl = resolvedTombstoneTtl;
         }
 
         internal CommandReservationStatus ReserveOrLookup(
@@ -79,6 +86,7 @@ namespace VSDebuggerMCP.Ipc
             lock (_sync)
             {
                 PruneResponsesLocked();
+                PruneTombstonesLocked();
                 lease = null;
                 if (_entries.TryGetValue(requestId, out Entry entry))
                 {
@@ -109,6 +117,7 @@ namespace VSDebuggerMCP.Ipc
                     ClientLane = clientLane,
                     RequestId = requestId,
                     Fingerprint = fingerprint,
+                    CreatedUtc = _utcNow(),
                     CompletedUtc = default(DateTime),
                     LeaseToken = token,
                 });
@@ -223,15 +232,69 @@ namespace VSDebuggerMCP.Ipc
             }
         }
 
+        private void PruneTombstonesLocked()
+        {
+            DateTime cutoff = _utcNow() - _tombstoneTtl;
+            string[] expired = _entries
+                .Where(pair =>
+                    pair.Value.CompletedUtc != default(DateTime) &&
+                    pair.Value.CompletedUtc < cutoff)
+                .Select(pair => pair.Key)
+                .ToArray();
+            foreach (string requestId in expired)
+            {
+                Entry entry = _entries[requestId];
+                if (entry.Response != null)
+                {
+                    _retainedResponseCount--;
+                    _retainedResponseBytes -= entry.ResponseBytes;
+                }
+                _entries.Remove(requestId);
+            }
+        }
+
+        internal CommandLedgerSnapshot Snapshot()
+        {
+            lock (_sync)
+            {
+                PruneResponsesLocked();
+                PruneTombstonesLocked();
+                DateTime now = _utcNow();
+                DateTime? oldest = _entries.Count == 0
+                    ? (DateTime?)null
+                    : _entries.Values.Min(entry => entry.CreatedUtc);
+                return new CommandLedgerSnapshot
+                {
+                    TombstoneCount = _entries.Count,
+                    TombstoneCapacity = _tombstoneCapacity,
+                    RetainedResponseCount = _retainedResponseCount,
+                    RetainedResponseBytes = _retainedResponseBytes,
+                    OldestEntryAgeMs = oldest.HasValue
+                        ? Math.Max(0L, (long)(now - oldest.Value).TotalMilliseconds)
+                        : 0L,
+                };
+            }
+        }
+
         private sealed class Entry
         {
             internal string ClientLane { get; set; }
             internal string RequestId { get; set; }
             internal string Fingerprint { get; set; }
+            internal DateTime CreatedUtc { get; set; }
             internal string Response { get; set; }
             internal DateTime CompletedUtc { get; set; }
             internal long ResponseBytes { get; set; }
             internal object LeaseToken { get; set; }
         }
+    }
+
+    internal sealed class CommandLedgerSnapshot
+    {
+        internal int TombstoneCount { get; set; }
+        internal int TombstoneCapacity { get; set; }
+        internal int RetainedResponseCount { get; set; }
+        internal long RetainedResponseBytes { get; set; }
+        internal long OldestEntryAgeMs { get; set; }
     }
 }

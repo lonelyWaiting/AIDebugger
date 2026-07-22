@@ -113,6 +113,8 @@ namespace VSDebuggerMCP.Ipc
 
         internal Task Completion => _worker;
 
+        internal int QueueDepth => _queue.Count;
+
         private async Task ProcessQueueAsync()
         {
             try
