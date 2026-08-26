@@ -9,7 +9,9 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 import xml.etree.ElementTree as ET
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -132,11 +134,13 @@ def discover_mcp_tool_names() -> list[str]:
     return names
 
 
-def discover_rider_dispatch_methods(source: str) -> set[str]:
+def discover_rider_dispatch_methods(source: str, coordinator_source: str = "") -> set[str]:
     start = source.index("return when (method) {")
     end = source.index("else -> throw UnsupportedOperationException", start)
     dispatch_table = source[start:end]
-    return set(re.findall(r'"([^"]+)"\s*->', dispatch_table))
+    methods = set(re.findall(r'"([^"]+)"\s*->', dispatch_table))
+    methods.update(re.findall(r'descriptor\.name\s*==\s*"([^"]+)"', coordinator_source))
+    return methods
 
 
 def expected_packaged_mcp_files() -> list[str]:
@@ -335,14 +339,217 @@ print(json.dumps({
         self.assertNotIn('Command = "python"', vs_registration)
         self.assertNotIn('Command = "python3"', vs_registration)
 
-    def test_named_pipe_strict_mode_toggle_present(self) -> None:
+    def test_named_pipe_security_is_unconditionally_owner_only(self) -> None:
         vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
         rider_pipe = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/NamedPipeServer.kt")
         self.assertNotIn("WorldSid", vs_pipe)
         self.assertNotIn("AIDB_PIPE_SECURITY", vs_pipe)
-        self.assertIn("AIDB_PIPE_SECURITY", rider_pipe)
+        self.assertNotIn("AIDB_PIPE_SECURITY", rider_pipe)
+        self.assertNotIn(";;;WD", rider_pipe)
+        self.assertIn("current-user owner only", rider_pipe)
+        self.assertIn("RiderInstanceRegistration", rider_pipe)
+        self.assertIn("GetNamedPipeClientProcessId", rider_pipe)
+        self.assertIn("RiderMethodCatalog.catalogHash", rider_pipe)
         self.assertIn("WaitForConnectionAsync", vs_pipe)
         self.assertIn("cancellationToken.Register", vs_pipe)
+
+    def test_rider_uses_authenticated_aidb2_actor_and_command_recovery(self) -> None:
+        rider_pipe = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/NamedPipeServer.kt")
+        rider_registration = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/RiderInstanceRegistration.kt")
+        rider_coordinator = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/RiderRequestCoordinator.kt")
+        rider_catalog = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/protocol/RiderMethodCatalog.kt")
+        rider_bridge = read("mcp_server/rider_bridge.py")
+        rider_trust = read("mcp_server/rider_trust.py")
+        control_tools = read("mcp_server/tool_modules/control_tools.py")
+
+        for token in (
+            "ByteOrder.BIG_ENDIAN", "decodeStrictUtf8", "validateStrictJson",
+            "GetNamedPipeClientProcessId", "clientProcessStartTimeUtcTicks",
+            "serverInstanceId", "isAcceptedUuid7", "RiderRequestCoordinator",
+        ):
+            self.assertIn(token, rider_pipe)
+        self.assertIn("ArrayBlockingQueue(MAX_CONNECTIONS)", rider_pipe)
+        self.assertNotIn("newCachedThreadPool", rider_pipe)
+        self.assertIn('const val protocol = "aidb/2"', rider_catalog)
+        self.assertIn('MessageDigest.getInstance("SHA-256")', rider_catalog)
+        catalog_methods = set(re.findall(r'"([a-z_]+)"', rider_catalog[rider_catalog.index("supportedMethods"):rider_catalog.index("private val manifestBytes")]))
+        service_methods = discover_rider_dispatch_methods(
+            read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt"),
+            rider_coordinator,
+        )
+        self.assertEqual(service_methods, catalog_methods)
+        self.assertIn("SecureRandom", rider_registration)
+        self.assertIn("PROTECTED_DACL_SECURITY_INFORMATION", rider_registration)
+        self.assertIn("writeAtomicallyOwnerOnly", rider_registration)
+        self.assertIn("GetProcessTimes", rider_registration)
+        self.assertNotIn("ProcessHandle.current().info().startInstant()", rider_registration)
+        self.assertNotIn("ProcessHandle.of(actualClientProcessId.toLong())", rider_pipe)
+
+        self.assertIn("ArrayBlockingQueue(QUEUE_CAPACITY)", rider_coordinator)
+        self.assertIn("COMMAND_ACCEPTANCE_WINDOW_MS", rider_coordinator)
+        self.assertIn("MAX_RETAINED_COMMAND_RESPONSE_BYTES", rider_coordinator)
+        self.assertIn("actor.remove(cancelledTask)", rider_coordinator)
+        self.assertIn("validateTargetIdentity", rider_coordinator)
+        self.assertIn('"OUTCOME_UNKNOWN"', rider_coordinator)
+        self.assertIn('descriptor.name == "get_request_status"', rider_coordinator)
+        self.assertIn('descriptor.name == "get_dispatcher_health"', rider_coordinator)
+        self.assertIn("request ID was already used", rider_coordinator)
+
+        self.assertIn('struct.pack(">I", len(payload))', rider_bridge)
+        self.assertIn("object_pairs_hook=_strict_json_object", rider_bridge)
+        self.assertIn("GetNamedPipeServerProcessId", rider_bridge)
+        self.assertIn("outcome_unknown=is_command and write_started", rider_bridge)
+        self.assertIn("_load_rider_registration", rider_bridge)
+        self.assertIn("async def call_pipe_exact", rider_bridge)
+        self.assertIn("debugSessionGeneration", rider_bridge)
+        self.assertNotIn("from .vs_trust", rider_bridge)
+        self.assertNotIn("from vs_trust", rider_bridge)
+        self.assertIn("SE_DACL_PROTECTED", rider_trust)
+        self.assertIn("_validate_same_user_process", rider_trust)
+
+        self.assertIn("_call_recovery_target", control_tools)
+        self.assertIn('target["ide"] == "rider"', control_tools)
+        self.assertIn("call_rider_exact", control_tools)
+        self.assertNotIn('"get_request_status", {"requestId": request_id}, timeout=10.0, preferred_ide="vs"', control_tools)
+
+        rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
+        self.assertIn("requestClientLane", rider_service)
+        self.assertIn("clientSelections", rider_service)
+        self.assertIn("captureDebugIdentity", rider_service)
+        self.assertNotIn("private var selectedThreadId", rider_service)
+        self.assertNotIn("private var selectedFrameIndex", rider_service)
+
+    def test_rider_request_ids_are_canonical_uuid7(self) -> None:
+        import mcp_server.rider_bridge as rider_bridge
+
+        values = [rider_bridge._new_request_id() for _ in range(128)]
+        self.assertEqual(values, sorted(values))
+        self.assertEqual(len(values), len(set(values)))
+        for value in values:
+            parsed = uuid.UUID(value)
+            self.assertEqual(7, parsed.version)
+            self.assertEqual(uuid.RFC_4122, parsed.variant)
+
+    def test_rider_registration_rejects_unsafe_path_with_typed_error(self) -> None:
+        import mcp_server.rider_trust as rider_trust
+
+        expected = rider_trust.RiderBridgeError("unsafe registration", code="INVALID_TARGET")
+        with mock.patch.object(rider_trust, "_validate_registration_security", side_effect=expected):
+            with self.assertRaises(rider_trust.RiderBridgeError) as raised:
+                rider_trust._load_rider_registration("AIDebuggerRider_123")
+        self.assertIs(expected, raised.exception)
+
+    def test_rider_pinned_capability_snapshot_cannot_drift(self) -> None:
+        import mcp_server.rider_bridge as rider_bridge
+
+        registration = {
+            "protocol": "aidb/2",
+            "pipeName": "AIDebuggerRider_123",
+            "processId": 123,
+            "processStartTimeUtcTicks": 1,
+            "serverInstanceId": "server",
+            "protocolCatalogHash": "hash",
+            "authToken": "token",
+            "capabilities": ["debug.read"],
+        }
+        changed = dict(registration, capabilities=["debug.read", "debug.execution.control"])
+        with mock.patch.object(rider_bridge, "_load_rider_registration", return_value=changed):
+            with self.assertRaises(rider_bridge.RiderBridgeError) as raised:
+                rider_bridge._bind_registration(registration["pipeName"], registration)
+        self.assertEqual("STALE_TARGET", raised.exception.code)
+
+    def test_rider_registration_snapshot_preserves_debugger_identity(self) -> None:
+        import mcp_server.rider_bridge as rider_bridge
+
+        registration = {
+            "protocol": "aidb/2",
+            "pipeName": "AIDebuggerRider_123",
+            "processId": 123,
+            "processStartTimeUtcTicks": 638000000000000000,
+            "serverInstanceId": "a" * 32,
+            "protocolCatalogHash": "b" * 64,
+            "authToken": "c" * 64,
+            "capabilities": ["debug.read"],
+            "debugSessionGeneration": 4,
+            "breakSequence": 5,
+            "contextEpoch": 6,
+            "identityKnown": True,
+        }
+        copied = rider_bridge._copy_registration(registration)
+        self.assertEqual(4, copied["debugSessionGeneration"])
+        self.assertEqual(5, copied["breakSequence"])
+        self.assertEqual(6, copied["contextEpoch"])
+        self.assertTrue(copied["identityKnown"])
+
+    def test_rider_stale_selection_is_transactional(self) -> None:
+        import mcp_server.rider_bridge as rider_bridge
+
+        previous = {
+            "protocol": "aidb/2",
+            "pipeName": "AIDebuggerRider_100",
+            "processId": 100,
+            "processStartTimeUtcTicks": 1000,
+            "serverInstanceId": "a" * 32,
+            "protocolCatalogHash": "b" * 64,
+            "authToken": "c" * 64,
+            "capabilities": ["debug.read"],
+        }
+        candidate = dict(
+            previous,
+            pipeName="AIDebuggerRider_200",
+            processId=200,
+            processStartTimeUtcTicks=2000,
+            serverInstanceId="d" * 32,
+        )
+        stale_target = {
+            "pipeName": candidate["pipeName"],
+            "processId": candidate["processId"],
+            "processStartTimeUtcTicks": 1999,
+            "serverInstanceId": candidate["serverInstanceId"],
+        }
+        bridge = rider_bridge.RiderBridge()
+        bridge._selected_pipe = previous["pipeName"]
+        bridge._selected_registration = rider_bridge._copy_registration(previous)
+        try:
+            with mock.patch.object(rider_bridge, "_load_rider_registration", return_value=candidate):
+                with self.assertRaises(rider_bridge.RiderBridgeError) as raised:
+                    bridge.select_instance(
+                        pipe_name=candidate["pipeName"],
+                        registration_snapshot=candidate,
+                        target_identity=stale_target,
+                    )
+            self.assertEqual("STALE_TARGET", raised.exception.code)
+            self.assertEqual(previous["pipeName"], bridge._selected_pipe)
+            self.assertEqual(1000, bridge._selected_registration["processStartTimeUtcTicks"])
+        finally:
+            bridge._executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_rider_exact_recovery_rejects_reused_process_identity(self) -> None:
+        import asyncio
+        import mcp_server.rider_bridge as rider_bridge
+
+        target = {
+            "pipeName": "AIDebuggerRider_123",
+            "processId": 123,
+            "processStartTimeUtcTicks": 638000000000000000,
+            "serverInstanceId": "a" * 32,
+        }
+        changed = {
+            "protocol": "aidb/2",
+            **target,
+            "processStartTimeUtcTicks": target["processStartTimeUtcTicks"] + 1,
+            "protocolCatalogHash": "b" * 64,
+            "authToken": "c" * 64,
+            "capabilities": ["server.control"],
+        }
+        with mock.patch.object(rider_bridge, "_load_rider_registration", return_value=changed):
+            with self.assertRaises(rider_bridge.RiderBridgeError) as raised:
+                asyncio.run(rider_bridge.call_pipe_exact(
+                    target,
+                    "get_request_status",
+                    {"requestId": str(uuid.uuid4())},
+                ))
+        self.assertEqual("STALE_TARGET", raised.exception.code)
 
     def test_server_exposes_p0_tools(self) -> None:
         server_py = read("mcp_server/server.py")
@@ -1877,9 +2084,11 @@ print(json.dumps({
         for bridge_py in (vs_bridge_py, rider_bridge_py):
             self.assertIn('self.connection_status = "ok"', bridge_py)
             self.assertIn('"connectionStatus": "unreachable"', bridge_py)
-            self.assertIn('"lastError": str(e)', bridge_py)
             self.assertIn('instances = [i for i in instances if i.connection_status == "ok"]', bridge_py)
             self.assertIn('return any(i.connection_status == "ok" for i in instances)', bridge_py)
+
+        self.assertIn('"lastError": str(e)', vs_bridge_py)
+        self.assertIn('"lastError": str(error)', rider_bridge_py)
 
         self.assertIn("Multiple VS instances found or no reachable instance could be auto-selected", vs_bridge_py)
         self.assertIn('self.connection_status = getattr(instance, "connection_status", "ok")', ide_bridge_py)
@@ -2094,12 +2303,13 @@ print(json.dumps({
     def test_tool_registry_matches_backend_matrix(self) -> None:
         registry = load_tool_registry()
         rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
+        rider_coordinator = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/RiderRequestCoordinator.kt")
         ide_bridge_py = read("mcp_server/ide_bridge.py")
 
         method_manifest = json.loads(read("mcp_server/debug_method_manifest.json"))
         self.assertEqual("aidb/2", method_manifest["protocol"])
         vs_methods = set(method_manifest["methods"])
-        rider_methods = discover_rider_dispatch_methods(rider_service)
+        rider_methods = discover_rider_dispatch_methods(rider_service, rider_coordinator)
         tool_names = discover_mcp_tool_names()
 
         self.assertEqual([], registry.validate_tool_specs(vs_methods, rider_methods, tool_names))

@@ -31,6 +31,8 @@ object McpClientRegistration {
         "vs_errors.py",
         "vs_trust.py",
         "rider_bridge.py",
+        "rider_errors.py",
+        "rider_trust.py",
         "mcp_app.py",
         "output_models.py",
         "tool_context.py",
@@ -59,6 +61,7 @@ object McpClientRegistration {
             "Use get_debug_status.stopReason to branch analysis flow (breakpoint/exception/step/user_break).\n" +
             "For stop debugging / stop debug / terminate debug session, use debug_stop, stop_debugging, or debug_control(action=\"stop\"). Rider detach is not exposed as supported; use debug_stop to stop the session.\n" +
             "Rider does not expose same-session multi-process enumeration or switch_process as supported; do not infer this Visual Studio-only capability from shared debugger navigation tools.\n" +
+            "If a modifying command returns OUTCOME_UNKNOWN, call get_command_status with its request ID; never replay the command blindly. get_dispatcher_health reports actor and command-ledger state.\n" +
             "When checking multiple values, prefer evaluate_expressions_batch to avoid drift. Expression evaluation attempts the requested expression and returns Rider's explicit value/error/timeout; if a function call is risky or unavailable, prefer field/address/memory inspection or Unreal-specific value decoding.\n"
 
     fun registerWithCursor() {

@@ -78,7 +78,7 @@ class IDEInstance:
         snapshot_getter = getattr(instance, "registration_snapshot", None)
         self._registration_snapshot = (
             snapshot_getter()
-            if ide == "vs" and callable(snapshot_getter) and self.connection_status == "ok"
+            if callable(snapshot_getter) and self.connection_status == "ok"
             else None
         )
 
@@ -104,21 +104,32 @@ class IDEInstance:
         }
 
     def target_identity(self) -> Dict[str, Any]:
-        if self.ide != "vs" or not self.process_start_time_utc_ticks or not self.server_instance_id:
+        if not self.process_start_time_utc_ticks or not self.server_instance_id:
             raise IDEBridgeError("Selected instance has no authenticated immutable identity", code="INVALID_TARGET")
-        return {
+        target = {
             "pipeName": self.pipe_name,
             "processId": self.process_id,
             "processStartTimeUtcTicks": self.process_start_time_utc_ticks,
             "serverInstanceId": self.server_instance_id,
         }
+        if self._registration_snapshot is not None:
+            for key in (
+                "protocolCatalogHash", "debugSessionGeneration", "breakSequence", "contextEpoch",
+            ):
+                if key in self._registration_snapshot:
+                    target[key] = self._registration_snapshot[key]
+        return target
 
     def registration_snapshot(self) -> Dict[str, Any]:
-        if self.ide != "vs" or self._registration_snapshot is None:
+        if self._registration_snapshot is None:
             raise IDEBridgeError(
                 "Selected instance has no authenticated registration snapshot",
                 code="INVALID_TARGET",
-                target_identity=self.target_identity() if self.ide == "vs" else None,
+                target_identity=(
+                    self.target_identity()
+                    if self.process_start_time_utc_ticks and self.server_instance_id
+                    else None
+                ),
             )
         snapshot = dict(self._registration_snapshot)
         snapshot["capabilities"] = list(snapshot.get("capabilities") or [])
@@ -266,9 +277,22 @@ class IDEBridge:
         elif ide == "rider":
             if rider_bridge is None:
                 raise IDEBridgeError("This MCP server was started without the Rider backend")
-            rider_bridge.select_instance(pipe_name=pipe_name, process_id=process_id)
-            target_identity = None
-            registration_snapshot = None
+            try:
+                rider_bridge.select_instance(
+                    pipe_name=pipe_name,
+                    process_id=process_id,
+                    registration_snapshot=registration_snapshot,
+                    target_identity=target_identity,
+                )
+            except _RIDER_BRIDGE_ERRORS as error:
+                raise _typed_bridge_error(error)
+            if registration_snapshot is None:
+                registration_snapshot = rider_bridge.get_selected_registration_snapshot()
+            target_identity = (
+                rider_bridge._target_identity(registration_snapshot)
+                if registration_snapshot is not None
+                else target_identity
+            )
             if vs_bridge is not None:
                 vs_bridge.clear_selection()
         else:
@@ -305,7 +329,7 @@ class IDEBridge:
         self._selection_generation += 1
 
     def _is_stale_selected_instance_error(self, error: Exception) -> bool:
-        if isinstance(error, _VS_BRIDGE_ERRORS):
+        if isinstance(error, _TRANSPORT_ERRORS):
             return getattr(error, "code", "") in {
                 "INSTANCE_REGISTRATION_NOT_FOUND",
                 "PIPE_BUSY",
@@ -522,6 +546,8 @@ class IDEBridge:
                     return await rider_bridge.call_pipe(selected_pipe, method, params, remaining)
                 return await rider_bridge.call(method, params, remaining)
             except _RIDER_BRIDGE_ERRORS as e:
+                if getattr(e, "outcome_unknown", False) and _registry_backend_method_kind(method) == "command":
+                    raise self._unknown_command_outcome(method, e)
                 if not self._is_stale_selected_instance_error(e):
                     raise _typed_bridge_error(e)
                 raise self._selected_target_failure(method, e)
@@ -559,8 +585,8 @@ class IDEBridge:
             )
         call_ide = selected.ide
         call_pipe = selected.pipe_name
-        call_target = selected.target_identity() if selected.ide == "vs" else None
-        call_registration = selected.registration_snapshot() if selected.ide == "vs" else None
+        call_target = selected.target_identity()
+        call_registration = selected.registration_snapshot()
         call_selection_generation = selection_generation
         async with self._lock:
             if self._selection_generation == selection_generation and self._selected_ide is None:
@@ -690,6 +716,23 @@ async def call(
 ) -> Any:
     bridge = get_bridge()
     return await bridge.call(method, params, timeout, preferred_ide=preferred_ide)
+
+
+async def call_rider_exact(
+    target: Dict[str, Any],
+    method: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: float = 10.0,
+) -> Any:
+    if rider_bridge is None:
+        raise IDEBridgeError(
+            "This MCP server was started without the Rider backend",
+            code="BACKEND_UNAVAILABLE",
+        )
+    try:
+        return await rider_bridge.call_pipe_exact(target, method, params, timeout)
+    except _RIDER_BRIDGE_ERRORS as error:
+        raise _typed_bridge_error(error)
 
 
 async def call_with_target(

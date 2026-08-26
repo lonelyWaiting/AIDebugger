@@ -1478,7 +1478,7 @@ asyncio.run(check())
             self.assertFalse(payload["retryable"])
             self.assertFalse(payload["outcomeUnknown"])
 
-    def test_recovery_target_requires_exact_typed_vs_identity(self) -> None:
+    def test_recovery_target_requires_exact_typed_ide_identity(self) -> None:
         from mcp_server import bootstrap
 
         bootstrap.ensure_deps()
@@ -1488,6 +1488,7 @@ asyncio.run(check())
         nonce = "a" * 32
         self.assertEqual(
             {
+                "ide": "vs",
                 "pipeName": "AIDebuggerVS_42",
                 "serverInstanceId": nonce,
                 "processId": 42,
@@ -1495,6 +1496,21 @@ asyncio.run(check())
             },
             _build_recovery_target(
                 "AIDebuggerVS_42",
+                nonce,
+                42,
+                638000000000000000,
+            ),
+        )
+        self.assertEqual(
+            {
+                "ide": "rider",
+                "pipeName": "AIDebuggerRider_42",
+                "serverInstanceId": nonce,
+                "processId": 42,
+                "processStartTimeUtcTicks": 638000000000000000,
+            },
+            _build_recovery_target(
+                "AIDebuggerRider_42",
                 nonce,
                 42,
                 638000000000000000,
@@ -1513,6 +1529,105 @@ asyncio.run(check())
             self.assertEqual("INVALID_ARGUMENT", payload["code"])
             self.assertFalse(payload["retryable"])
             self.assertFalse(payload["outcomeUnknown"])
+
+    def test_exact_recovery_routes_to_original_backend(self) -> None:
+        from mcp_server.tool_modules import control_tools
+
+        target = {
+            "ide": "rider",
+            "pipeName": "AIDebuggerRider_42",
+            "serverInstanceId": "a" * 32,
+            "processId": 42,
+            "processStartTimeUtcTicks": 638000000000000000,
+        }
+        with mock.patch.object(
+            control_tools.ide_bridge,
+            "call_rider_exact",
+            mock.AsyncMock(return_value={"state": "completed"}),
+            create=True,
+        ) as exact_call:
+            result = asyncio.run(control_tools._call_recovery_target(
+                target,
+                "get_request_status",
+                {"requestId": "request"},
+                timeout=10.0,
+            ))
+        self.assertEqual({"state": "completed"}, result)
+        exact_call.assert_awaited_once_with(
+            {
+                "pipeName": "AIDebuggerRider_42",
+                "serverInstanceId": "a" * 32,
+                "processId": 42,
+                "processStartTimeUtcTicks": 638000000000000000,
+            },
+            "get_request_status",
+            {"requestId": "request"},
+            timeout=10.0,
+        )
+
+    def test_combined_ide_instance_preserves_rider_registration_snapshot(self) -> None:
+        from mcp_server import ide_bridge, rider_bridge
+
+        registration = {
+            "protocol": "aidb/2",
+            "pipeName": "AIDebuggerRider_42",
+            "processId": 42,
+            "processStartTimeUtcTicks": 638000000000000000,
+            "serverInstanceId": "a" * 32,
+            "protocolCatalogHash": "b" * 64,
+            "authToken": "c" * 64,
+            "capabilities": ["server.control", "debug.read"],
+            "debugSessionGeneration": 7,
+            "breakSequence": 8,
+            "contextEpoch": 9,
+            "identityKnown": True,
+        }
+        rider = rider_bridge.RiderInstance(
+            registration["pipeName"],
+            {"processId": 42, "connectionStatus": "ok"},
+            registration,
+        )
+        combined = ide_bridge.IDEInstance("rider", rider)
+        self.assertEqual(registration, combined.registration_snapshot())
+        self.assertEqual(9, combined.target_identity()["contextEpoch"])
+
+    def test_combined_selection_pins_rider_registration(self) -> None:
+        from mcp_server import ide_bridge
+
+        registration = {
+            "protocol": "aidb/2",
+            "pipeName": "AIDebuggerRider_42",
+            "processId": 42,
+            "processStartTimeUtcTicks": 638000000000000000,
+            "serverInstanceId": "a" * 32,
+            "protocolCatalogHash": "b" * 64,
+            "authToken": "c" * 64,
+            "capabilities": ["server.control", "debug.read"],
+            "debugSessionGeneration": 7,
+            "breakSequence": 8,
+            "contextEpoch": 9,
+            "identityKnown": True,
+        }
+        bridge = ide_bridge.IDEBridge()
+        bridge._preferred_ide = None
+        with mock.patch.object(ide_bridge.rider_bridge, "select_instance") as select:
+            bridge.select_instance(
+                ide="rider",
+                pipe_name=registration["pipeName"],
+                target_identity={key: registration[key] for key in (
+                    "pipeName", "processId", "processStartTimeUtcTicks", "serverInstanceId",
+                )},
+                registration_snapshot=registration,
+            )
+        select.assert_called_once_with(
+            pipe_name=registration["pipeName"],
+            process_id=None,
+            registration_snapshot=registration,
+            target_identity={key: registration[key] for key in (
+                "pipeName", "processId", "processStartTimeUtcTicks", "serverInstanceId",
+            )},
+        )
+        self.assertEqual(9, bridge._selected_target["contextEpoch"])
 
     def test_detect_preserves_explicit_target_over_paused_candidate(self) -> None:
         from mcp_server import ide_bridge

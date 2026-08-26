@@ -83,6 +83,8 @@ dependencies {
         }
     }
     implementation("io.github.icedland.iced:iced-x86:1.21.0")
+    testImplementation(kotlin("test-junit5"))
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 java {
@@ -108,4 +110,11 @@ tasks.named("instrumentCode") {
 
 tasks.named("prepareJarSearchableOptions") {
     enabled = false
+}
+
+tasks.test {
+    useJUnitPlatform()
+    javaLauncher.set(javaToolchains.launcherFor {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    })
 }

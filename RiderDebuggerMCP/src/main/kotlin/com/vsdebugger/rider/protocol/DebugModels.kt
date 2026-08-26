@@ -11,7 +11,10 @@ data class DebugStatusResult(
     @SerializedName("currentProcess") val currentProcess: String? = null,
     @SerializedName("stopReason") val stopReason: String = "not_paused",
     @SerializedName("stopReasonRaw") val stopReasonRaw: String? = null,
-    @SerializedName("currentLocation") val currentLocation: LocationInfo? = null
+    @SerializedName("currentLocation") val currentLocation: LocationInfo? = null,
+    @SerializedName("debugSessionGeneration") val debugSessionGeneration: Long = 0,
+    @SerializedName("breakSequence") val breakSequence: Long = 0,
+    @SerializedName("contextEpoch") val contextEpoch: Long = 0
 )
 
 data class LocationInfo(

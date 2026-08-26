@@ -39,6 +39,7 @@ COMMON_BACKEND_METHODS = frozenset({
     "get_build_errors",
     "get_callstack",
     "get_debug_status",
+    "get_dispatcher_health",
     "get_disassembly",
     "get_disassembly_at",
     "get_errors_only",
@@ -48,6 +49,7 @@ COMMON_BACKEND_METHODS = frozenset({
     "get_locals",
     "get_modules",
     "get_output_window",
+    "get_request_status",
     "get_registers",
     "get_threads",
     "get_warnings_only",
@@ -65,6 +67,7 @@ COMMON_BACKEND_METHODS = frozenset({
     "stop",
     "switch_stack_frame",
     "switch_thread",
+    "cancel_request",
 })
 
 VS_ONLY_BACKEND_METHODS = frozenset({
@@ -78,11 +81,8 @@ VS_ONLY_BACKEND_METHODS = frozenset({
     "continue_and_wait_for_break_safe",
     "get_breakpoint_bindings",
     "get_debug_processes",
-    "get_dispatcher_health",
     "get_dump_memory_ranges",
     "get_module_layout",
-    "get_request_status",
-    "cancel_request",
     "inspect_managed_assembly",
     "inspect_managed_method_il",
     "inspect_managed_type",

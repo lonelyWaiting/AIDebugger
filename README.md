@@ -12,7 +12,7 @@ execution control, and Visual Studio-only no-source native/managed workflows.
 
 ```
 Visual Studio VSIX -- authenticated AIDB/2 pipe --> VS-only FastMCP entry -- stdio --> MCP client
-Rider plugin       -- Rider pipe ----------------> Rider FastMCP entry ---- stdio --> MCP client
+Rider plugin       -- authenticated AIDB/2 pipe --> Rider FastMCP entry --- stdio --> MCP client
 ```
 
 Each IDE instance owns a named pipe:
@@ -21,8 +21,8 @@ Each IDE instance owns a named pipe:
 - Visual Studio control: `\\.\pipe\AIDebuggerVS_<PID>_control` (paired with the data pipe; not a separate IDE instance)
 - Rider: `\\.\pipe\AIDebuggerRider_<PID>`
 
-Visual Studio discovery is based on owner-only instance registrations, not on
-pipe names alone. A selected target is pinned by PID, process creation time,
+Both backends are discovered through owner-only instance registrations rather
+than pipe names alone. A selected target is pinned by PID, process creation time,
 server instance nonce, authentication token, and granted-capability snapshot.
 Authentication data remains private and is never serialized in MCP results.
 Composite/context-sensitive calls additionally pin
@@ -75,7 +75,12 @@ Important files:
 
 - `RiderDebuggerPlugin.kt` - plugin startup and MCP client registration.
 - `DebuggerService.kt` - Rider debugger operations.
-- `NamedPipeServer.kt` - JSON-RPC request dispatch over named pipes.
+- `NamedPipeServer.kt` - authenticated, length-prefixed AIDB/2 host with strict
+  UTF-8/JSON validation and immutable process/instance binding.
+- `RiderInstanceRegistration.kt` - owner-only atomic registration and per-instance token.
+- `RiderRequestCoordinator.kt` - bounded single actor, command tombstones,
+  result recovery, cancellation admission, and dispatcher health.
+- `protocol/RiderMethodCatalog.kt` - loads and hashes the shared backend manifest.
 - `McpClientRegistration.kt` - seeds the Python MCP server and registers MCP clients.
 - `protocol/DebugModels.kt` - response models aligned with the VS contracts.
 
@@ -455,7 +460,7 @@ Get-ChildItem \\.\pipe\ | Where-Object { $_.Name -like "AIDebuggerRider_*" }
 
 ## Protocol
 
-Visual Studio uses AIDB/2: a four-byte big-endian payload length followed by
+Both Visual Studio and Rider use AIDB/2: a four-byte big-endian payload length followed by
 strict UTF-8 JSON. Frames, parameters, results, and deadlines are bounded.
 Every request is authenticated and declares its command/query kind, primary
 capability, immutable target identity, deadline, and debug-session generation.
@@ -489,8 +494,8 @@ operations (for example execution control plus read access):
 
 The owner-only instance registration and every response also carry a
 `protocolCatalogHash` (SHA-256 of the shared method manifest). Discovery fails
-with `PROTOCOL_CATALOG_MISMATCH` when the deployed VSIX and Python bundle do not
-describe the same protocol surface.
+with `PROTOCOL_CATALOG_MISMATCH` when the deployed IDE plugin and Python bundle
+do not describe the same protocol surface.
 
 Successful response:
 
@@ -509,9 +514,10 @@ a bounded 24-hour acceptance window. Completed tombstones remain fail-closed for
 that whole window; expired IDs are rejected before they can execute, so bounded
 reclamation never permits replay. Response bodies have a separate bounded cache.
 Transport loss after command acceptance returns `OUTCOME_UNKNOWN`; clients query
-`get_command_status` rather than replaying the command. Queries that finish after
-the transport deadline are retained in a bounded five-minute result journal and
-are recoverable through the same status tool.
+`get_command_status` rather than replaying the command. Rider and VS both retain
+24-hour command tombstones and bounded response bodies. VS additionally retains
+queries that finish after the transport deadline in a bounded five-minute result
+journal.
 
 The VSIX maintains 8 data, 4 interrupt, and 2 recovery listeners. Their protected
 current-user ACL includes `CreateNewInstance` only so the owning VS process can
@@ -522,8 +528,15 @@ the active request/effect state plus actor queue depth, configured listener pool
 command-ledger capacity, and query-journal usage; recovery requires restarting
 that Visual Studio process and cannot be bypassed by toggling the MCP server.
 
-`AIDB_ALLOWED_CAPABILITIES` can restrict the server
-to a comma-separated subset. Pipe and instance-registration ACLs are always
+Rider uses a bounded single debug-session actor, so mutable thread/frame state
+cannot race across pipe connections. `get_dispatcher_health`,
+`get_command_status`, and queued-request cancellation bypass debugger execution
+and remain available while the actor is busy. A running Rider command is not
+forcibly interrupted; deadline or transport loss is reported as
+`OUTCOME_UNKNOWN` until its ledger entry reaches a definitive result.
+
+For Visual Studio, `AIDB_ALLOWED_CAPABILITIES` can restrict the server to a
+comma-separated subset. Pipe and instance-registration ACLs are always
 protected current-user owner-only ACLs; there is no world-access compatibility mode.
 This is intentionally a same-Windows-user trust boundary, not a defense against a
 malicious process already running as that user. Run untrusted tools under another

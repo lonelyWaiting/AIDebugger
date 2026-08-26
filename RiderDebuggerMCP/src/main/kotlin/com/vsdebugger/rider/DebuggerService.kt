@@ -48,16 +48,37 @@ import java.io.File
 import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.util.Base64
+import java.util.LinkedHashMap
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import javax.swing.Icon
 
+data class RiderDebuggerIdentity(
+    val debugSessionGeneration: Long = 0,
+    val breakSequence: Long = 0,
+    val contextEpoch: Long = 0
+)
+
 class DebuggerService {
+    private data class ClientSelection(
+        var threadId: Int? = null,
+        var frameIndex: Int? = null
+    )
+
     private var pipeName: String = ""
-    private var selectedThreadId: Int? = null
-    private var selectedFrameIndex: Int? = null
+    private val requestClientLane = ThreadLocal<String>()
+    private val clientSelections = object : LinkedHashMap<String, ClientSelection>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ClientSelection>?): Boolean =
+            size > 64
+    }
+    private var identityInitialized = false
+    private var observedSession: XDebugSession? = null
+    private var observedSuspendContext: XSuspendContext? = null
+    private var debugSessionGeneration = 0L
+    private var breakSequence = 0L
+    private var contextEpoch = 0L
     private val snapshotMaxAttempts = 2
     private val snapshotRetryDelayMs = 40L
     private val variableExpansionMaxNodes = 128
@@ -71,9 +92,53 @@ class DebuggerService {
         pipeName = value
     }
 
+    fun captureDebugIdentity(): RiderDebuggerIdentity {
+        val session = currentSession()
+        val suspendContext = session?.suspendContext
+        if (!identityInitialized) {
+            identityInitialized = true
+            if (session != null) {
+                debugSessionGeneration++
+                contextEpoch++
+            }
+            if (suspendContext != null) breakSequence++
+        } else if (session !== observedSession) {
+            debugSessionGeneration++
+            contextEpoch++
+            if (suspendContext != null) breakSequence++
+            clientSelections.clear()
+        } else if (suspendContext !== observedSuspendContext) {
+            contextEpoch++
+            if (suspendContext != null) breakSequence++
+            clientSelections.clear()
+        }
+        observedSession = session
+        observedSuspendContext = suspendContext
+        return currentDebugIdentity()
+    }
+
+    fun advanceContextEpoch(): RiderDebuggerIdentity {
+        captureDebugIdentity()
+        contextEpoch++
+        return currentDebugIdentity()
+    }
+
+    private fun currentDebugIdentity(): RiderDebuggerIdentity = RiderDebuggerIdentity(
+        debugSessionGeneration = debugSessionGeneration,
+        breakSequence = breakSequence,
+        contextEpoch = contextEpoch
+    )
+
+    private fun currentSelection(): ClientSelection {
+        val lane = requestClientLane.get() ?: "internal"
+        return clientSelections.getOrPut(lane) { ClientSelection() }
+    }
+
     fun handleMethod(request: DebugRequest): Any? {
         val method = request.method?.lowercase(Locale.ROOT) ?: return null
-        return when (method) {
+        val clientLane = "${request.meta?.clientProcessId ?: 0}:${request.meta?.clientProcessStartTimeUtcTicks ?: 0L}"
+        fun dispatch(): Any? {
+            return when (method) {
             "get_debug_status" -> getDebugStatus()
             "get_callstack" -> getCallStack()
             "get_locals" -> {
@@ -278,12 +343,24 @@ class DebuggerService {
                 val maxMatches = getParam(request.params, "maxMatches", 20)
                 searchOutput(pattern, pane, isRegex, contextLines, maxMatches)
             }
-            else -> throw UnsupportedOperationException("Unknown method: ${request.method}")
+                else -> throw UnsupportedOperationException("Unknown method: ${request.method}")
+            }
+        }
+        requestClientLane.set(clientLane)
+        return try {
+            dispatch()
+        } finally {
+            requestClientLane.remove()
         }
     }
 
     private fun getDebugStatus(): DebugStatusResult {
-        val session = currentSession() ?: return DebugStatusResult()
+        val identity = captureDebugIdentity()
+        val session = currentSession() ?: return DebugStatusResult(
+            debugSessionGeneration = identity.debugSessionGeneration,
+            breakSequence = identity.breakSequence,
+            contextEpoch = identity.contextEpoch
+        )
         val isPaused = session.isSuspended
         val isDebugging = !session.isSuspended || session.suspendContext != null
         val mode = if (isPaused) "Break" else if (isDebugging) "Running" else "Design"
@@ -298,7 +375,10 @@ class DebuggerService {
             currentProcess = processName,
             stopReason = stopReason,
             stopReasonRaw = stopReasonRaw,
-            currentLocation = location
+            currentLocation = location,
+            debugSessionGeneration = identity.debugSessionGeneration,
+            breakSequence = identity.breakSequence,
+            contextEpoch = identity.contextEpoch
         )
     }
 
@@ -432,7 +512,7 @@ class DebuggerService {
         val budget = VariableExpansionBudget(variableExpansionMaxNodes, variableExpansionBudgetMs)
         val variables = collectVariables(frame, 0, maxDepth.coerceIn(0, variableExpansionMaxDepth), budget)
         return LocalsResult(
-            frameIndex = selectedFrameIndex ?: 0,
+            frameIndex = currentSelection().frameIndex ?: 0,
             variables = variables.toMutableList(),
             partial = budget.isExceeded,
             error = budget.reason
@@ -1790,7 +1870,6 @@ class DebuggerService {
     }
 
     private fun switchStackFrame(frameIndex: Int): DebugControlResult {
-        selectedFrameIndex = frameIndex
         val session = currentSession() ?: return DebugControlResult(action = "SwitchStackFrame", success = false, message = "No debug session")
         val suspendContext = session.suspendContext ?: return DebugControlResult(action = "SwitchStackFrame", success = false, message = "Not paused")
         val stack = getSelectedStack(suspendContext) ?: return DebugControlResult(action = "SwitchStackFrame", success = false, message = "No stack")
@@ -1801,6 +1880,7 @@ class DebuggerService {
         val frame = frames[frameIndex]
         return try {
             session.setCurrentStackFrame(stack, frame, true)
+            currentSelection().frameIndex = frameIndex
             DebugControlResult(action = "SwitchStackFrame", success = true, message = "Ok", newLocation = getFrameLocation(frame))
         } catch (ex: Exception) {
             DebugControlResult(action = "SwitchStackFrame", success = false, message = ex.message)
@@ -1808,8 +1888,6 @@ class DebuggerService {
     }
 
     private fun switchThread(threadId: Int): DebugControlResult {
-        selectedThreadId = threadId
-        selectedFrameIndex = 0
         val session = currentSession() ?: return DebugControlResult(action = "SwitchThread", success = false, message = "No debug session")
         val suspendContext = session.suspendContext ?: return DebugControlResult(action = "SwitchThread", success = false, message = "Not paused")
         val stack = suspendContext.executionStacks?.firstOrNull { threadId(it) == threadId }
@@ -1818,6 +1896,10 @@ class DebuggerService {
         if (frame != null) {
             return try {
                 session.setCurrentStackFrame(stack, frame, true)
+                currentSelection().apply {
+                    this.threadId = threadId
+                    frameIndex = 0
+                }
                 DebugControlResult(action = "SwitchThread", success = true, message = "Ok", newLocation = getFrameLocation(frame))
             } catch (ex: Exception) {
                 DebugControlResult(action = "SwitchThread", success = false, message = ex.message)
@@ -2115,7 +2197,7 @@ class DebuggerService {
                 )
             )
         }
-        result.currentThreadId = selectedThreadId ?: (active?.let { threadId(it) } ?: 0)
+        result.currentThreadId = currentSelection().threadId ?: (active?.let { threadId(it) } ?: 0)
         if (budget.isExceeded) {
             result.partial = true
             result.error = budget.reason
@@ -2148,7 +2230,7 @@ class DebuggerService {
     private fun getSelectedStack(suspendContext: XSuspendContext): XExecutionStack? {
         val stacks = suspendContext.executionStacks?.toList() ?: emptyList()
         if (stacks.isEmpty()) return null
-        val selected = selectedThreadId
+        val selected = currentSelection().threadId
         if (selected != null) {
             val match = stacks.firstOrNull { threadId(it) == selected }
             if (match != null) return match
@@ -2160,7 +2242,7 @@ class DebuggerService {
         val suspendContext = session.suspendContext ?: return session.currentStackFrame
         val stack = getSelectedStack(suspendContext) ?: return session.currentStackFrame
         val frames = collectStackFrames(stack)
-        val index = (selectedFrameIndex ?: 0).coerceAtLeast(0)
+        val index = (currentSelection().frameIndex ?: 0).coerceAtLeast(0)
         return frames.getOrNull(index) ?: stack.topFrame ?: session.currentStackFrame
     }
 

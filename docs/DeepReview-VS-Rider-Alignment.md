@@ -1,6 +1,6 @@
 # Visual Studio / Rider capability alignment
 
-Last verified: 2026-07-22
+Last verified: 2026-07-23
 
 This document describes the current public contracts. It is not a historical
 security review and must not be used as evidence for older AIDB/1 builds.
@@ -18,7 +18,7 @@ VSIX -> AIDebuggerVS_<PID> + _control + _recovery
      -> authenticated AIDB/2 -> VS-only FastMCP server
 
 Rider plugin -> AIDebuggerRider_<PID>
-             -> Rider FastMCP server
+             -> authenticated AIDB/2 -> Rider FastMCP server
 ```
 
 The `_control` and `_recovery` pipes are paired with one VS instance; neither is
@@ -71,6 +71,31 @@ The package does not auto-start the server and does not modify MCP client
 configuration during normal Visual Studio startup. Setup and removal are
 explicit Tools-menu actions with per-client preview and confirmation.
 
+## Rider security and command semantics
+
+Rider now shares the transport invariants that prevent stale-target execution
+and command replay:
+
+- protected current-user owner-only pipe and atomic instance-registration ACLs;
+- owner-registration discovery, a 256-bit per-instance token, Rider PID/process
+  creation time, server nonce, client PID/process creation time, and response
+  identity validation;
+- the same manifest SHA-256 catalog hash as Python and Visual Studio;
+- four-byte big-endian frames, strict UTF-8, duplicate-property and JSON-depth
+  rejection, bounded requests/responses, typed errors, and response-ID checks;
+- a bounded single actor around every live `DebuggerService` operation, removing
+  the previous cross-connection thread/frame selection race;
+- UUIDv7 command IDs, fingerprint conflicts, 24-hour fail-closed tombstones,
+  bounded response bodies, no transport replay, and `OUTCOME_UNKNOWN` plus
+  `get_command_status` recovery;
+- direct health/status and queued-cancellation handling outside the debugger
+  actor, so a slow Rider debugger call does not hide command ownership.
+
+Rider does not yet mirror the VS process-wide UI/COM poison circuit or its
+five-minute late-query journal. Running debugger calls are conservatively marked
+outcome-unknown on deadline and are allowed to finish under the single actor;
+queued calls can be cancelled before execution.
+
 ## Capability contract
 
 The machine-readable source of truth is
@@ -90,7 +115,7 @@ Important semantic differences:
 | Same-session process selection | Enumerates `Debugger.DebuggedProcesses`; `switch_process` selects an opaque session/PID/start-time handle while paused (legacy PID fallback remains) | No equivalent multi-process selection contract exposed |
 | Source location | Official debugger document context; explicit unavailable status when absent | Rider debugger position APIs |
 | Native/dump inspection | VS-specific native, memory, disassembly, module, and dump workflows | Capability-dependent and more limited |
-| Command recovery | AIDB/2 request ledger and exact target handle | Rider-specific transport semantics |
+| Command recovery | AIDB/2 request ledger, exact target handle, late-query journal, UI/COM poison circuit | AIDB/2 request ledger, exact process/instance target, single actor; no late-query journal or poison circuit |
 
 Clients must read `debug_capabilities` and each result's `capability`,
 `behavior`, `partial`, and snapshot fields. They must not infer parity from a

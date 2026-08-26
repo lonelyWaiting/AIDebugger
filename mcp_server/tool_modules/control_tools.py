@@ -21,7 +21,7 @@ async def get_dispatcher_health(
     target_process_id: Optional[int] = None,
     target_process_start_time_utc_ticks: Optional[int] = None,
 ) -> str:
-    """Return process-wide VS UI/COM dispatcher health through the recovery lane."""
+    """Return the selected backend's serialized debugger-dispatch health."""
     try:
         target = _build_recovery_target(
             target_pipe_name,
@@ -29,12 +29,8 @@ async def get_dispatcher_health(
             target_process_id,
             target_process_start_time_utc_ticks,
         )
-        result = await (
-            vs_bridge.call_pipe_exact(
-                target, "get_dispatcher_health", {}, timeout=10.0)
-            if target else
-            ide_bridge.call(
-                "get_dispatcher_health", {}, timeout=10.0, preferred_ide="vs")
+        result = await _call_recovery_target(
+            target, "get_dispatcher_health", {}, timeout=10.0
         )
         return format_result(result)
     except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as e:
@@ -49,7 +45,7 @@ async def get_command_status(
     target_process_id: Optional[int] = None,
     target_process_start_time_utc_ticks: Optional[int] = None,
 ) -> str:
-    """查询一次可能丢失响应的修改型命令是否已在 VS 端完成。"""
+    """查询一次可能丢失响应的 VS 或 Rider 修改型命令是否已完成。"""
     try:
         target = _build_recovery_target(
             target_pipe_name,
@@ -57,10 +53,8 @@ async def get_command_status(
             target_process_id,
             target_process_start_time_utc_ticks,
         )
-        result = await (
-            vs_bridge.call_pipe_exact(target, "get_request_status", {"requestId": request_id}, timeout=10.0)
-            if target else
-            ide_bridge.call("get_request_status", {"requestId": request_id}, timeout=10.0, preferred_ide="vs")
+        result = await _call_recovery_target(
+            target, "get_request_status", {"requestId": request_id}, timeout=10.0
         )
         return format_result(result)
     except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as e:
@@ -75,7 +69,7 @@ async def cancel_debug_request(
     target_process_id: Optional[int] = None,
     target_process_start_time_utc_ticks: Optional[int] = None,
 ) -> str:
-    """请求取消尚未完成的 VS 调试请求；已开始的修改操作会返回结果未知语义。"""
+    """请求取消所选 VS 或 Rider 后端中尚未完成的调试请求。"""
     try:
         target = _build_recovery_target(
             target_pipe_name,
@@ -83,10 +77,8 @@ async def cancel_debug_request(
             target_process_id,
             target_process_start_time_utc_ticks,
         )
-        result = await (
-            vs_bridge.call_pipe_exact(target, "cancel_request", {"requestId": request_id}, timeout=10.0)
-            if target else
-            ide_bridge.call("cancel_request", {"requestId": request_id}, timeout=10.0, preferred_ide="vs")
+        result = await _call_recovery_target(
+            target, "cancel_request", {"requestId": request_id}, timeout=10.0
         )
         return format_result(result)
     except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as e:
@@ -123,16 +115,43 @@ def _build_recovery_target(
         or process_start_time_utc_ticks > 0x7FFFFFFFFFFFFFFF
     ):
         raise invalid("Invalid recovery target process identity")
-    if not isinstance(pipe_name, str) or pipe_name != f"AIDebuggerVS_{process_id}":
+    if not isinstance(pipe_name, str):
+        raise invalid("Recovery target pipe name does not match its process id")
+    if pipe_name == f"AIDebuggerVS_{process_id}":
+        ide = "vs"
+    elif pipe_name == f"AIDebuggerRider_{process_id}":
+        ide = "rider"
+    else:
         raise invalid("Recovery target pipe name does not match its process id")
     if not isinstance(server_instance_id, str) or not re.fullmatch(r"[0-9a-f]{32}", server_instance_id):
         raise invalid("Recovery target server instance id is invalid")
     return {
+        "ide": ide,
         "pipeName": pipe_name,
         "serverInstanceId": server_instance_id,
         "processId": process_id,
         "processStartTimeUtcTicks": process_start_time_utc_ticks,
     }
+
+
+async def _call_recovery_target(
+    target: Optional[Dict[str, Any]],
+    method: str,
+    params: Dict[str, Any],
+    timeout: float,
+) -> Any:
+    if target is None:
+        return await ide_bridge.call(method, params, timeout=timeout)
+    exact_target = {key: value for key, value in target.items() if key != "ide"}
+    if target["ide"] == "rider":
+        exact_call = getattr(ide_bridge, "call_rider_exact", None)
+        if exact_call is None:
+            raise ide_bridge.IDEBridgeError(
+                "This MCP server was started without exact Rider recovery support",
+                code="BACKEND_UNAVAILABLE",
+            )
+        return await exact_call(exact_target, method, params, timeout=timeout)
+    return await vs_bridge.call_pipe_exact(exact_target, method, params, timeout=timeout)
 
 
 @mcp.tool()

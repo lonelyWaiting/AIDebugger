@@ -255,10 +255,8 @@ async def detect_debug_sessions(prefer_ide: Optional[str] = None, select: bool =
                 ide_bridge.select_instance(
                     ide=selected.ide,
                     pipe_name=selected.pipe_name,
-                    target_identity=selected.target_identity() if selected.ide == "vs" else None,
-                    registration_snapshot=(
-                        selected.registration_snapshot() if selected.ide == "vs" else None
-                    ),
+                    target_identity=selected.target_identity(),
+                    registration_snapshot=selected.registration_snapshot(),
                 )
                 selected_payload = selected.to_dict()
                 selected_payload["isSelected"] = True
@@ -333,10 +331,8 @@ async def select_ide_instance(ide: str, process_id: int) -> str:
         ide_bridge.select_instance(
             ide=ide_key,
             pipe_name=target.pipe_name,
-            target_identity=target.target_identity() if ide_key == "vs" else None,
-            registration_snapshot=(
-                target.registration_snapshot() if ide_key == "vs" else None
-            ),
+            target_identity=target.target_identity(),
+            registration_snapshot=target.registration_snapshot(),
         )
 
         result = {

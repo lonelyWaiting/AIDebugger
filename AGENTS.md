@@ -108,7 +108,10 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 **Rider Plugin:**
 - `RiderDebuggerPlugin.kt` - Plugin entry point
 - `DebuggerService.kt` - Debugger operations (mirrors VS implementation)
-- `NamedPipeServer.kt` - Named Pipe server (`\\.\pipe\AIDebuggerRider_<PID>`)
+- `NamedPipeServer.kt` - Authenticated AIDB/2 host (`\\.\pipe\AIDebuggerRider_<PID>`)
+- `RiderInstanceRegistration.kt` / `RiderRequestCoordinator.kt` - owner-only
+  rendezvous, immutable instance identity, single actor, command tombstones,
+  status recovery, and dispatcher health
 - `McpClientRegistration.kt` - MCP registration with Python version check
 
 **MCP Server:**
