@@ -51,7 +51,7 @@ namespace VSDebuggerMCP.Protocol
             "continue",
             "evaluate_expression", "evaluate_expressions_batch", "get_callstack", "get_disassembly",
             "get_disassembly_at", "get_exception", "get_full_context", "get_locals", "get_registers",
-            "read_memory", "resolve_address", "search_memory", "set_address_breakpoint", "set_data_breakpoint",
+            "get_dump_memory_ranges", "read_memory", "resolve_address", "search_memory", "set_address_breakpoint", "set_data_breakpoint",
             "run_to_cursor", "set_next_statement", "set_watchpoint", "step_into", "step_out", "step_over",
             "switch_process", "switch_stack_frame", "switch_thread",
         };
@@ -232,6 +232,7 @@ namespace VSDebuggerMCP.Protocol
             Add(specs, "capture_debug_bundle_safe", "", "includeModules includeOutput includeThreads outputTailLines threadIncludeFrames threadMaxFramesPerThread threadMaxNodes threadBudgetMs");
             Add(specs, "capture_debug_bundle", "", "expressions expandChildren maxDepth evaluationPolicy includeLocals includeModules includeRegisters includeOutput includeThreads includeException outputTailLines threadIncludeFrames threadMaxFramesPerThread threadMaxNodes threadBudgetMs");
             Add(specs, "read_memory", "address", "size");
+            Add(specs, "get_dump_memory_ranges", "", "startIndex maxNodes budgetMs");
             Add(specs, "get_disassembly", "", "linesBefore linesAfter");
             Add(specs, "get_disassembly_at", "address", "count");
             Add(specs, "resolve_address", "address", "");
@@ -257,9 +258,10 @@ namespace VSDebuggerMCP.Protocol
             Add(specs, "set_data_breakpoint set_watchpoint", "dataExpression", "byteCount condition hitCount hitCountType conditionType");
             Add(specs, "set_address_breakpoint", "address", "condition hitCount hitCountType conditionType");
             Add(specs, "delete_breakpoint clear_breakpoint", "filePath lineNumber", "breakpointLookupBudgetMs");
+            Add(specs, "delete_data_breakpoint", "dataBreakpointId", "breakpointLookupBudgetMs");
             Add(specs, "enable_breakpoint", "filePath lineNumber", "enabled breakpointLookupBudgetMs");
             Add(specs, "add_watch", "expression", "");
-            Add(specs, "search_memory", "startAddress pattern", "maxResults searchSize patternFormat startOffset");
+            Add(specs, "search_memory", "pattern", "startAddress maxResults searchSize patternFormat startOffset continuation");
             Add(specs, "switch_stack_frame", "", "frameIndex");
             Add(specs, "switch_thread", "threadId", "threadLookupBudgetMs");
             Add(specs, "get_output_window", "", "pane tailLines endCharacter maxBytes");

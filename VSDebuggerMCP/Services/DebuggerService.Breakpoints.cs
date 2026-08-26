@@ -421,6 +421,8 @@ namespace VSDebuggerMCP
                     return result;
                 }
 
+                string dataBreakpointId = Guid.NewGuid().ToString("N");
+
                 try
                 {
                     result.CommandIssued = true;
@@ -454,10 +456,24 @@ namespace VSDebuggerMCP
 
                     var breakpoint = bps.Item(1);
                     result.AffectedCount = 1;
+                    if (!TrySetDataBreakpointTag(breakpoint, dataBreakpointId))
+                    {
+                        SafeDeleteBreakpoint(breakpoint);
+                        result.Success = false;
+                        result.ErrorCode = "OUTCOME_UNKNOWN";
+                        result.Outcome = "created_then_identity_cleanup_attempted";
+                        result.Message = "Data breakpoint could not be assigned an AIDebugger cleanup identity";
+                        return result;
+                    }
                     IsBreakpointBound(debugger, breakpoint);
                     var breakpointInfo = BuildBreakpointInfo(breakpoint, debugger, null, 0, normalizedCondition);
                     if (!breakpointInfo.ConditionApplied)
                     {
+                        // The tag was assigned before condition verification.  If
+                        // cleanup encounters a transient VS failure, preserve the
+                        // owned ID in the outcome so the caller can retry only this
+                        // breakpoint rather than broadening cleanup to user data.
+                        result.BreakpointInfo = breakpointInfo;
                         SafeDeleteBreakpoint(breakpoint);
                         result.Success = false;
                         result.ErrorCode = "OUTCOME_UNKNOWN";
@@ -482,6 +498,124 @@ namespace VSDebuggerMCP
 
                 return result;
             });
+        }
+
+        /// <summary>
+        /// Delete one AIDebugger-owned data breakpoint by the opaque identifier
+        /// returned from <see cref="SetDataBreakpoint"/>.  User-created Visual
+        /// Studio breakpoints and unrecognised tags are never candidates.
+        /// </summary>
+        public BreakpointOperationResult DeleteDataBreakpoint(
+            string dataBreakpointId,
+            int breakpointLookupBudgetMs = -1)
+        {
+            string normalizedDataBreakpointId;
+            if (!TryNormalizeDataBreakpointId(dataBreakpointId, out normalizedDataBreakpointId))
+            {
+                return new BreakpointOperationResult
+                {
+                    Operation = "DeleteData",
+                    Success = false,
+                    ErrorCode = "INVALID_ARGUMENT",
+                    Message = "dataBreakpointId must be an AIDebugger data-breakpoint identifier",
+                    Outcome = "invalid_identifier",
+                };
+            }
+
+            DataBreakpointLookupResult lookup = FindOwnedDataBreakpointSliced(
+                normalizedDataBreakpointId,
+                breakpointLookupBudgetMs);
+            if (lookup.MatchingCount > 1)
+            {
+                return new BreakpointOperationResult
+                {
+                    Operation = "DeleteData",
+                    Success = false,
+                    ErrorCode = "OUTCOME_UNKNOWN",
+                    Message = "Multiple data breakpoints share this AIDebugger cleanup identity; no breakpoint was removed",
+                    Outcome = "ambiguous_owned_identity",
+                };
+            }
+
+            if (lookup.Index <= 0)
+            {
+                return new BreakpointOperationResult
+                {
+                    Operation = "DeleteData",
+                    Success = false,
+                    ErrorCode = "TARGET_NOT_FOUND",
+                    Message = "AIDebugger data breakpoint not found",
+                    Outcome = "not_found",
+                };
+            }
+
+            BreakpointOperationResult result = ExecuteOnMainThread(() =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                var debugger = Debugger;
+                var operation = new BreakpointOperationResult { Operation = "DeleteData" };
+
+                try
+                {
+                    EnvDTE.Breakpoint breakpoint = debugger?.Breakpoints?.Item(lookup.Index);
+                    if (breakpoint == null ||
+                        !string.Equals(
+                            TryGetDataBreakpointId(breakpoint.Tag),
+                            normalizedDataBreakpointId,
+                            StringComparison.Ordinal))
+                    {
+                        throw new StaleDebugSessionException(
+                            "Breakpoint collection changed before the AIDebugger data breakpoint could be deleted.");
+                    }
+
+                    operation.BreakpointInfo = BuildBreakpointInfo(breakpoint, debugger);
+                    operation.CommandIssued = true;
+                    CommandEffectExecutor.Issue("breakpoint.delete_data", breakpoint.Delete);
+                    operation.AffectedCount = 1;
+                    operation.Success = true;
+                    operation.Outcome = "deleted";
+                    operation.Message = "AIDebugger data breakpoint deleted";
+                }
+                catch (Exception ex)
+                {
+                    RethrowRequestControlFlow(ex);
+                    operation.Success = false;
+                    operation.ErrorCode = "OUTCOME_UNKNOWN";
+                    operation.Outcome = operation.CommandIssued ? "delete_outcome_unknown" : "delete_not_started";
+                    operation.Message = ex.Message;
+                }
+
+                return operation;
+            });
+
+            if (!result.Success)
+            {
+                return result;
+            }
+
+            try
+            {
+                DataBreakpointLookupResult remaining = FindOwnedDataBreakpointSliced(
+                    normalizedDataBreakpointId,
+                    breakpointLookupBudgetMs);
+                if (remaining.MatchingCount > 0)
+                {
+                    result.Success = false;
+                    result.ErrorCode = "OUTCOME_UNKNOWN";
+                    result.Outcome = "delete_outcome_unknown";
+                    result.Message = "The AIDebugger data breakpoint still appears after deletion; do not retry blindly";
+                }
+            }
+            catch (Exception ex)
+            {
+                RethrowRequestControlFlow(ex);
+                result.Success = false;
+                result.ErrorCode = "OUTCOME_UNKNOWN";
+                result.Outcome = "delete_outcome_unknown";
+                result.Message = $"Data-breakpoint deletion could not be verified: {ex.Message}";
+            }
+
+            return result;
         }
 
         /// <summary>
@@ -758,6 +892,112 @@ namespace VSDebuggerMCP
             internal int LineNumber { get; set; }
         }
 
+        [SuppressMessage("Usage", "VSTHRD010", Justification = "Reads one breakpoint tag per bounded UI slice.")]
+        private DataBreakpointLookupResult FindOwnedDataBreakpointSliced(
+            string dataBreakpointId,
+            int budgetMs)
+        {
+            BreakpointTagSnapshot first = CaptureBreakpointTagSnapshot(budgetMs);
+            List<BreakpointTagIdentity> matches = first.Items
+                .Where(item => string.Equals(
+                    TryGetDataBreakpointId(item.Tag),
+                    dataBreakpointId,
+                    StringComparison.Ordinal))
+                .ToList();
+            if (matches.Count > 0)
+            {
+                return new DataBreakpointLookupResult
+                {
+                    Index = matches.Count == 1 ? matches[0].Index : 0,
+                    MatchingCount = matches.Count,
+                };
+            }
+
+            BreakpointTagSnapshot confirmation = CaptureBreakpointTagSnapshot(budgetMs);
+            if (!BreakpointTagSnapshotsEqual(first, confirmation))
+            {
+                throw new StaleDebugSessionException(
+                    "Breakpoint collection changed while locating the AIDebugger data breakpoint.");
+            }
+
+            return new DataBreakpointLookupResult();
+        }
+
+        [SuppressMessage("Usage", "VSTHRD010", Justification = "CaptureBreakpointTag is invoked only through ExecuteOnMainThread, one item per slice.")]
+        private BreakpointTagSnapshot CaptureBreakpointTagSnapshot(int budgetMs)
+        {
+            int normalizedBudgetMs = NormalizeCollectionBudgetMs(budgetMs);
+            BreakpointSliceHeader header = ExecuteOnMainThread(CaptureBreakpointSliceHeader);
+            var snapshot = new BreakpointTagSnapshot();
+            var stopwatch = Stopwatch.StartNew();
+            for (int index = 1; index <= header.Count; index++)
+            {
+                DebuggerRequestContext.ThrowIfCancellationOrDeadlineExceeded();
+                if (stopwatch.ElapsedMilliseconds >= normalizedBudgetMs)
+                {
+                    throw new ResourceLimitExceededException(
+                        $"Breakpoint lookup exceeded its {normalizedBudgetMs}ms budget; retry with a larger breakpoint_lookup_budget_ms.");
+                }
+                int capturedIndex = index;
+                BreakpointTagIdentity item = ExecuteOnMainThread(
+                    () => CaptureBreakpointTag(capturedIndex),
+                    DefaultMainThreadTimeoutMs);
+                if (item == null)
+                {
+                    throw new StaleDebugSessionException("Breakpoint collection changed while being enumerated.");
+                }
+                snapshot.Items.Add(item);
+            }
+            return snapshot;
+        }
+
+        private BreakpointTagIdentity CaptureBreakpointTag(int index)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            try
+            {
+                EnvDTE.Breakpoint breakpoint = Debugger?.Breakpoints?.Item(index);
+                return breakpoint == null ? null : new BreakpointTagIdentity
+                {
+                    Index = index,
+                    Tag = breakpoint.Tag,
+                };
+            }
+            catch { return null; }
+        }
+
+        private static bool BreakpointTagSnapshotsEqual(
+            BreakpointTagSnapshot left,
+            BreakpointTagSnapshot right)
+        {
+            if (left.Items.Count != right.Items.Count) return false;
+            for (int index = 0; index < left.Items.Count; index++)
+            {
+                if (!string.Equals(left.Items[index].Tag, right.Items[index].Tag, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private sealed class DataBreakpointLookupResult
+        {
+            internal int Index { get; set; }
+            internal int MatchingCount { get; set; }
+        }
+
+        private sealed class BreakpointTagSnapshot
+        {
+            internal List<BreakpointTagIdentity> Items { get; } = new List<BreakpointTagIdentity>();
+        }
+
+        private sealed class BreakpointTagIdentity
+        {
+            internal int Index { get; set; }
+            internal string Tag { get; set; }
+        }
+
         private BreakpointInfo BuildBreakpointInfo(EnvDTE.Breakpoint breakpoint, Debugger5 debugger, string requestedFilePath = null, int requestedLineNumber = 0, string requestedCondition = null)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
@@ -770,6 +1010,7 @@ namespace VSDebuggerMCP
             int effectiveRequestedLineNumber = requestedLineNumber > 0
                 ? requestedLineNumber
                 : (isFileBreakpoint ? breakpoint.FileLine : 0);
+            string breakpointTag = breakpoint.Tag;
             var breakpointInfo = new BreakpointInfo
             {
                 Name = breakpoint.Name,
@@ -784,7 +1025,8 @@ namespace VSDebuggerMCP
                 HitCountTarget = breakpoint.HitCountTarget,
                 HitCountType = GetHitCountTypeString(breakpoint),
                 BreakpointType = GetBreakpointTypeString(breakpoint.LocationType),
-                Tag = breakpoint.Tag,
+                Tag = breakpointTag,
+                DataBreakpointId = TryGetDataBreakpointId(breakpointTag),
                 RequestedFilePath = effectiveRequestedFilePath,
                 RequestedLineNumber = effectiveRequestedLineNumber,
                 RequestedCondition = requestedCondition,
@@ -985,6 +1227,73 @@ namespace VSDebuggerMCP
 
             string value = tag.Substring(AddressBreakpointTagPrefix.Length).Trim();
             return string.IsNullOrEmpty(value) ? null : value;
+        }
+
+        private bool TrySetDataBreakpointTag(EnvDTE.Breakpoint breakpoint, string dataBreakpointId)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            string normalizedDataBreakpointId;
+            if (breakpoint == null ||
+                !TryNormalizeDataBreakpointId(dataBreakpointId, out normalizedDataBreakpointId))
+            {
+                return false;
+            }
+
+            string expectedTag = DataBreakpointTagPrefix + normalizedDataBreakpointId;
+            try
+            {
+                CommandEffectExecutor.Issue(
+                    "breakpoint.assign_data_tag",
+                    () =>
+                    {
+                        ThreadHelper.ThrowIfNotOnUIThread();
+                        breakpoint.Tag = expectedTag;
+                    });
+                return string.Equals(breakpoint.Tag, expectedTag, StringComparison.Ordinal);
+            }
+            catch (Exception ex)
+            {
+                RethrowRequestControlFlow(ex);
+                _log($"TrySetDataBreakpointTag failed: {ex.GetType().Name}");
+                return false;
+            }
+        }
+
+        private static bool TryNormalizeDataBreakpointId(string value, out string normalizedDataBreakpointId)
+        {
+            normalizedDataBreakpointId = null;
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+
+            Guid parsedDataBreakpointId;
+            if (!Guid.TryParseExact(value.Trim(), "N", out parsedDataBreakpointId))
+            {
+                return false;
+            }
+
+            normalizedDataBreakpointId = parsedDataBreakpointId.ToString("N");
+            return true;
+        }
+
+        private string TryGetDataBreakpointId(string tag)
+        {
+            if (string.IsNullOrWhiteSpace(tag) ||
+                !tag.StartsWith(DataBreakpointTagPrefix, StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            string value = tag.Substring(DataBreakpointTagPrefix.Length).Trim();
+            string normalizedDataBreakpointId;
+            if (!TryNormalizeDataBreakpointId(value, out normalizedDataBreakpointId) ||
+                !string.Equals(value, normalizedDataBreakpointId, StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            return normalizedDataBreakpointId;
         }
 
         private BreakpointChildrenSnapshot GetBreakpointChildrenSnapshot(EnvDTE.Breakpoint breakpoint)

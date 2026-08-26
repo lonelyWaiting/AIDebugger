@@ -79,6 +79,7 @@ VS_ONLY_BACKEND_METHODS = frozenset({
     "get_breakpoint_bindings",
     "get_debug_processes",
     "get_dispatcher_health",
+    "get_dump_memory_ranges",
     "get_module_layout",
     "get_request_status",
     "cancel_request",
@@ -86,6 +87,7 @@ VS_ONLY_BACKEND_METHODS = frozenset({
     "inspect_managed_method_il",
     "inspect_managed_type",
     "resolve_address",
+    "delete_data_breakpoint",
     "set_address_breakpoint",
     "set_data_breakpoint",
     "set_watchpoint",
@@ -315,6 +317,7 @@ TOOLS: Dict[str, ToolSpec] = {
     "set_address_breakpoint": _spec("set_address_breakpoint", "breakpoint", "set_address_breakpoint"),
     "set_watchpoint": _spec("set_watchpoint", "breakpoint", "set_data_breakpoint", alias_for="set_data_breakpoint"),
     "delete_breakpoint": _spec("delete_breakpoint", "breakpoint", "delete_breakpoint"),
+    "delete_data_breakpoint": _spec("delete_data_breakpoint", "breakpoint", "delete_data_breakpoint"),
     "clear_breakpoint": _spec("clear_breakpoint", "breakpoint", "delete_breakpoint", alias_for="delete_breakpoint"),
     "delete_all_breakpoints": _spec("delete_all_breakpoints", "breakpoint", "delete_all_breakpoints"),
     "enable_breakpoint": _spec("enable_breakpoint", "breakpoint", "enable_breakpoint"),
@@ -325,6 +328,7 @@ TOOLS: Dict[str, ToolSpec] = {
 
     # Memory / disassembly / registers / watches
     "read_memory": _spec("read_memory", "memory", "read_memory", timeout_class="memory"),
+    "get_dump_memory_ranges": _spec("get_dump_memory_ranges", "memory", "get_dump_memory_ranges", timeout_class="memory"),
     "get_disassembly": _spec("get_disassembly", "memory", "get_disassembly", timeout_class="disassembly"),
     "get_disassembly_at": _spec("get_disassembly_at", "memory", "get_disassembly_at", timeout_class="disassembly"),
     "get_registers": _spec("get_registers", "memory", "get_registers"),

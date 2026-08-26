@@ -729,28 +729,28 @@ namespace VSDebuggerMCP.Tests
         }
 
         [TestMethod]
-        public void AnyAuthenticatedLaneCanRecoverButCannotChangeAnExistingCommand()
+        public void CommandRecoveryUsesOneServerGlobalRequestIdNamespace()
         {
             var store = new CommandResultStore(
                 8,
                 TimeSpan.FromMinutes(10));
             Assert.AreEqual(
                 CommandReservationStatus.ReservedByCaller,
-                store.ReserveOrLookup("old", "request", "fingerprint", out _, out CommandReservationLease lease));
+                store.ReserveOrLookup("request", "fingerprint", out _, out CommandReservationLease lease));
 
             Assert.AreEqual(
                 CommandReservationStatus.InProgress,
-                store.ReserveOrLookup("new", "request", "fingerprint", out _, out _));
+                store.ReserveOrLookup("request", "fingerprint", out _, out _));
             Assert.AreEqual(
                 CommandReservationStatus.Conflict,
-                store.ReserveOrLookup("new", "request", "changed", out _, out _));
+                store.ReserveOrLookup("request", "changed", out _, out _));
 
             store.Complete(lease, "definitive");
             Assert.AreEqual(
                 CommandReservationStatus.Cached,
-                store.ReserveOrLookup("new", "request", "fingerprint", out string cached, out _));
+                store.ReserveOrLookup("request", "fingerprint", out string cached, out _));
             Assert.AreEqual("definitive", cached);
-            Assert.IsTrue(store.TryGetById("new", "request", out string queried, out _, out bool evicted));
+            Assert.IsTrue(store.TryGetById("request", out string queried, out _, out bool evicted));
             Assert.AreEqual("definitive", queried);
             Assert.IsFalse(evicted);
         }
@@ -774,25 +774,6 @@ namespace VSDebuggerMCP.Tests
         }
 
         [TestMethod]
-        public void CommandResultStoreUsesOneServerGlobalRequestIdNamespace()
-        {
-            var store = new CommandResultStore(
-                responseCapacity: 2,
-                responseTtl: TimeSpan.FromMinutes(1),
-                tombstoneCapacity: 2);
-            Assert.AreEqual(CommandReservationStatus.ReservedByCaller,
-                store.ReserveOrLookup("100:111", "shared", "a", out _, out CommandReservationLease shared));
-            Assert.AreEqual(CommandReservationStatus.InProgress,
-                store.ReserveOrLookup("200:222", "shared", "a", out _, out _));
-            Assert.AreEqual(CommandReservationStatus.Conflict,
-                store.ReserveOrLookup("200:222", "shared", "changed", out _, out _));
-            store.Complete(shared, "a");
-            Assert.AreEqual(CommandReservationStatus.Cached,
-                store.ReserveOrLookup("200:222", "shared", "a", out string cached, out _));
-            Assert.AreEqual("a", cached);
-        }
-
-        [TestMethod]
         public void CommandResultStoreRejectsNewCommandsAtTombstoneCapacity()
         {
             DateTime now = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
@@ -803,18 +784,18 @@ namespace VSDebuggerMCP.Tests
                 tombstoneCapacity: 2);
 
             Assert.AreEqual(CommandReservationStatus.ReservedByCaller,
-                store.ReserveOrLookup("future-lane", "future", "f", out _, out CommandReservationLease future));
+                store.ReserveOrLookup("future", "f", out _, out CommandReservationLease future));
             store.Complete(future, "future-result");
             now = now.AddSeconds(1);
             Assert.AreEqual(CommandReservationStatus.ReservedByCaller,
-                store.ReserveOrLookup("normal-lane", "normal", "n", out _, out CommandReservationLease normal));
+                store.ReserveOrLookup("normal", "n", out _, out CommandReservationLease normal));
             store.Complete(normal, "normal-result");
 
             now = now.AddSeconds(1);
             Assert.AreEqual(CommandReservationStatus.CapacityExceeded,
-                store.ReserveOrLookup("normal-lane", "next", "n2", out _, out _));
-            Assert.IsTrue(store.TryGetById("future-lane", "future", out _, out _, out _));
-            Assert.IsTrue(store.TryGetById("normal-lane", "normal", out _, out _, out _));
+                store.ReserveOrLookup("next", "n2", out _, out _));
+            Assert.IsTrue(store.TryGetById("future", out _, out _, out _));
+            Assert.IsTrue(store.TryGetById("normal", out _, out _, out _));
         }
 
         [TestMethod]
@@ -846,6 +827,26 @@ namespace VSDebuggerMCP.Tests
             Assert.AreEqual(CommandReservationStatus.InProgress,
                 store.ReserveOrLookup("pending", "pending", out _, out _));
             store.ReleaseReservation(pending);
+        }
+
+        [TestMethod]
+        public void CommandResultStoreStatusLookupDoesNotOutliveTheDedupeWindow()
+        {
+            DateTime now = new DateTime(2026, 7, 22, 0, 0, 0, DateTimeKind.Utc);
+            var store = new CommandResultStore(
+                responseCapacity: 1,
+                responseTtl: TimeSpan.FromMinutes(1),
+                utcNow: () => now,
+                tombstoneCapacity: 2,
+                tombstoneTtl: TimeSpan.FromMinutes(2));
+            Assert.AreEqual(CommandReservationStatus.ReservedByCaller,
+                store.ReserveOrLookup("expired", "fingerprint", out _, out CommandReservationLease lease));
+            store.Complete(lease, "response");
+
+            now = now.AddMinutes(3);
+            Assert.IsFalse(store.TryGetById("expired", out _, out _, out _));
+            Assert.AreEqual(CommandReservationStatus.ReservedByCaller,
+                store.ReserveOrLookup("expired", "replacement", out _, out _));
         }
 
         [TestMethod]
@@ -886,7 +887,7 @@ namespace VSDebuggerMCP.Tests
                 ttl: TimeSpan.FromMinutes(5),
                 utcNow: () => now);
 
-            store.Complete("one", "client-a", "result-one");
+            store.Complete("one", "result-one");
             Assert.IsTrue(store.TryGet("one", out string response, out DateTime completed));
             Assert.AreEqual("result-one", response);
             Assert.AreEqual(now, completed);
@@ -896,8 +897,8 @@ namespace VSDebuggerMCP.Tests
             Assert.AreEqual(10L, initial.RetainedBytes);
 
             now = now.AddMinutes(1);
-            store.Complete("two", "client-a", "result-two");
-            store.Complete("three", "client-a", "result-three");
+            store.Complete("two", "result-two");
+            store.Complete("three", "result-three");
             Assert.IsFalse(store.TryGet("one", out _, out _));
             Assert.IsTrue(store.TryGet("two", out _, out _));
             Assert.IsTrue(store.TryGet("three", out _, out _));
@@ -906,7 +907,7 @@ namespace VSDebuggerMCP.Tests
             Assert.IsFalse(store.TryGet("two", out _, out _));
             Assert.IsFalse(store.TryGet("three", out _, out _));
 
-            store.Complete("oversized", "client-a", new string('x', 65));
+            store.Complete("oversized", new string('x', 65));
             Assert.IsFalse(store.TryGet("oversized", out _, out _));
         }
 
@@ -921,17 +922,17 @@ namespace VSDebuggerMCP.Tests
                 tombstoneCapacity: 2);
 
             Assert.AreEqual(CommandReservationStatus.ReservedByCaller,
-                store.ReserveOrLookup("late-lane", "old", "old-fingerprint", out _, out CommandReservationLease late));
+                store.ReserveOrLookup("old", "old-fingerprint", out _, out CommandReservationLease late));
             Assert.AreEqual(CommandReservationStatus.ReservedByCaller,
-                store.ReserveOrLookup("other-lane", "other", "other-fingerprint", out _, out CommandReservationLease other));
+                store.ReserveOrLookup("other", "other-fingerprint", out _, out CommandReservationLease other));
             store.Complete(other, "other-result");
             now = now.AddMinutes(1);
             store.Complete(late, "late-result");
 
             Assert.AreEqual(CommandReservationStatus.CapacityExceeded,
-                store.ReserveOrLookup("third-lane", "third", "third-fingerprint", out _, out _));
-            Assert.IsTrue(store.TryGetById("other-lane", "other", out _, out _, out _));
-            Assert.IsTrue(store.TryGetById("late-lane", "old", out string response, out _, out _));
+                store.ReserveOrLookup("third", "third-fingerprint", out _, out _));
+            Assert.IsTrue(store.TryGetById("other", out _, out _, out _));
+            Assert.IsTrue(store.TryGetById("old", out string response, out _, out _));
             Assert.AreEqual("late-result", response);
         }
 

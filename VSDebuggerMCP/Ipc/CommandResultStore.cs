@@ -23,10 +23,11 @@ namespace VSDebuggerMCP.Ipc
     }
 
     /// <summary>
-    /// Keeps server-instance-lifetime at-most-once tombstones keyed by request id.
-    /// Response bodies are bounded and may be evicted, but tombstones are never
-    /// evicted: once the ledger is full, new commands are rejected until the
-    /// server restarts rather than risking a duplicate side effect.
+    /// Keeps server-instance-scoped at-most-once tombstones keyed by request id.
+    /// Response bodies are bounded and may be evicted independently. Completed
+    /// tombstones are retained for the configured command-acceptance window;
+    /// while that window is active, capacity exhaustion rejects new commands
+    /// rather than risking a duplicate side effect.
     /// </summary>
     internal sealed class CommandResultStore
     {
@@ -72,17 +73,6 @@ namespace VSDebuggerMCP.Ipc
             out string response,
             out CommandReservationLease lease)
         {
-            return ReserveOrLookup("test-client", requestId, fingerprint, out response, out lease);
-        }
-
-        internal CommandReservationStatus ReserveOrLookup(
-            string clientLane,
-            string requestId,
-            string fingerprint,
-            out string response,
-            out CommandReservationLease lease)
-        {
-            if (string.IsNullOrWhiteSpace(clientLane)) throw new ArgumentException("Client lane is required", nameof(clientLane));
             lock (_sync)
             {
                 PruneResponsesLocked();
@@ -114,7 +104,6 @@ namespace VSDebuggerMCP.Ipc
                 object token = new object();
                 _entries.Add(requestId, new Entry
                 {
-                    ClientLane = clientLane,
                     RequestId = requestId,
                     Fingerprint = fingerprint,
                     CreatedUtc = _utcNow(),
@@ -182,19 +171,10 @@ namespace VSDebuggerMCP.Ipc
             out DateTime completedUtc,
             out bool resultEvicted)
         {
-            return TryGetById("test-client", requestId, out response, out completedUtc, out resultEvicted);
-        }
-
-        internal bool TryGetById(
-            string clientLane,
-            string requestId,
-            out string response,
-            out DateTime completedUtc,
-            out bool resultEvicted)
-        {
             lock (_sync)
             {
                 PruneResponsesLocked();
+                PruneTombstonesLocked();
                 _entries.TryGetValue(requestId, out Entry entry);
                 if (entry != null && entry.CompletedUtc != default(DateTime))
                 {
@@ -278,7 +258,6 @@ namespace VSDebuggerMCP.Ipc
 
         private sealed class Entry
         {
-            internal string ClientLane { get; set; }
             internal string RequestId { get; set; }
             internal string Fingerprint { get; set; }
             internal DateTime CreatedUtc { get; set; }

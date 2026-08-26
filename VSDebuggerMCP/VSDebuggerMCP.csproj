@@ -79,6 +79,8 @@
     <Compile Include="Services\VariableCaptureBudget.cs" />
     <Compile Include="Services\ThreadCaptureBudget.cs" />
     <Compile Include="Services\TargetArchitecture.cs" />
+    <Compile Include="Services\MinidumpMemoryReader.cs" />
+    <Compile Include="Services\MappedDumpSearchContinuation.cs" />
     <Compile Include="Services\RegisterCapturePolicy.cs" />
     <Compile Include="Services\SnapshotCompletenessPolicy.cs" />
     <Compile Include="Services\ModuleCaptureBudget.cs" />

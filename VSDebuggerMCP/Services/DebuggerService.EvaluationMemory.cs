@@ -21,6 +21,8 @@ namespace VSDebuggerMCP
 {
     public partial class DebuggerService
     {
+        private const int ExpressionFallbackMaxBytes = 256;
+
         #region Expression Evaluation
 
         [SuppressMessage("Usage", "VSTHRD010", Justification = "Expression roots and children are captured through bounded UI slices.")]
@@ -647,38 +649,12 @@ namespace VSDebuggerMCP
                 unavailable.Error = "Address must be a hexadecimal or decimal literal";
                 return unavailable;
             }
-            MemoryReadHeader header = ExecuteOnMainThread(() =>
+            if ((ulong)(requestedSize - 1) > ulong.MaxValue - baseAddress)
             {
-                ThreadHelper.ThrowIfNotOnUIThread();
-                var debugger = Debugger;
-                if (debugger == null || debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
-                {
-                    return null;
-                }
-                string dumpPathCandidate = GetActiveDumpFilePathCandidate();
-                int processId = debugger.CurrentProcess?.ProcessID ?? 0;
-                IntPtr processHandle = IsDumpFilePath(dumpPathCandidate) || processId <= 0
-                    ? IntPtr.Zero
-                    : OpenTrustedLiveProcessHandle(
-                        processId,
-                        PROCESS_VM_READ | PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION
-                    );
-                return new MemoryReadHeader
-                {
-                    ProcessId = processId,
-                    SnapshotToken = CreateDebuggerSnapshotToken(debugger),
-                    DumpPathCandidate = dumpPathCandidate,
-                    // Bind the OS process object while the DTE context is still pinned.
-                    // Keeping this handle open prevents PID reuse from redirecting the
-                    // subsequent background read to an unrelated process.
-                    ProcessHandle = processHandle,
-                    Capability = IsDumpFilePath(dumpPathCandidate)
-                        ? "debugger_engine_dump_read"
-                        : (processHandle != IntPtr.Zero
-                            ? "trusted_live_process_read"
-                            : "debugger_expression_fallback_untrusted_session"),
-                };
-            });
+                unavailable.Error = "Memory range overflows address space";
+                return unavailable;
+            }
+            MemoryReadHeader header = CaptureMemoryReadHeader();
             if (header == null)
             {
                 unavailable.Error = "Not in break mode";
@@ -688,62 +664,41 @@ namespace VSDebuggerMCP
             // A dump's recorded PID can already belong to an unrelated live process. Never
             // use ReadProcessMemory for a confirmed dump session; only the debugger engine
             // can authoritatively serve that snapshot's address space.
-            bool isDumpSession = !string.IsNullOrEmpty(NormalizeExistingDumpPath(header.DumpPathCandidate));
+            string dumpPath = NormalizeExistingDumpPath(header.DumpPathCandidate);
+            bool isDumpSession = !string.IsNullOrEmpty(dumpPath);
             byte[] memory = null;
             bool trustedLiveReadAttempted = header.ProcessHandle != IntPtr.Zero;
-            bool trustedLiveReadSucceeded = false;
             try
             {
-                if (!isDumpSession && header.ProcessHandle != IntPtr.Zero &&
-                    IsMemorySnapshotCurrent(header))
+                if (isDumpSession)
                 {
+                    memory = ReadRawMinidumpMemory(dumpPath, baseAddress, requestedSize);
+                    if (memory != null && memory.Length > 0)
+                    {
+                        header.Capability = "raw_minidump_memory_read";
+                    }
+                }
+                else if (header.ProcessHandle != IntPtr.Zero)
+                {
+                    // The handle was opened while the DTE current-process identity was
+                    // pinned.  A single post-read snapshot check is enough to reject a
+                    // context change and avoids an extra UI round trip per read.
                     memory = ReadProcessMemoryContiguous(header.ProcessHandle, baseAddress, requestedSize);
-                    trustedLiveReadSucceeded = memory != null && memory.Length > 0;
                 }
             }
             finally
             {
-                if (header.ProcessHandle != IntPtr.Zero)
-                {
-                    CloseHandle(header.ProcessHandle);
-                    header.ProcessHandle = IntPtr.Zero;
-                }
-            }
-            if (memory != null && memory.Length > 0 && !IsMemorySnapshotCurrent(header))
-            {
-                memory = null;
-                trustedLiveReadSucceeded = false;
+                CloseMemoryReadHandle(header);
             }
             if (memory == null || memory.Length == 0)
             {
-                var bytes = new List<byte>(requestedSize);
-                const int expressionFallbackMaxBytes = 256;
-                const int expressionFallbackBudgetMs = 250;
-                var fallbackBudget = Stopwatch.StartNew();
-                int boundedFallbackBytes = Math.Min(requestedSize, expressionFallbackMaxBytes);
-                for (int offset = 0; offset < boundedFallbackBytes; offset += 4)
-                {
-                    DebuggerRequestContext.ThrowIfCancellationOrDeadlineExceeded();
-                    if (fallbackBudget.ElapsedMilliseconds >= expressionFallbackBudgetMs) break;
-                    int capturedOffset = offset;
-                    byte[] word = ExecuteOnMainThread(
-                        () => ReadMemoryWord(Debugger, baseAddress + (ulong)capturedOffset, boundedFallbackBytes - capturedOffset),
-                        35);
-                    if (word == null || word.Length == 0) break;
-                    bytes.AddRange(word);
-                }
-                memory = bytes.ToArray();
+                memory = ReadMemoryExpressionPrefix(baseAddress, requestedSize);
                 header.Capability = isDumpSession
-                    ? "debugger_engine_dump_read"
+                    ? "debugger_expression_dump_fallback"
                     : (trustedLiveReadAttempted
                         ? "debugger_expression_fallback_after_live_read_failure"
                         : "debugger_expression_fallback_untrusted_session");
             }
-            else if (trustedLiveReadSucceeded)
-            {
-                header.Capability = "trusted_live_process_read";
-            }
-
             string tokenAfter = ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
@@ -757,7 +712,7 @@ namespace VSDebuggerMCP
                 memory);
             result.Capability = header.Capability;
             if (result.Partial && memory != null && memory.Length > 0 &&
-                header.Capability.StartsWith("debugger_expression_fallback", StringComparison.Ordinal))
+                IsExpressionMemoryFallbackCapability(header.Capability))
             {
                 result.HasMore = true;
                 result.RemainingBytes = requestedSize - memory.Length;
@@ -774,6 +729,476 @@ namespace VSDebuggerMCP
                 unstable.Error = "Debugger context changed while memory was captured; captured bytes were discarded";
                 return unstable;
             }
+            return result;
+        }
+
+        private static bool IsExpressionMemoryFallbackCapability(string capability)
+        {
+            return !string.IsNullOrEmpty(capability) &&
+                (capability.StartsWith("debugger_expression_fallback", StringComparison.Ordinal) ||
+                 string.Equals(capability, "debugger_expression_dump_fallback", StringComparison.Ordinal));
+        }
+
+        /// <summary>
+        /// Captures one paused debugger identity and, when this is a known live
+        /// session, pins its verified OS process handle.  A confirmed dump never
+        /// receives a live handle: its recorded PID can have been reused by an
+        /// unrelated process.
+        /// </summary>
+        private MemoryReadHeader CaptureMemoryReadHeader(bool includeTrustedLiveHandle = true)
+        {
+            return ExecuteOnMainThread(() =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                var debugger = Debugger;
+                if (debugger == null || debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+                {
+                    return null;
+                }
+
+                string dumpPathCandidate = GetActiveDumpFilePathCandidate();
+                int processId = debugger.CurrentProcess?.ProcessID ?? 0;
+                bool isDumpCandidate = IsDumpFilePath(dumpPathCandidate);
+                bool isTrustedLiveProcess = false;
+                bool isVerifiedCurrentLiveProcess = false;
+                IntPtr processHandle = IntPtr.Zero;
+                try
+                {
+                    if (includeTrustedLiveHandle && !isDumpCandidate && processId > 0)
+                    {
+                        processHandle = OpenTrustedLiveProcessHandle(
+                            processId,
+                            PROCESS_VM_READ | PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION);
+                        isTrustedLiveProcess = processHandle != IntPtr.Zero;
+                        if (!isTrustedLiveProcess)
+                        {
+                            processHandle = OpenVerifiedCurrentLiveProcessHandle(
+                                debugger,
+                                processId,
+                                PROCESS_VM_READ | PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION);
+                            isVerifiedCurrentLiveProcess = processHandle != IntPtr.Zero;
+                        }
+                    }
+                    return new MemoryReadHeader
+                    {
+                        ProcessId = processId,
+                        SnapshotToken = CreateDebuggerSnapshotToken(debugger),
+                        DumpPathCandidate = dumpPathCandidate,
+                        // The OS handle, if present, pins PID identity while the
+                        // background read runs and prevents PID reuse from changing the
+                        // target between capture and ReadProcessMemory.
+                        ProcessHandle = processHandle,
+                        Capability = isDumpCandidate
+                            ? "debugger_engine_dump_read"
+                            : (isTrustedLiveProcess
+                                ? "trusted_live_process_read"
+                                : (isVerifiedCurrentLiveProcess
+                                    ? "verified_live_process_read"
+                                    : "debugger_expression_fallback_untrusted_session")),
+                    };
+                }
+                catch
+                {
+                    if (processHandle != IntPtr.Zero)
+                    {
+                        CloseHandle(processHandle);
+                    }
+                    throw;
+                }
+            });
+        }
+
+        /// <summary>
+        /// Establishes an ephemeral direct-read handle for a manually started
+        /// local debug session. PID equality alone is unsafe because a dump can
+        /// preserve a PID that a later process has reused. The DTE current process
+        /// must be the same COM identity as a local-process entry before and
+        /// after the OS handle is opened. The second check closes the PID-reuse
+        /// window before that handle is recorded as trusted. Failure falls back
+        /// safely to the debugger engine.
+        /// </summary>
+        private IntPtr OpenVerifiedCurrentLiveProcessHandle(
+            Debugger5 debugger,
+            int processId,
+            uint desiredAccess)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (debugger == null || processId <= 0)
+            {
+                return IntPtr.Zero;
+            }
+
+            IntPtr handle = IntPtr.Zero;
+            try
+            {
+                EnvDTE.Process current = debugger.CurrentProcess;
+                if (!IsCurrentLocalProcessIdentity(debugger, current, processId))
+                {
+                    return IntPtr.Zero;
+                }
+
+                handle = OpenProcess(desiredAccess, false, processId);
+                if (handle == IntPtr.Zero)
+                {
+                    return IntPtr.Zero;
+                }
+                if (!TryGetProcessStartTimeUtcTicks(handle, out long startTimeUtcTicks) ||
+                    startTimeUtcTicks <= 0 ||
+                    !IsCurrentLocalProcessIdentity(debugger, current, processId))
+                {
+                    return IntPtr.Zero;
+                }
+
+                // The handle now pins the verified process object while the direct
+                // memory read runs, and its creation time protects later reuse.
+                BindTrustedLiveProcessIdentity(
+                    processId,
+                    startTimeUtcTicks,
+                    _sessionTracker.Generation);
+                IntPtr verifiedHandle = handle;
+                handle = IntPtr.Zero;
+                return verifiedHandle;
+            }
+            catch (Exception ex)
+            {
+                RethrowRequestControlFlow(ex);
+                // VS transports can expose non-local or transient process entries.
+                // Never let an identity probe turn a read-only request into a failure.
+            }
+            finally
+            {
+                if (handle != IntPtr.Zero)
+                {
+                    CloseHandle(handle);
+                }
+            }
+
+            return IntPtr.Zero;
+        }
+
+        private bool IsCurrentLocalProcessIdentity(
+            Debugger5 debugger,
+            EnvDTE.Process expectedCurrent,
+            int processId)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (debugger == null || expectedCurrent == null || processId <= 0 ||
+                debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+            {
+                return false;
+            }
+
+            EnvDTE.Process current = debugger.CurrentProcess;
+            if (current == null || current.ProcessID != processId ||
+                !HasSameComIdentity(expectedCurrent, current))
+            {
+                return false;
+            }
+
+            const int MaxLocalProcessIdentityProbeCount = 256;
+            int count = debugger.LocalProcesses?.Count ?? 0;
+            if (count <= 0 || count > MaxLocalProcessIdentityProbeCount)
+            {
+                return false;
+            }
+
+            for (int index = 1; index <= count; index++)
+            {
+                if ((index & 0x1F) == 0)
+                {
+                    DebuggerRequestContext.ThrowIfCancellationOrDeadlineExceeded();
+                }
+
+                EnvDTE.Process candidate = debugger.LocalProcesses?.Item(index);
+                if (candidate != null && candidate.ProcessID == processId &&
+                    HasSameComIdentity(expectedCurrent, candidate))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool HasSameComIdentity(object left, object right)
+        {
+            if (left == null || right == null)
+            {
+                return false;
+            }
+
+            IntPtr leftUnknown = IntPtr.Zero;
+            IntPtr rightUnknown = IntPtr.Zero;
+            try
+            {
+                leftUnknown = Marshal.GetIUnknownForObject(left);
+                rightUnknown = Marshal.GetIUnknownForObject(right);
+                return leftUnknown != IntPtr.Zero && leftUnknown == rightUnknown;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                if (leftUnknown != IntPtr.Zero)
+                {
+                    Marshal.Release(leftUnknown);
+                }
+                if (rightUnknown != IntPtr.Zero)
+                {
+                    Marshal.Release(rightUnknown);
+                }
+            }
+        }
+
+        private static void CloseMemoryReadHandle(MemoryReadHeader header)
+        {
+            if (header == null || header.ProcessHandle == IntPtr.Zero)
+            {
+                return;
+            }
+
+            CloseHandle(header.ProcessHandle);
+            header.ProcessHandle = IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// The debugger-engine fallback is intentionally bounded, but it must not
+        /// schedule one UI request per four-byte word.  The old 35ms dispatch
+        /// slices routinely expired before VS could dequeue them in manually
+        /// started live sessions.  Read a small prefix in grouped UI slices instead.
+        /// </summary>
+        [SuppressMessage("Usage", "VSTHRD010", Justification = "Each debugger-expression group is invoked only inside ExecuteOnMainThread; the byte aggregation runs off-thread.")]
+        private byte[] ReadMemoryExpressionPrefix(ulong baseAddress, int requestedSize)
+        {
+            const int ExpressionWordsPerUiSlice = 8;
+            const int ExpressionFallbackBudgetMs = 1500;
+
+            int boundedBytes = Math.Min(Math.Max(0, requestedSize), ExpressionFallbackMaxBytes);
+            if (boundedBytes == 0)
+            {
+                return Array.Empty<byte>();
+            }
+
+            var bytes = new List<byte>(boundedBytes);
+            var budget = Stopwatch.StartNew();
+            while (bytes.Count < boundedBytes && budget.ElapsedMilliseconds < ExpressionFallbackBudgetMs)
+            {
+                DebuggerRequestContext.ThrowIfCancellationOrDeadlineExceeded();
+                ulong sliceAddress = baseAddress + (ulong)bytes.Count;
+                int sliceRemaining = boundedBytes - bytes.Count;
+                byte[] slice = ExecuteOnMainThread(
+                    () => ReadMemoryWords(
+                        Debugger,
+                        sliceAddress,
+                        sliceRemaining,
+                        ExpressionWordsPerUiSlice),
+                    ExpressionEvaluationTimeoutMs);
+                if (slice == null || slice.Length == 0)
+                {
+                    break;
+                }
+
+                bytes.AddRange(slice);
+                if (slice.Length < Math.Min(sliceRemaining, ExpressionWordsPerUiSlice * sizeof(uint)))
+                {
+                    break;
+                }
+            }
+
+            return bytes.ToArray();
+        }
+
+        private byte[] ReadMemoryWords(
+            Debugger5 debugger,
+            ulong address,
+            int remaining,
+            int maxWords)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (debugger == null || debugger.CurrentMode != dbgDebugMode.dbgBreakMode ||
+                remaining <= 0 || maxWords <= 0)
+            {
+                return Array.Empty<byte>();
+            }
+
+            var bytes = new List<byte>(Math.Min(remaining, maxWords * sizeof(uint)));
+            for (int wordIndex = 0; wordIndex < maxWords && bytes.Count < remaining; wordIndex++)
+            {
+                DebuggerRequestContext.ThrowIfCancellationOrDeadlineExceeded();
+                byte[] word = ReadMemoryWord(
+                    debugger,
+                    address + (ulong)bytes.Count,
+                    remaining - bytes.Count);
+                if (word == null || word.Length == 0)
+                {
+                    break;
+                }
+
+                bytes.AddRange(word);
+                if (word.Length < sizeof(uint))
+                {
+                    break;
+                }
+            }
+            return bytes.ToArray();
+        }
+
+        private byte[] ReadRawMinidumpMemory(string dumpPath, ulong address, int requestedSize)
+        {
+            if (string.IsNullOrEmpty(dumpPath) || requestedSize <= 0)
+            {
+                return null;
+            }
+
+            try
+            {
+                using (var reader = MinidumpMemoryReader.Open(dumpPath))
+                {
+                    return reader.Read(address, requestedSize);
+                }
+            }
+            catch (Exception ex)
+            {
+                RethrowRequestControlFlow(ex);
+                _log($"ReadRawMinidumpMemory failed: {ex.GetType().Name}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Enumerate the virtual-address ranges physically present in the dump
+        /// selected by the active Visual Studio session.  This is metadata-only:
+        /// it never scans the dump payload or opens an arbitrary caller path.
+        /// </summary>
+        public DumpMemoryRangesResult GetDumpMemoryRanges(
+            int startIndex = 0,
+            int maxNodes = -1,
+            int budgetMs = -1)
+        {
+            if (startIndex < 0)
+            {
+                throw new DebuggerParameterValidationException(
+                    "startIndex must be non-negative.");
+            }
+
+            int normalizedMaxNodes = NormalizeCollectionNodeLimit(maxNodes);
+            int normalizedBudgetMs = NormalizeCollectionBudgetMs(budgetMs);
+            var result = new DumpMemoryRangesResult
+            {
+                Capability = "raw_minidump_memory_map_unavailable",
+                StartIndex = startIndex,
+                MaxNodes = normalizedMaxNodes,
+                BudgetMs = normalizedBudgetMs,
+                SnapshotStatus = "unavailable",
+            };
+
+            MemoryReadHeader header = ExecuteOnMainThread(() =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                var debugger = Debugger;
+                if (debugger == null || debugger.CurrentMode != dbgDebugMode.dbgBreakMode)
+                {
+                    return null;
+                }
+
+                string dumpPathCandidate = GetActiveDumpFilePathCandidate();
+                return new MemoryReadHeader
+                {
+                    SnapshotToken = CreateDebuggerSnapshotToken(debugger),
+                    DumpPathCandidate = dumpPathCandidate,
+                };
+            });
+            if (header == null)
+            {
+                result.Error = "Not in break mode";
+                return result;
+            }
+
+            string dumpPath = NormalizeExistingDumpPath(header.DumpPathCandidate);
+            if (string.IsNullOrEmpty(dumpPath))
+            {
+                result.Error = "The active Visual Studio session is not an opened dump";
+                return result;
+            }
+
+            result.DumpPath = dumpPath;
+            try
+            {
+                using (var reader = MinidumpMemoryReader.Open(dumpPath))
+                {
+                    result.Capability = "raw_minidump_memory_map";
+                    result.Source = reader.Source;
+                    result.RangeCount = reader.Ranges.Count;
+                    result.TotalMappedBytes = checked((long)reader.TotalMappedBytes);
+                    int begin = Math.Min(startIndex, reader.Ranges.Count);
+                    result.StartIndex = begin;
+                    var stopwatch = Stopwatch.StartNew();
+                    for (int index = begin; index < reader.Ranges.Count; index++)
+                    {
+                        DebuggerRequestContext.ThrowIfCancellationOrDeadlineExceeded();
+                        if (stopwatch.ElapsedMilliseconds >= normalizedBudgetMs)
+                        {
+                            result.HasMore = true;
+                            result.Partial = true;
+                            result.NextIndex = index;
+                            result.Error = $"Dump memory-range enumeration exceeded its {normalizedBudgetMs}ms budget";
+                            break;
+                        }
+                        if (result.Ranges.Count >= normalizedMaxNodes)
+                        {
+                            result.HasMore = true;
+                            result.Partial = true;
+                            result.NextIndex = index;
+                            break;
+                        }
+
+                        MinidumpMemoryRange range = reader.Ranges[index];
+                        result.Ranges.Add(new DumpMemoryRangeInfo
+                        {
+                            StartAddress = FormatAddress(range.StartAddress),
+                            EndAddressExclusive = FormatAddress(range.EndAddress),
+                            SizeBytes = checked((long)range.Size),
+                        });
+                    }
+
+                    if (!result.HasMore)
+                    {
+                        result.Status = "ok";
+                        result.SnapshotStatus = "best_effort";
+                    }
+                    else
+                    {
+                        result.Status = "partial";
+                        result.SnapshotStatus = "best_effort";
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                RethrowRequestControlFlow(ex);
+                result.Status = "unavailable";
+                result.Partial = true;
+                result.Error = $"Could not parse active minidump memory ranges: {ex.Message}";
+                _log($"GetDumpMemoryRanges failed: {ex.GetType().Name}");
+                return result;
+            }
+
+            if (!IsMemorySnapshotCurrent(header))
+            {
+                result.Status = "unstable";
+                result.Partial = true;
+                result.HasMore = false;
+                result.NextIndex = null;
+                result.Ranges.Clear();
+                result.RangeCount = 0;
+                result.TotalMappedBytes = 0;
+                result.Source = null;
+                result.SnapshotStatus = "unstable";
+                result.Error = "Debugger context changed while dump memory ranges were captured; ranges were discarded";
+            }
+
             return result;
         }
 

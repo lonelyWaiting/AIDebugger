@@ -924,6 +924,150 @@ asyncio.run(check())
             with self.subTest(breakpoint_address=invalid), self.assertRaises(ToolError):
                 validate_address_breakpoint_target("address", invalid)
 
+    def test_delete_data_breakpoint_validates_identifier_before_calling_bridge(self) -> None:
+        from mcp_server import bootstrap
+
+        bootstrap.ensure_deps()
+        from mcp.server.fastmcp.exceptions import ToolError
+        from mcp_server.tool_modules import breakpoint_tools
+
+        call = mock.AsyncMock(return_value={"success": True})
+        with mock.patch.object(breakpoint_tools.ide_bridge, "call", call):
+            for value in (None, "", "x" * 33):
+                with self.subTest(data_breakpoint_id=value), self.assertRaises(ToolError):
+                    asyncio.run(breakpoint_tools.delete_data_breakpoint(value))
+
+        call.assert_not_awaited()
+
+    def test_memory_search_rejects_dump_continuation_with_start_address(self) -> None:
+        from mcp_server import bootstrap
+
+        bootstrap.ensure_deps()
+        from mcp.server.fastmcp.exceptions import ToolError
+        from mcp_server.tool_modules import memory_tools
+
+        call = mock.AsyncMock(return_value={})
+        with mock.patch.object(memory_tools.ide_bridge, "call", call):
+            with self.assertRaises(ToolError) as raised:
+                asyncio.run(memory_tools.search_memory(
+                    start_address="0x1000",
+                    pattern="AA",
+                    continuation="opaque-cursor",
+                ))
+
+        self.assertIn('"code":"INVALID_ARGUMENT"', str(raised.exception))
+        call.assert_not_awaited()
+
+    def test_memory_search_rejects_start_offset_range_that_exceeds_backend_int64(self) -> None:
+        from mcp_server import bootstrap
+
+        bootstrap.ensure_deps()
+        from mcp.server.fastmcp.exceptions import ToolError
+        from mcp_server.tool_modules import memory_tools
+
+        call = mock.AsyncMock(return_value={})
+        with mock.patch.object(memory_tools.ide_bridge, "call", call):
+            with self.assertRaises(ToolError) as raised:
+                asyncio.run(memory_tools.search_memory(
+                    start_address="0x1000",
+                    pattern="AA",
+                    start_offset=0x7FFFFFFFFFFFFFFF,
+                    search_size=2,
+                ))
+
+        self.assertIn('"code":"INVALID_ARGUMENT"', str(raised.exception))
+        call.assert_not_awaited()
+
+    def test_chunked_memory_search_does_not_synthesize_terminal_backend_cursor(self) -> None:
+        from mcp_server import bootstrap
+
+        bootstrap.ensure_deps()
+        from mcp_server.tool_context import MAX_MEMORY_SEARCH_CHUNK_SIZE
+        from mcp_server.tool_modules import memory_tools
+
+        first_page = {
+            "patternBytes": ["AA", "BB"],
+            "matches": [],
+            "bytesSearched": 0,
+            "bytesAttempted": 0,
+            "unreadableBytes": 0,
+            "unattemptedBytes": MAX_MEMORY_SEARCH_CHUNK_SIZE,
+            "status": "unavailable",
+            "partial": True,
+            "truncated": False,
+            "hasMore": False,
+            "capability": "debugger_expression_fallback_untrusted_session",
+            "error": "bounded fallback cannot search this pattern",
+        }
+        call_with_target = mock.AsyncMock(return_value=(first_page, {"pipeName": "target"}))
+        with mock.patch.object(memory_tools.ide_bridge, "call_with_target", call_with_target):
+            response = asyncio.run(memory_tools.search_memory(
+                start_address="0x1000",
+                pattern="AA",
+                search_size=MAX_MEMORY_SEARCH_CHUNK_SIZE + 1,
+            ))
+
+        result = response if isinstance(response, dict) else json.loads(response)
+        result = result.get("result", result)
+        self.assertTrue(result["partial"])
+        self.assertFalse(result["hasMore"])
+        self.assertIsNone(result["nextStartExpression"])
+        self.assertIsNone(result["nextStartOffset"])
+        self.assertEqual(1, call_with_target.await_count)
+
+    def test_chunked_memory_search_finishes_when_final_match_reaches_result_limit(self) -> None:
+        from mcp_server import bootstrap
+
+        bootstrap.ensure_deps()
+        from mcp_server.tool_context import MAX_MEMORY_SEARCH_CHUNK_SIZE
+        from mcp_server.tool_modules import memory_tools
+
+        first_page = {
+            "patternBytes": ["AA", "BB"],
+            "matches": [],
+            "bytesSearched": MAX_MEMORY_SEARCH_CHUNK_SIZE,
+            "bytesAttempted": MAX_MEMORY_SEARCH_CHUNK_SIZE,
+            "status": "ok",
+            "partial": False,
+            "truncated": False,
+            "hasMore": False,
+            "capability": "trusted_live_process_read",
+        }
+        final_page = {
+            "patternBytes": ["AA", "BB"],
+            "matches": ["0x10100000"],
+            "bytesSearched": 2,
+            "bytesAttempted": 2,
+            "status": "ok",
+            "partial": False,
+            "truncated": False,
+            "hasMore": False,
+            "capability": "trusted_live_process_read",
+        }
+        target = {"pipeName": "target"}
+        with mock.patch.object(
+            memory_tools.ide_bridge,
+            "call_with_target",
+            mock.AsyncMock(return_value=(first_page, target)),
+        ), mock.patch.object(
+            memory_tools.vs_bridge,
+            "call_pipe_exact",
+            mock.AsyncMock(return_value=final_page),
+        ):
+            response = asyncio.run(memory_tools.search_memory(
+                start_address="0x1000",
+                pattern="AA BB",
+                max_results=1,
+                search_size=MAX_MEMORY_SEARCH_CHUNK_SIZE + 1,
+            ))
+
+        result = response["result"]
+        self.assertEqual("ok", result["status"])
+        self.assertFalse(result["partial"])
+        self.assertFalse(result["hasMore"])
+        self.assertNotIn("errorCode", result)
+        self.assertEqual(["0x10100000"], result["matches"])
+
     def test_get_locals_requires_complete_frame_context(self) -> None:
         from mcp_server import bootstrap
 
@@ -1202,6 +1346,44 @@ asyncio.run(check())
         self.assertEqual(backend_offset, payload["nextStartOffset"])
         self.assertEqual(search_size - backend_offset, payload["remainingBytes"])
         self.assertTrue(payload["hasMore"])
+
+    def test_unified_memory_search_uses_vs_mapped_path_without_an_address(self) -> None:
+        from mcp_server.tool_modules import memory_tools
+        from mcp_server.tool_registry import TOOLS
+
+        backend_result = {
+            "pattern": "AA",
+            "status": "partial",
+            "matches": ["0x1000"],
+            "totalFound": 1,
+            "bytesSearched": 4096,
+            "bytesAttempted": 4096,
+            "requestedBytes": 4096,
+            "failedReads": 0,
+            "unreadableBytes": 0,
+            "unattemptedBytes": 0,
+            "partial": True,
+            "truncated": False,
+            "hasMore": True,
+            "continuation": "eyJ2ZXJzaW9uIjoxfQ",
+            "source": "memory64_list",
+        }
+        call = mock.AsyncMock(return_value=backend_result)
+        with mock.patch.object(memory_tools.ide_bridge, "call", call):
+            response = asyncio.run(memory_tools.search_memory(
+                pattern="AA",
+                search_size=4096,
+                continuation="eyJ2ZXJzaW9uIjoxfQ",
+            ))
+
+        self.assertEqual(backend_result, response["result"])
+        self.assertEqual("search_memory", call.await_args.args[0])
+        params = call.await_args.args[1]
+        self.assertNotIn("startAddress", params)
+        self.assertEqual("eyJ2ZXJzaW9uIjoxfQ", params["continuation"])
+        self.assertEqual("vs", call.await_args.kwargs["preferred_ide"])
+        self.assertIn("search_memory", TOOLS)
+        self.assertNotIn("search_dump_memory", TOOLS)
 
     def test_step_and_capture_uses_safe_bundle_unless_unsafe_fields_are_requested(self) -> None:
         from mcp_server.tool_modules import snapshot_tools

@@ -357,6 +357,7 @@ namespace VSDebuggerMCP.Ipc
                 case "moduleSnapshotId": case "scanContinuationToken": maximum = 128; break;
                 case "pane": case "patternFormat": case "evaluationPolicy": case "hitCountType": case "conditionType": maximum = 256; break;
                 case "address": case "startAddress": maximum = 1024; break;
+                case "continuation": maximum = 512; break;
                 case "pattern": case "functionName": case "methodName": case "typeName": case "typeFilter": maximum = 4096; break;
                 case "condition": case "dataExpression": maximum = 16 * 1024; break;
                 case "filePath": case "assemblyPath": case "executablePath": case "workingDirectory": maximum = 32 * 1024; break;

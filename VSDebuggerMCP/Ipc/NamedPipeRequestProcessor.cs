@@ -91,7 +91,6 @@ namespace VSDebuggerMCP
                 }
                 fingerprint = ComputeCommandFingerprint(request);
                 CommandReservationStatus reservation = _commandResults.ReserveOrLookup(
-                    clientLane,
                     request.Id,
                     fingerprint,
                     out string cachedResponse,
@@ -518,7 +517,7 @@ namespace VSDebuggerMCP
                     }
                     else if (!isCommand && response != null)
                     {
-                        _queryResults.Complete(request.Id, clientLane, response);
+                        _queryResults.Complete(request.Id, response);
                     }
                     CompleteActiveRequest(activeRequestKey, activeRequest);
                 }
@@ -863,7 +862,6 @@ namespace VSDebuggerMCP
                 {
                     _queryResults.Complete(
                         requestId,
-                        CreateClientLane(request.Meta),
                         finalResponse);
                 }
                 CompleteActiveRequest(activeRequestKey, activeRequest);
@@ -1043,7 +1041,6 @@ namespace VSDebuggerMCP
             }
 
             if (_commandResults.TryGetById(
-                clientLane,
                 requestId,
                 out string response,
                 out DateTime completedUtc,

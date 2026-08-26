@@ -309,6 +309,7 @@ class BreakpointPayload(StrictPayload):
     hitCountType: Optional[str] = None
     breakpointType: Optional[str] = None
     tag: Optional[str] = None
+    dataBreakpointId: Optional[str] = None
     requestedFilePath: Optional[str] = None
     requestedLineNumber: Optional[int] = None
     requestedCondition: Optional[str] = None
@@ -351,6 +352,30 @@ class MemorySearchChunkPayload(StrictPayload):
     nextStartAddress: Optional[str] = None
     matchCount: int
     capability: Optional[str] = None
+    error: Optional[str] = None
+
+
+class DumpMemoryRangePayload(StrictPayload):
+    startAddress: str
+    endAddressExclusive: str
+    sizeBytes: int
+
+
+class DumpMemoryRangesPayload(StrictPayload):
+    capability: str
+    status: str
+    dumpPath: Optional[str] = None
+    source: Optional[str] = None
+    rangeCount: int
+    totalMappedBytes: int
+    startIndex: int
+    maxNodes: int
+    budgetMs: int
+    ranges: List[DumpMemoryRangePayload]
+    nextIndex: Optional[int] = None
+    hasMore: bool
+    partial: bool
+    snapshotStatus: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -738,6 +763,8 @@ class MemorySearchPayload(StrictPayload):
     chunks: Optional[List[MemorySearchChunkPayload]] = None
     nextStartExpression: Optional[str] = None
     nextStartOffset: Optional[int] = None
+    source: Optional[str] = None
+    continuation: Optional[str] = None
     remainingBytes: Optional[int] = None
     error: Optional[str] = None
     errorCode: Optional[str] = None
@@ -1126,6 +1153,7 @@ _MODEL_BY_TOOL: Dict[str, Type[StrictPayload]] = {
     "get_breakpoints": BreakpointsPayload,
     "get_breakpoint_bindings": BreakpointsPayload,
     "read_memory": MemoryReadPayload,
+    "get_dump_memory_ranges": DumpMemoryRangesPayload,
     "search_memory": MemorySearchPayload,
     "get_disassembly": DisassemblyPayload,
     "get_disassembly_at": DisassemblyPayload,
@@ -1143,7 +1171,7 @@ _MODEL_BY_TOOL: Dict[str, Type[StrictPayload]] = {
     **{name: BreakpointOperationPayload for name in (
         "set_breakpoint", "set_function_breakpoint",
         "set_data_breakpoint", "set_address_breakpoint", "set_watchpoint", "delete_breakpoint",
-        "clear_breakpoint", "delete_all_breakpoints", "enable_breakpoint",
+        "delete_data_breakpoint", "clear_breakpoint", "delete_all_breakpoints", "enable_breakpoint",
     )},
     **{name: ContextSelectionPayload for name in (
         "switch_stack_frame",

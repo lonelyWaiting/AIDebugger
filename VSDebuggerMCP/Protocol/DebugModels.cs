@@ -1597,6 +1597,68 @@ namespace VSDebuggerMCP.Protocol
         public string Error { get; set; }
     }
 
+    [DataContract]
+    public class DumpMemoryRangesResult
+    {
+        [DataMember(Name = "capability")]
+        public string Capability { get; set; }
+
+        [DataMember(Name = "status")]
+        public string Status { get; set; } = "unavailable";
+
+        [DataMember(Name = "dumpPath")]
+        public string DumpPath { get; set; }
+
+        [DataMember(Name = "source")]
+        public string Source { get; set; }
+
+        [DataMember(Name = "rangeCount")]
+        public int RangeCount { get; set; }
+
+        [DataMember(Name = "totalMappedBytes")]
+        public long TotalMappedBytes { get; set; }
+
+        [DataMember(Name = "startIndex")]
+        public int StartIndex { get; set; }
+
+        [DataMember(Name = "maxNodes")]
+        public int MaxNodes { get; set; }
+
+        [DataMember(Name = "budgetMs")]
+        public int BudgetMs { get; set; }
+
+        [DataMember(Name = "ranges")]
+        public List<DumpMemoryRangeInfo> Ranges { get; set; } = new List<DumpMemoryRangeInfo>();
+
+        [DataMember(Name = "nextIndex", EmitDefaultValue = false)]
+        public int? NextIndex { get; set; }
+
+        [DataMember(Name = "hasMore")]
+        public bool HasMore { get; set; }
+
+        [DataMember(Name = "partial")]
+        public bool Partial { get; set; }
+
+        [DataMember(Name = "snapshotStatus")]
+        public string SnapshotStatus { get; set; }
+
+        [DataMember(Name = "error")]
+        public string Error { get; set; }
+    }
+
+    [DataContract]
+    public class DumpMemoryRangeInfo
+    {
+        [DataMember(Name = "startAddress")]
+        public string StartAddress { get; set; }
+
+        [DataMember(Name = "endAddressExclusive")]
+        public string EndAddressExclusive { get; set; }
+
+        [DataMember(Name = "sizeBytes")]
+        public long SizeBytes { get; set; }
+    }
+
     #endregion
 
     #region Disassembly
@@ -2246,6 +2308,12 @@ namespace VSDebuggerMCP.Protocol
         [DataMember(Name = "tag")]
         public string Tag { get; set; }
 
+        // Only populated for data breakpoints created by AIDebugger.  This is
+        // deliberately separate from the raw Visual Studio tag so callers can
+        // remove exactly the watchpoint they created.
+        [DataMember(Name = "dataBreakpointId", EmitDefaultValue = false)]
+        public string DataBreakpointId { get; set; }
+
         [DataMember(Name = "requestedFilePath")]
         public string RequestedFilePath { get; set; }
 
@@ -2517,6 +2585,12 @@ namespace VSDebuggerMCP.Protocol
 
         [DataMember(Name = "nextStartOffset", EmitDefaultValue = false)]
         public long? NextStartOffset { get; set; }
+
+        [DataMember(Name = "source", EmitDefaultValue = false)]
+        public string Source { get; set; }
+
+        [DataMember(Name = "continuation", EmitDefaultValue = false)]
+        public string Continuation { get; set; }
 
         [DataMember(Name = "hasMore")]
         public bool HasMore { get; set; }

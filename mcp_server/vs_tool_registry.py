@@ -59,12 +59,13 @@ VS_TOOL_DOMAINS: Dict[str, List[str]] = {
         "get_breakpoints", "get_breakpoint_bindings", "continue_and_capture_breakpoint",
         "set_breakpoint", "set_function_breakpoint", "set_data_breakpoint",
         "set_address_breakpoint", "set_watchpoint", "delete_breakpoint", "clear_breakpoint",
+        "delete_data_breakpoint",
         "delete_all_breakpoints", "enable_breakpoint", "switch_stack_frame",
         "select_stack_frame", "switch_thread", "select_thread",
     ],
     "memory": [
         "read_memory", "get_disassembly", "get_disassembly_at", "get_registers",
-        "add_watch", "search_memory",
+        "get_dump_memory_ranges", "add_watch", "search_memory",
     ],
 }
 

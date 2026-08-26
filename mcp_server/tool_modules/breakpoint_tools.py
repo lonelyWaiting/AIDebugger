@@ -248,6 +248,41 @@ async def set_watchpoint_alias(
     )
 
 @mcp.tool()
+async def delete_data_breakpoint(
+    data_breakpoint_id: str,
+    breakpoint_lookup_budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+) -> str:
+    """
+    Remove exactly one AIDebugger-owned data breakpoint/watchpoint.
+
+    Pass breakpointInfo.dataBreakpointId returned by set_data_breakpoint. This
+    never falls back to delete_all_breakpoints and will not remove a manually
+    created Visual Studio breakpoint.
+    """
+    try:
+        params = {
+            "dataBreakpointId": validate_nonempty_string(
+                "data_breakpoint_id", data_breakpoint_id, 32
+            )
+        }
+        if breakpoint_lookup_budget_ms is not None:
+            params["breakpointLookupBudgetMs"] = validate_int_range(
+                "breakpoint_lookup_budget_ms", breakpoint_lookup_budget_ms, 0, 120000
+            )
+        result = await ide_bridge.call(
+            "delete_data_breakpoint",
+            params,
+            preferred_ide="vs",
+            timeout=tool_timeout_for_budget(
+                timeout_seconds, THREADS_TIMEOUT_SECONDS, breakpoint_lookup_budget_ms
+            ),
+        )
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "delete_data_breakpoint")
+
+@mcp.tool()
 async def delete_breakpoint(
     file_path: str,
     line_number: int,

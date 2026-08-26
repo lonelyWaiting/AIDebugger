@@ -36,7 +36,7 @@ namespace VSDebuggerMCP.Ipc
             _utcNow = utcNow ?? (() => DateTime.UtcNow);
         }
 
-        internal void Complete(string requestId, string clientLane, string response)
+        internal void Complete(string requestId, string response)
         {
             if (string.IsNullOrWhiteSpace(requestId) || response == null) return;
             long bytes = Encoding.UTF8.GetByteCount(response);
@@ -54,7 +54,6 @@ namespace VSDebuggerMCP.Ipc
                 }
                 _entries[requestId] = new Entry
                 {
-                    ClientLane = clientLane,
                     Response = response,
                     ResponseBytes = bytes,
                     CompletedUtc = _utcNow(),
@@ -124,7 +123,6 @@ namespace VSDebuggerMCP.Ipc
 
         private sealed class Entry
         {
-            internal string ClientLane { get; set; }
             internal string Response { get; set; }
             internal long ResponseBytes { get; set; }
             internal DateTime CompletedUtc { get; set; }

@@ -112,7 +112,7 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 - `McpClientRegistration.kt` - MCP registration with Python version check
 
 **MCP Server:**
-- `server.py` - Combined thin entry point for all 83 MCP tools
+- `server.py` - Combined thin entry point for all 86 MCP tools
 - `vs_server.py` - VS-only entry point; never imports or discovers Rider
 - `ide_bridge.py` - Unified bridge with auto-selection logic for multiple IDE instances
 - `vs_bridge.py` / `rider_bridge.py` - Named Pipe clients with overlapped I/O and timeout handling
@@ -140,7 +140,7 @@ Visual Studio uses authenticated AIDB/2 length-prefixed messages. Requests inclu
 - `AIDB_PREFERRED_IDE` env var locks MCP server to `vs` or `rider`
 - Auto-selection priority: paused at breakpoint > debugging > single instance
 - VS pipe/instance registration default to current-user owner-only ACLs
-- `AIDB_ALLOWED_CAPABILITIES` optionally restricts the server capability set
+- `AIDB_ALLOWED_CAPABILITIES` optionally restricts the VS server capability set
 - VS has no world-access pipe compatibility mode
 
 ## Versioning

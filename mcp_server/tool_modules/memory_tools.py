@@ -27,6 +27,34 @@ async def read_memory(address: str, size: int = 256, timeout_seconds: Optional[f
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "read_memory")
 
+
+@mcp.tool()
+async def get_dump_memory_ranges(
+    start_index: int = 0,
+    max_nodes: Optional[int] = None,
+    budget_ms: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+) -> str:
+    """
+    List virtual-address ranges physically present in the currently opened VS dump.
+
+    This reads only the active dump's minidump directory, never an arbitrary
+    caller path or the dump payload. Use a returned startAddress with
+    search_memory/read_memory for bounded raw-dump evidence.
+    """
+    try:
+        params = add_bounded_collection_params({}, start_index, max_nodes, budget_ms)
+        result = await ide_bridge.call(
+            "get_dump_memory_ranges",
+            params,
+            preferred_ide="vs",
+            timeout=tool_timeout_for_budget(timeout_seconds, MEMORY_TIMEOUT_SECONDS, budget_ms),
+        )
+        return format_result(result)
+    except ide_bridge.IDEBridgeError as e:
+        return handle_ide_error(e, "get_dump_memory_ranges")
+
+
 @mcp.tool()
 async def get_disassembly(
     lines_before: int = 20,
@@ -108,25 +136,46 @@ async def add_watch(expression: str) -> str:
 
 @mcp.tool()
 async def search_memory(
-    start_address: str,
-    pattern: str,
+    start_address: Optional[str] = None,
+    pattern: str = "",
     max_results: int = 100,
     search_size: int = 0x10000,
     pattern_format: str = "auto",
     start_offset: int = 0,
+    continuation: Optional[str] = None,
     timeout_seconds: Optional[float] = None
 ) -> str:
-    """Search a bounded memory range beginning at a numeric address literal.
+    """Search active memory without choosing a dump-specific tool.
 
-    start_address accepts unsigned decimal or hexadecimal notation only. Larger
-    ranges are chunked with explicit byte/result/time budgets.
+    With a numeric start_address, search that bounded address range in either a
+    live target or the active dump. Without start_address, Visual Studio detects
+    its active dump and scans only mapped dump ranges. Pass the opaque
+    continuation returned by that page to continue; no dump parser or separate
+    search function is required. A continuation is valid only for the same
+    active dump, paused debugger context, and parsed pattern; restart the
+    search if any of those changes. Live searches require start_address so they
+    remain bounded and do not sweep an arbitrary process address space.
     """
     # The total requested range is not reduced to the VSIX per-call limit;
     # larger searches are chunked below. Invalid input is rejected, never changed.
     search_size = validate_int_range("search_size", search_size, 1, MAX_MEMORY_SEARCH_SIZE)
     max_results = validate_int_range("max_results", max_results, 1, 10000)
     start_offset = validate_int_range("start_offset", start_offset, 0, 0x7FFFFFFFFFFFFFFF)
-    start_address = validate_address_literal("start_address", start_address)
+    if start_address is not None:
+        start_address = validate_address_literal("start_address", start_address)
+        # The VS protocol represents startOffset as an Int64.  Validate the
+        # whole requested range before chunking so a later page cannot overflow
+        # while being serialized back to the debugger.
+        if start_offset > 0x7FFFFFFFFFFFFFFF - (search_size - 1):
+            raise invalid_argument(
+                "start_offset + search_size exceeds the backend Int64 offset range"
+            )
+    elif start_offset != 0:
+        raise invalid_argument("start_offset requires start_address")
+    if continuation is not None:
+        continuation = validate_nonempty_string("continuation", continuation, 512)
+    if start_address is not None and continuation is not None:
+        raise invalid_argument("continuation cannot be combined with start_address")
     pattern_format = validate_enum(
         "pattern_format", pattern_format, ("auto", "hex", "bytes", "text", "ascii", "string")
     )
@@ -137,6 +186,39 @@ async def search_memory(
     deadline = asyncio.get_running_loop().time() + tool_timeout
 
     try:
+        if start_address is None:
+            # A mapped dump page is intentionally capped to one VSIX request.
+            # The backend supplies an opaque continuation when more mapped bytes
+            # remain, so callers never need to choose a dump-only method.
+            search_size = validate_int_range(
+                "search_size", search_size, 1, MAX_MEMORY_SEARCH_CHUNK_SIZE
+            )
+            call_timeout = remaining_tool_timeout(deadline, MEMORY_TIMEOUT_SECONDS)
+            if call_timeout is None:
+                return handle_ide_error(
+                    ide_bridge.IDEBridgeError(
+                        "Search was not started because the search_memory timeout budget was exhausted",
+                        code="DEADLINE_EXCEEDED_NOT_STARTED",
+                    ),
+                    "search_memory",
+                )
+            params = {
+                "pattern": pattern,
+                "maxResults": max_results,
+                "searchSize": search_size,
+                "patternFormat": pattern_format,
+                "startOffset": start_offset,
+            }
+            if continuation is not None:
+                params["continuation"] = continuation
+            result = await ide_bridge.call(
+                "search_memory",
+                params,
+                preferred_ide="vs",
+                timeout=call_timeout,
+            )
+            return format_result(result)
+
         if search_size <= MAX_MEMORY_SEARCH_CHUNK_SIZE:
             call_timeout = remaining_tool_timeout(deadline, MEMORY_TIMEOUT_SECONDS)
             if call_timeout is None:
@@ -153,7 +235,7 @@ async def search_memory(
                 "maxResults": max_results,
                 "searchSize": search_size,
                 "patternFormat": pattern_format,
-                "startOffset": start_offset
+                "startOffset": start_offset,
             }, timeout=call_timeout)
             return format_result(result)
 
@@ -175,6 +257,7 @@ async def search_memory(
         continuation_expression = None
         continuation_offset = None
         continuation_remaining = None
+        terminal_backend_no_continuation = False
         pinned_target = None
         capability = None
 
@@ -336,34 +419,49 @@ async def search_memory(
                 status = "partial"
                 error = chunk_error or f"Chunk at {chunk_start} was partial"
                 backend_next_offset = chunk_result.get("nextStartOffset")
-                if backend_next_offset is not None:
-                    continuation_expression = start_address
-                    continuation_offset = int(backend_next_offset)
-                    consumed = max(0, continuation_offset - start_offset)
-                    continuation_remaining = max(0, search_size - consumed)
-                break
-
-            if len(matches) >= max_results:
-                partial = True
-                status = "partial"
-                backend_next_offset = chunk_result.get("nextStartOffset")
                 try:
-                    backend_next_offset = int(backend_next_offset)
+                    backend_next_offset = (
+                        int(backend_next_offset)
+                        if backend_next_offset is not None
+                        else None
+                    )
                 except (TypeError, ValueError, OverflowError):
                     backend_next_offset = None
                 range_end_offset = start_offset + search_size
-                if backend_next_offset is not None and start_offset <= backend_next_offset < range_end_offset:
+                if (backend_next_offset is not None and
+                        start_offset <= backend_next_offset < range_end_offset):
                     continuation_expression = start_address
                     continuation_offset = backend_next_offset
-                    consumed = backend_next_offset - start_offset
-                    continuation_remaining = search_size - consumed
-                    error = (
-                        "Search stopped after reaching max_results; continue with the same "
-                        "start address, nextStartOffset and remainingBytes"
-                    )
-                else:
-                    error_code = "INVALID_BACKEND_CONTINUATION"
-                    error = "Search reached max_results but the debugger returned no valid continuation offset"
+                    consumed = max(0, continuation_offset - start_offset)
+                    continuation_remaining = max(0, search_size - consumed)
+                elif not bool(chunk_result.get("hasMore")):
+                    # The backend explicitly refused to advance across an
+                    # inconclusive memory interval.  Do not turn that into a
+                    # synthetic startAddress cursor that retries the same page.
+                    terminal_backend_no_continuation = True
+                break
+
+            if len(matches) >= max_results:
+                # A backend only emits nextStartOffset when its own result limit
+                # truncated an otherwise still-searchable chunk. If the final
+                # match merely happens to fill the caller's max_results budget,
+                # there may be no backend cursor at all. Finish normally when
+                # the aggregate range is covered; otherwise use the proven
+                # chunk boundary (with overlap) as the continuation.
+                if covered_until >= search_size:
+                    offset = search_size
+                    break
+
+                next_offset = max(offset + 1, covered_until - overlap)
+                partial = True
+                status = "partial"
+                continuation_expression = start_address
+                continuation_offset = start_offset + next_offset
+                continuation_remaining = search_size - next_offset
+                error = (
+                    "Search stopped after reaching max_results; continue with the same "
+                    "start address, nextStartOffset and remainingBytes"
+                )
                 break
 
             offset = next_offset
@@ -375,7 +473,7 @@ async def search_memory(
             next_start_expression = continuation_expression
             next_start_offset = continuation_offset
             remaining_bytes = continuation_remaining
-        elif covered_until < search_size:
+        elif covered_until < search_size and not terminal_backend_no_continuation:
             next_start_expression = start_address
             next_start_offset = start_offset + covered_until
             remaining_bytes = search_size - covered_until

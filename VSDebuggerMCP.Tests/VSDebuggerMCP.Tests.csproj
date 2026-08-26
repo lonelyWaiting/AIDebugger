@@ -64,6 +64,8 @@
     <Compile Include="..\VSDebuggerMCP\Services\VariableCaptureBudget.cs" Link="Production\VariableCaptureBudget.cs" />
     <Compile Include="..\VSDebuggerMCP\Services\ThreadCaptureBudget.cs" Link="Production\ThreadCaptureBudget.cs" />
     <Compile Include="..\VSDebuggerMCP\Services\TargetArchitecture.cs" Link="Production\TargetArchitecture.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\MinidumpMemoryReader.cs" Link="Production\MinidumpMemoryReader.cs" />
+    <Compile Include="..\VSDebuggerMCP\Services\MappedDumpSearchContinuation.cs" Link="Production\MappedDumpSearchContinuation.cs" />
     <Compile Include="..\VSDebuggerMCP\Services\RegisterCapturePolicy.cs" Link="Production\RegisterCapturePolicy.cs" />
     <Compile Include="..\VSDebuggerMCP\Services\SnapshotCompletenessPolicy.cs" Link="Production\SnapshotCompletenessPolicy.cs" />
     <Compile Include="..\VSDebuggerMCP\Services\ModuleCaptureBudget.cs" Link="Production\ModuleCaptureBudget.cs" />

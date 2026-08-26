@@ -192,10 +192,10 @@ namespace VSDebuggerMCP
 
             // Never enumerate Debugger.LocalProcesses here. This observer runs in
             // request-finally UI-thread paths, and even a bounded COM enumeration can
-            // monopolize the IDE. Only an MCP start/attach operation supplies the
-            // pre-captured OS start time needed to bind a live process safely.
-            // Sessions started outside MCP stay on debugger-engine-only access; this
-            // also prevents a dump's recorded PID from being mistaken for a reused PID.
+            // monopolize the IDE. MCP start/attach can bind immediately from its
+            // pre-captured OS identity. A read request may separately perform a
+            // bounded COM-identity proof before it enables a manual live session;
+            // this observer must never infer live memory access from PID alone.
             ClearTrustedLiveProcessIdentity(clearPending: false);
             ExpirePendingTrustedLiveProcessIdentity();
             lock (_trustedLiveProcessSync)
@@ -290,6 +290,7 @@ namespace VSDebuggerMCP
         private const uint DebugDumpFileCommandId = 0x00000603;
         private const long SourcePreflightMaxBytes = 16L * 1024L * 1024L;
         private const string AddressBreakpointTagPrefix = "AIDB_ADDR=";
+        private const string DataBreakpointTagPrefix = "AIDB_DATA=";
         private const uint PROCESS_VM_READ = 0x0010;
         private const uint PROCESS_QUERY_INFORMATION = 0x0400;
         private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;

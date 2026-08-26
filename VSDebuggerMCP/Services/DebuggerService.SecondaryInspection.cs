@@ -5,10 +5,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading;
-using System.Web.Script.Serialization;
 using EnvDTE;
 using EnvDTE80;
 using EnvDTE100;
@@ -198,68 +195,333 @@ namespace VSDebuggerMCP
         #region Memory Search
 
         /// <summary>
-        /// Search for a pattern in memory using optimized batch reading.
-        /// Performance: Reads memory in chunks instead of byte-by-byte, reducing IPC calls from O(n) to O(n/4).
-        /// Automatically handles thread context issues by trying to switch to user code thread if needed.
+        /// Search memory without making the caller select a dump-specific API.
+        /// A known active dump is searched through its mapped minidump bytes; an
+        /// active live process searches the requested numeric range.  Omitting
+        /// startAddress is meaningful only for a dump and scans its mapped ranges
+        /// with the opaque continuation returned by a prior page.
         /// </summary>
-        [SuppressMessage("Usage", "VSTHRD010", Justification = "ReadMemory self-marshals bounded debugger validation/fallback slices; byte search runs off-thread.")]
-        public MemorySearchResult SearchMemory(string startAddress, string pattern, int maxResults = 100, int searchSize = 0x10000, string patternFormat = "auto", long startOffset = 0)
+        [SuppressMessage("Usage", "VSTHRD010", Justification = "The initial/final debugger identity checks are bounded UI slices; raw process and dump reads run off the UI thread.")]
+        public MemorySearchResult SearchMemory(
+            string startAddress,
+            string pattern,
+            int maxResults = 100,
+            int searchSize = 0x10000,
+            string patternFormat = "auto",
+            long startOffset = 0,
+            string continuation = null)
         {
             int requestedBytes = Math.Max(1, Math.Min(searchSize, 0x100000));
             int resultLimit = Math.Max(1, Math.Min(maxResults, 10000));
-            var result = CreateUnavailableMemorySearchResult(pattern, requestedBytes);
+            var unavailable = CreateUnavailableMemorySearchResult(pattern, requestedBytes);
             byte[] patternBytes = SearchPatternParser.Parse(pattern, patternFormat);
-            if (!TryParseAddressLiteral(startAddress, out ulong baseAddress))
+            bool hasStartAddress = !string.IsNullOrWhiteSpace(startAddress);
+            ulong baseAddress = 0;
+            if (hasStartAddress && !TryParseAddressLiteral(startAddress, out baseAddress))
             {
-                result.Error = "Invalid start address";
-                return result;
+                unavailable.Error = "Invalid start address";
+                return unavailable;
             }
-            ulong offsetValue = startOffset > 0 ? (ulong)startOffset : 0UL;
-            if (baseAddress > ulong.MaxValue - offsetValue)
+            if (!hasStartAddress && startOffset != 0)
             {
-                result.Error = "Start offset overflows resolved address";
-                return result;
+                unavailable.Error = "startOffset requires startAddress";
+                return unavailable;
             }
-            baseAddress += offsetValue;
-            if ((ulong)(requestedBytes - 1) > ulong.MaxValue - baseAddress)
+            if (hasStartAddress)
             {
-                result.Error = "Search range overflows address space";
-                return result;
+                if (startOffset < 0)
+                {
+                    unavailable.Error = "startOffset must be non-negative";
+                    return unavailable;
+                }
+                if (startOffset > long.MaxValue - (requestedBytes - 1))
+                {
+                    unavailable.Error = "Start offset plus search range exceeds the supported protocol range";
+                    return unavailable;
+                }
+                ulong offsetValue = (ulong)startOffset;
+                if (baseAddress > ulong.MaxValue - offsetValue)
+                {
+                    unavailable.Error = "Start offset overflows resolved address";
+                    return unavailable;
+                }
+                baseAddress += offsetValue;
+                if ((ulong)(requestedBytes - 1) > ulong.MaxValue - baseAddress)
+                {
+                    unavailable.Error = "Search range overflows address space";
+                    return unavailable;
+                }
             }
-            result.PatternBytes = patternBytes.Select(value => value.ToString("X2")).ToArray();
 
-            const int chunkSize = 4096;
+            MemoryReadHeader header = CaptureMemoryReadHeader();
+            if (header == null)
+            {
+                unavailable.Error = "Not in break mode";
+                return unavailable;
+            }
+
+            MemorySearchResult result;
+            string dumpPath = NormalizeExistingDumpPath(header.DumpPathCandidate);
+            try
+            {
+                if (!string.IsNullOrEmpty(dumpPath))
+                {
+                    result = SearchMappedDumpMemory(
+                        dumpPath,
+                        header.SnapshotToken,
+                        hasStartAddress,
+                        baseAddress,
+                        pattern,
+                        patternBytes,
+                        resultLimit,
+                        requestedBytes,
+                        startOffset,
+                        continuation);
+                }
+                else if (!string.IsNullOrWhiteSpace(continuation))
+                {
+                    result = CreateUnavailableMemorySearchResult(pattern, requestedBytes);
+                    result.Error = "The continuation belongs to a mapped dump search, but the active target is live";
+                }
+                else if (!hasStartAddress)
+                {
+                    result = CreateUnavailableMemorySearchResult(pattern, requestedBytes);
+                    result.Error = "startAddress is required when the active target is not a recognized dump";
+                }
+                else if (header.ProcessHandle != IntPtr.Zero)
+                {
+                    // Keep one verified handle for the entire search.  The previous
+                    // implementation re-captured DTE state for every 4KiB chunk,
+                    // which made large live searches prone to UI-dispatch timeouts.
+                    result = SearchMemoryByReader(
+                        pattern,
+                        patternBytes,
+                        baseAddress,
+                        startOffset,
+                        requestedBytes,
+                        resultLimit,
+                        (address, size) => ReadProcessMemoryContiguous(header.ProcessHandle, address, size),
+                        header.Capability);
+                }
+                else
+                {
+                    // Do not open an unverified process from a manually started
+                    // session: a dump's recorded PID can be reused.  The bounded
+                    // debugger-engine fallback now runs in grouped UI slices, rather
+                    // than one 35ms dispatch per word.
+                    if (patternBytes.Length > ExpressionFallbackMaxBytes)
+                    {
+                        result = CreateUnavailableMemorySearchResult(pattern, requestedBytes);
+                        result.Capability = "debugger_expression_fallback_untrusted_session";
+                        result.Partial = true;
+                        result.Error = $"Search patterns longer than {ExpressionFallbackMaxBytes} bytes " +
+                            "cannot be evaluated through the bounded debugger-expression fallback";
+                    }
+                    else
+                    {
+                        bool fallbackReadIssued = false;
+                        result = SearchMemoryByReader(
+                            pattern,
+                            patternBytes,
+                            baseAddress,
+                            startOffset,
+                            requestedBytes,
+                            resultLimit,
+                            (address, size) =>
+                            {
+                                if (fallbackReadIssued)
+                                {
+                                    return Array.Empty<byte>();
+                                }
+                                fallbackReadIssued = true;
+                                return ReadMemoryExpressionPrefix(address, size);
+                            },
+                            "debugger_expression_fallback_untrusted_session");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                RethrowRequestControlFlow(ex);
+                result = CreateUnavailableMemorySearchResult(pattern, requestedBytes);
+                result.Capability = !string.IsNullOrEmpty(dumpPath)
+                    ? "raw_minidump_memory_search_unavailable"
+                    : header.Capability;
+                result.Partial = true;
+                result.Error = !string.IsNullOrEmpty(dumpPath)
+                    ? $"Could not search active minidump memory: {ex.Message}"
+                    : $"Could not search active memory: {ex.Message}";
+                _log($"SearchMemory failed: {ex.GetType().Name}");
+            }
+            finally
+            {
+                CloseMemoryReadHandle(header);
+            }
+
+            if (!IsMemorySnapshotCurrent(header))
+            {
+                var unstable = CreateUnavailableMemorySearchResult(pattern, requestedBytes);
+                unstable.Capability = result.Capability;
+                unstable.Source = result.Source;
+                unstable.Status = "unstable";
+                unstable.Partial = true;
+                unstable.Error = "Debugger context changed while memory was searched; matches were discarded";
+                return unstable;
+            }
+
+            return result;
+        }
+
+        private MemorySearchResult SearchMappedDumpMemory(
+            string dumpPath,
+            string snapshotToken,
+            bool hasStartAddress,
+            ulong baseAddress,
+            string pattern,
+            byte[] patternBytes,
+            int resultLimit,
+            int requestedBytes,
+            long startOffset,
+            string continuation)
+        {
+            using (var reader = MinidumpMemoryReader.Open(dumpPath))
+            {
+                if (hasStartAddress)
+                {
+                    if (!string.IsNullOrWhiteSpace(continuation))
+                    {
+                        var invalid = CreateUnavailableMemorySearchResult(pattern, requestedBytes);
+                        invalid.Capability = "raw_minidump_memory_search";
+                        invalid.Source = reader.Source;
+                        invalid.Error = "continuation cannot be combined with startAddress";
+                        return invalid;
+                    }
+
+                    return SearchMemoryByReader(
+                        pattern,
+                        patternBytes,
+                        baseAddress,
+                        startOffset,
+                        requestedBytes,
+                        resultLimit,
+                        (address, size) => reader.Read(address, size),
+                        "raw_minidump_memory_search",
+                        reader.Source);
+                }
+
+                string dumpIdentity = MappedDumpSearchContinuationCodec.CreateDumpIdentity(dumpPath);
+                if (!MappedDumpSearchContinuationCodec.TryDecode(
+                    continuation,
+                    patternBytes.Length,
+                    dumpIdentity,
+                    snapshotToken,
+                    patternBytes,
+                    out int rangeIndex,
+                    out ulong rangeOffset,
+                    out int continuationCarryBytes,
+                    out string continuationError))
+                {
+                    var invalid = CreateUnavailableMemorySearchResult(pattern, requestedBytes);
+                    invalid.Capability = "raw_minidump_memory_search";
+                    invalid.Source = reader.Source;
+                    invalid.Error = continuationError;
+                    return invalid;
+                }
+
+                MinidumpMemorySearchPage page = reader.Search(
+                    patternBytes,
+                    resultLimit,
+                    requestedBytes,
+                    rangeIndex,
+                    rangeOffset,
+                    continuationCarryBytes);
+                var result = CreateUnavailableMemorySearchResult(pattern, requestedBytes);
+                result.PatternBytes = patternBytes.Select(value => value.ToString("X2")).ToArray();
+                result.Capability = "raw_minidump_memory_search";
+                result.Source = reader.Source;
+                result.Matches = page.Matches.Select(FormatAddress).ToList();
+                result.TotalFound = result.Matches.Count;
+                result.BytesSearched = page.BytesSearched;
+                result.BytesAttempted = page.BytesAttempted;
+                result.FailedReads = Math.Max(0, page.BytesAttempted - page.BytesSearched);
+                result.UnreadableBytes = result.FailedReads;
+                result.UnattemptedBytes = page.HasMore
+                    ? Math.Max(0, requestedBytes - page.BytesAttempted)
+                    : 0;
+                result.Partial = page.Partial;
+                result.Truncated = page.Truncated;
+                result.HasMore = page.HasMore;
+                result.Error = page.Error;
+                if (page.NextRangeIndex.HasValue && page.NextRangeOffset.HasValue)
+                {
+                    if (page.NextRangeOffset.Value > long.MaxValue)
+                    {
+                        result.Partial = true;
+                        result.HasMore = false;
+                        result.Error = "Mapped memory continuation offset exceeds the supported protocol range";
+                    }
+                    else
+                    {
+                        result.Continuation = MappedDumpSearchContinuationCodec.Create(
+                            page.NextRangeIndex.Value,
+                            checked((long)page.NextRangeOffset.Value),
+                            page.NextCarryBytes,
+                            dumpIdentity,
+                            snapshotToken,
+                            patternBytes);
+                    }
+                }
+                result.Status = result.BytesSearched == 0 && !result.HasMore &&
+                    !string.IsNullOrEmpty(result.Error)
+                    ? "unavailable"
+                    : (result.Partial ? "partial" : "ok");
+                return result;
+            }
+        }
+
+        private MemorySearchResult SearchMemoryByReader(
+            string pattern,
+            byte[] patternBytes,
+            ulong baseAddress,
+            long startOffset,
+            int requestedBytes,
+            int resultLimit,
+            Func<ulong, int, byte[]> read,
+            string capability,
+            string source = null)
+        {
+            var result = CreateUnavailableMemorySearchResult(pattern, requestedBytes);
+            result.PatternBytes = patternBytes.Select(value => value.ToString("X2")).ToArray();
+            result.Capability = capability;
+            result.Source = source;
+
+            const int chunkSize = 64 * 1024;
             var carry = new List<byte>(Math.Max(0, patternBytes.Length - 1));
             int nextCandidateOffset = 0;
             for (int offset = 0; offset < requestedBytes; offset += chunkSize)
             {
                 DebuggerRequestContext.ThrowIfCancellationOrDeadlineExceeded();
                 int readSize = Math.Min(chunkSize, requestedBytes - offset);
-                result.BytesAttempted += readSize;
-                ulong chunkAddress = baseAddress + (ulong)offset;
-                MemoryResult chunk = ReadMemory(FormatAddress(chunkAddress), readSize);
-                if (string.IsNullOrEmpty(result.Capability))
-                {
-                    result.Capability = chunk.Capability;
-                }
-                else if (!string.Equals(result.Capability, chunk.Capability, StringComparison.Ordinal))
-                {
-                    result.Capability = "mixed_memory_read_strategies";
-                }
-                int available = Math.Min(chunk.Bytes?.Count ?? 0, readSize);
+                byte[] bytes = read(baseAddress + (ulong)offset, readSize) ?? Array.Empty<byte>();
+                int available = Math.Min(bytes.Length, readSize);
+                // A short result from the debugger-expression fallback, or an
+                // unsuccessful direct read, does not prove that the rest of this
+                // requested chunk is unreadable. Count only bytes actually returned
+                // as attempted so the remaining interval stays explicitly
+                // inconclusive instead of being reported as a failed read.
+                result.BytesAttempted += available;
                 result.BytesSearched += available;
                 if (available == 0)
                 {
                     result.Partial = true;
-                    SetMemorySearchContinuation(
-                        result, startOffset, baseAddress, offset + readSize, requestedBytes);
+                    result.Error = "Memory read made no progress; the remaining range was not skipped";
                     break;
                 }
 
                 int combinedBaseOffset = offset - carry.Count;
                 var combined = new List<byte>(carry.Count + available);
                 combined.AddRange(carry);
-                combined.AddRange(chunk.Bytes.Take(available));
+                combined.AddRange(bytes.Take(available));
                 int lastCandidateExclusive = Math.Min(
                     Math.Max(0, requestedBytes - patternBytes.Length + 1),
                     combinedBaseOffset + Math.Max(0, combined.Count - patternBytes.Length + 1));
@@ -277,7 +539,11 @@ namespace VSDebuggerMCP
                             break;
                         }
                     }
-                    if (!matched) continue;
+                    if (!matched)
+                    {
+                        continue;
+                    }
+
                     ulong matchAddress = baseAddress + (ulong)candidateOffset;
                     result.Matches.Add(FormatAddress(matchAddress));
                     if (result.Matches.Count >= resultLimit)
@@ -297,24 +563,40 @@ namespace VSDebuggerMCP
                         break;
                     }
                 }
+
                 nextCandidateOffset = Math.Max(nextCandidateOffset, lastCandidateExclusive);
                 int carryCount = Math.Min(patternBytes.Length - 1, combined.Count);
                 carry = carryCount > 0
                     ? combined.Skip(combined.Count - carryCount).Take(carryCount).ToList()
                     : new List<byte>();
-                if (result.Truncated) break;
+                if (result.Truncated)
+                {
+                    break;
+                }
                 if (available < readSize)
                 {
                     result.Partial = true;
+                    int continuationOffset = offset + available;
+                    if (IsExpressionMemoryFallbackCapability(capability))
+                    {
+                        // This fallback stopped at its intentional byte budget, not
+                        // at an unreadable virtual-memory boundary. Revisit the last
+                        // pattern-width bytes so a match spanning two pages is not
+                        // lost on the next bounded request.
+                        continuationOffset = Math.Max(
+                            offset,
+                            continuationOffset - Math.Max(0, patternBytes.Length - 1));
+                    }
                     SetMemorySearchContinuation(
                         result,
                         startOffset,
                         baseAddress,
-                        chunk.HasMore ? offset + available : offset + readSize,
+                        continuationOffset,
                         requestedBytes);
                     break;
                 }
             }
+
             result.TotalFound = result.Matches.Count;
             result.UnreadableBytes = Math.Max(0, result.BytesAttempted - result.BytesSearched);
             result.FailedReads = result.UnreadableBytes;

@@ -2172,6 +2172,7 @@ print(json.dumps({
         self.assertIn('start_offset: int = 0', search_memory)
         self.assertIn('"startOffset": start_offset', search_memory)
         self.assertIn('"startOffset": absolute_offset', search_memory)
+        self.assertIn("start_offset + search_size exceeds the backend Int64 offset range", search_memory)
         self.assertIn("chunk_start = start_address if absolute_offset == 0 else", search_memory)
         self.assertIn("next_offset = max(offset + 1, covered_until - overlap)", search_memory)
         self.assertIn("newly_covered", search_memory)
@@ -2181,11 +2182,16 @@ print(json.dumps({
         self.assertIn('"startAddress": start_address', search_memory)
         self.assertIn("Search stopped after reaching max_results", search_memory)
         self.assertNotIn("10 * 1024 * 1024", search_memory)
-        self.assertIn("Search a bounded memory range beginning at a numeric address literal", search_memory)
+        self.assertIn("Search active memory without choosing a dump-specific tool", search_memory)
+        self.assertIn('continuation: Optional[str] = None', search_memory)
+        self.assertIn('params["continuation"] = continuation', search_memory)
+        self.assertIn('preferred_ide="vs"', search_memory)
+        self.assertNotIn("search_dump_memory", server_py)
         self.assertIn('pattern_format: str = "auto"', search_memory)
         self.assertIn('"patternFormat": pattern_format', search_memory)
         self.assertIn('string patternFormat = GetParam<string>(request.Params, "patternFormat", "auto")', vs_pipe)
         self.assertIn('long startOffset = GetParam<long>(request.Params, "startOffset", 0)', vs_pipe)
+        self.assertIn("Start offset plus search range exceeds the supported protocol range", vs_execute_search)
         self.assertIn("if (value is long longValue)", vs_pipe)
         self.assertIn("long converted = intValue", vs_pipe)
         self.assertIn('"startOffset"', vs_schema)
@@ -2198,8 +2204,16 @@ print(json.dumps({
         self.assertIn("LooksLikeSpacedHex", vs_parse_pattern)
         self.assertIn("Encoding.UTF8.GetBytes(pattern)", vs_parse_pattern)
         self.assertIn("contains non-ASCII characters", vs_parse_pattern)
-        self.assertIn("startOffset > 0 ? (ulong)startOffset : 0UL", vs_service)
+        self.assertIn("startOffset must be non-negative", vs_execute_search)
+        self.assertIn("ulong offsetValue = (ulong)startOffset", vs_execute_search)
         self.assertIn("baseAddress += offsetValue", vs_execute_search)
+        self.assertIn("CaptureMemoryReadHeader()", vs_execute_search)
+        self.assertIn("SearchMappedDumpMemory", vs_execute_search)
+        self.assertIn("ReadMemoryExpressionPrefix", vs_execute_search)
+        self.assertIn("OpenVerifiedCurrentLiveProcessHandle", vs_service)
+        self.assertIn("HasSameComIdentity", vs_service)
+        self.assertIn("ExpressionWordsPerUiSlice", vs_service)
+        self.assertNotIn("SearchDumpMemory", vs_service)
         self.assertNotIn("pattern.Trim().Length == 2", vs_parse_pattern)
         self.assertIn("result.Truncated = true", vs_service)
         self.assertIn("result.NextStartAddress", vs_service)
@@ -2212,6 +2226,61 @@ print(json.dumps({
         self.assertIn("hex.substring(index * 2, index * 2 + 2).toInt(16).toByte()", rider_service)
         self.assertIn("truncated = truncated", rider_service)
         self.assertIn("nextStartAddress = nextStartAddress", rider_service)
+
+    def test_vs_memory_search_safety_contracts(self) -> None:
+        secondary = read("VSDebuggerMCP/Services/DebuggerService.SecondaryInspection.cs")
+        evaluation = read("VSDebuggerMCP/Services/DebuggerService.EvaluationMemory.cs")
+        cursor_codec = read("VSDebuggerMCP/Services/MappedDumpSearchContinuation.cs")
+        memory_tools = read("mcp_server/tool_modules/memory_tools.py")
+        search_loop = csharp_slice(
+            secondary,
+            "private MemorySearchResult SearchMemoryByReader(",
+            "        private void SetMemorySearchContinuation",
+        )
+        verified_handle = csharp_slice(
+            evaluation,
+            "private IntPtr OpenVerifiedCurrentLiveProcessHandle(",
+            "        private bool IsCurrentLocalProcessIdentity(",
+        )
+
+        self.assertIn("result.BytesAttempted += available", search_loop)
+        self.assertNotIn("result.BytesAttempted += readSize", search_loop)
+        self.assertIn(
+            "Memory read made no progress; the remaining range was not skipped",
+            search_loop,
+        )
+        self.assertNotIn("offset + readSize, requestedBytes", search_loop)
+        self.assertIn("IsExpressionMemoryFallbackCapability(capability)", search_loop)
+        self.assertIn("IsExpressionMemoryFallbackCapability(header.Capability)", evaluation)
+        self.assertIn('"debugger_expression_dump_fallback"', evaluation)
+        self.assertIn("Memory range overflows address space", evaluation)
+        self.assertIn("patternBytes.Length > ExpressionFallbackMaxBytes", secondary)
+        self.assertIn("cannot be evaluated through the bounded debugger-expression fallback", secondary)
+        self.assertIn("RethrowRequestControlFlow(ex)", verified_handle)
+        self.assertIn("IntPtr handle = IntPtr.Zero", verified_handle)
+        self.assertIn("finally\n            {\n                if (handle != IntPtr.Zero)", verified_handle)
+        self.assertIn("header == null || header.ProcessHandle == IntPtr.Zero", evaluation)
+        self.assertIn("if (processHandle != IntPtr.Zero)\n                    {\n                        CloseHandle(processHandle);", evaluation)
+
+        self.assertEqual(
+            2,
+            verified_handle.count("IsCurrentLocalProcessIdentity(debugger, current, processId)"),
+        )
+        self.assertLess(
+            verified_handle.index("OpenProcess(desiredAccess, false, processId)"),
+            verified_handle.rfind("IsCurrentLocalProcessIdentity(debugger, current, processId)"),
+        )
+
+        for token in (
+            "CursorVersion = 3",
+            "DumpIdentityDigest",
+            "SnapshotDigest",
+            "PatternDigest",
+            "continuation does not match the active dump, debugger context, or search pattern",
+        ):
+            self.assertIn(token, cursor_codec)
+        self.assertIn("restart the\n    search if any of those changes", memory_tools)
+        self.assertIn("terminal_backend_no_continuation", memory_tools)
 
     def test_debug_bundle_safe_defaults_are_advertised(self) -> None:
         server_py = read("mcp_server/server.py")

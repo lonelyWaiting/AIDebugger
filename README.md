@@ -115,8 +115,8 @@ assuming a fixed flat tool list.
 
 ## Tool Domains
 
-The combined entry point exposes 83 MCP tools. The VS-only entry point exposes
-65 canonical tools by default: cross-IDE selectors and deprecated compatibility
+The combined entry point exposes 86 MCP tools. The VS-only entry point exposes
+68 canonical tools by default: cross-IDE selectors and deprecated compatibility
 aliases are omitted. Set `AIDB_ENABLE_LEGACY_ALIASES=1` only for migration.
 The registry in `mcp_server/tool_registry.py` is the source of truth for tool
 names, aliases, backend support, and timeout classes. Backend method kind and

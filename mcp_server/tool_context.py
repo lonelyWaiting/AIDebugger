@@ -34,6 +34,7 @@ __all__ = [
     "MAX_THREAD_BUDGET_SECONDS",
     "MAX_MEMORY_SEARCH_CHUNK_SIZE",
     "MAX_MEMORY_SEARCH_SIZE",
+    "invalid_argument",
     "clamp_tool_timeout",
     "validate_int_range",
     "validate_enum",
@@ -76,6 +77,11 @@ def _invalid_argument(message: str) -> ToolError:
         "retryable": False,
         "outcomeUnknown": False,
     }, ensure_ascii=False, separators=(",", ":")))
+
+
+def invalid_argument(message: str) -> ToolError:
+    """Create the standard public invalid-argument tool error."""
+    return _invalid_argument(message)
 
 
 def clamp_tool_timeout(timeout_seconds: Optional[float], default_seconds: float) -> float:

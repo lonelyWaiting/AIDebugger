@@ -122,6 +122,12 @@
       ],
       "kind": "command"
     },
+    "delete_data_breakpoint": {
+      "capabilities": [
+        "debug.breakpoint.write"
+      ],
+      "kind": "command"
+    },
     "detach": {
       "capabilities": [
         "debug.execution.control"
@@ -198,6 +204,12 @@
       "kind": "query"
     },
     "get_disassembly_at": {
+      "capabilities": [
+        "debug.memory.read"
+      ],
+      "kind": "query"
+    },
+    "get_dump_memory_ranges": {
       "capabilities": [
         "debug.memory.read"
       ],

@@ -236,6 +236,14 @@ namespace VSDebuggerMCP
                         return _debuggerService.ReadMemory(address, size);
                     }
 
+                case "get_dump_memory_ranges":
+                    {
+                        int startIndex = GetParam<int>(request.Params, "startIndex", 0);
+                        int maxNodes = GetParam<int>(request.Params, "maxNodes", -1);
+                        int budgetMs = GetParam<int>(request.Params, "budgetMs", -1);
+                        return _debuggerService.GetDumpMemoryRanges(startIndex, maxNodes, budgetMs);
+                    }
+
                 case "get_disassembly":
                     {
                         int linesBefore = GetParam<int>(request.Params, "linesBefore", 20);
@@ -606,6 +614,13 @@ namespace VSDebuggerMCP
                         return _debuggerService.DeleteBreakpoint(filePath, lineNumber, breakpointLookupBudgetMs);
                     }
 
+                case "delete_data_breakpoint":
+                    {
+                        string dataBreakpointId = GetParam<string>(request.Params, "dataBreakpointId", "");
+                        int breakpointLookupBudgetMs = GetParam<int>(request.Params, "breakpointLookupBudgetMs", -1);
+                        return _debuggerService.DeleteDataBreakpoint(dataBreakpointId, breakpointLookupBudgetMs);
+                    }
+
                 case "delete_all_breakpoints":
                     return _debuggerService.DeleteAllBreakpoints();
 
@@ -638,13 +653,24 @@ namespace VSDebuggerMCP
                 case "search_memory":
                     {
                         string startAddress = GetParam<string>(request.Params, "startAddress", "");
-                        ValidateAddressLiteral("startAddress", startAddress);
+                        if (!string.IsNullOrWhiteSpace(startAddress))
+                        {
+                            ValidateAddressLiteral("startAddress", startAddress);
+                        }
                         string pattern = GetParam<string>(request.Params, "pattern", "");
                         int maxResults = GetParam<int>(request.Params, "maxResults", 100);
                         int searchSize = GetParam<int>(request.Params, "searchSize", 0x10000);
                         string patternFormat = GetParam<string>(request.Params, "patternFormat", "auto");
                         long startOffset = GetParam<long>(request.Params, "startOffset", 0);
-                        return _debuggerService.SearchMemory(startAddress, pattern, maxResults, searchSize, patternFormat, startOffset);
+                        string continuation = GetParam<string>(request.Params, "continuation", "");
+                        return _debuggerService.SearchMemory(
+                            startAddress,
+                            pattern,
+                            maxResults,
+                            searchSize,
+                            patternFormat,
+                            startOffset,
+                            continuation);
                     }
 
                 // Debug Context Navigation
