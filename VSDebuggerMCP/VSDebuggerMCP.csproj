@@ -264,6 +264,20 @@
     <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\..\tools\Stamp-Version.ps1&quot; -Target VS" />
   </Target>
 
+  <!-- Stamp-Version rewrites source.extension.vsixmanifest during the build, but the
+       VSSDK manifest chain is incremental against the intermediates it generated in
+       obj\ on the previous build (MergeVsixManifestFile writes the merged manifest,
+       DetokenizeVsixManifestFile detokenizes it to extension.vsixmanifest, and
+       CreateVsixContainer packages from that file). The stamp is therefore never
+       observed and an incremental build ships the previous version in the VSIX.
+       Dropping those intermediates makes the chain regenerate them from the freshly
+       stamped source. -->
+  <Target Name="InvalidateStaleVsixManifest"
+          AfterTargets="StampVersion"
+          Condition="'$(DesignTimeBuild)' != 'true' and (Exists('$(IntermediateMergedVsixManifest)') or Exists('$(IntermediateVsixManifest)'))">
+    <Delete Files="$(IntermediateMergedVsixManifest);$(IntermediateVsixManifest)" />
+  </Target>
+
   <Target Name="BuildManagedInspectionHelper" BeforeTargets="BeforeBuild" Condition="'$(DesignTimeBuild)' != 'true'">
     <MSBuild Projects="$(MSBuildProjectDirectory)\ManagedInspectionHelper\ManagedInspectionHelper.csproj"
              Targets="Build"
