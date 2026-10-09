@@ -65,11 +65,16 @@ def _public_target(target: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
     return payload or None
 
 
-def _error_payload(error: Exception, fallback_code: str = "IDE_BRIDGE_ERROR") -> Dict[str, Any]:
+def _error_payload(
+    error: Exception,
+    fallback_code: str = "IDE_BRIDGE_ERROR",
+    *,
+    outcome_unknown: bool = False,
+) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "code": str(getattr(error, "code", fallback_code) or fallback_code),
         "message": str(error),
-        "outcomeUnknown": bool(getattr(error, "outcome_unknown", False)),
+        "outcomeUnknown": bool(getattr(error, "outcome_unknown", False)) or outcome_unknown,
     }
     request_id = getattr(error, "request_id", None)
     if isinstance(request_id, str) and request_id:
@@ -144,10 +149,13 @@ async def _discover_and_prepare(
     process_ids: List[int],
     method: str,
     params: Dict[str, Any],
+    timeout: float,
 ) -> Tuple[List[Tuple[int, Dict[str, Any], Dict[str, Any]]], Dict[int, Dict[str, Any]]]:
     instances = [
         instance
-        for instance in await ide_bridge.discover_instances(preferred_ide="vs")
+        for instance in await ide_bridge.discover_instances(
+            preferred_ide="vs", timeout=timeout
+        )
         if getattr(instance, "ide", None) == "vs"
     ]
     jobs: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
@@ -285,9 +293,18 @@ async def _dispatch_one(
             # Transport-level failure (closed pipe, reset connection) is scoped
             # to this target. Anything else is a bug and should not be hidden
             # behind a per-target error item.
+            #
+            # A command that failed on the transport may already have been
+            # accepted by Visual Studio, so its outcome is unknown rather than
+            # definitely-not-applied. Reporting False here would tell the caller
+            # it is safe to re-invoke a destructive command.
             return _error_item(
                 process_id,
-                _error_payload(error, "TARGET_DISPATCH_FAILED"),
+                _error_payload(
+                    error,
+                    "TARGET_DISPATCH_FAILED",
+                    outcome_unknown=backend_method_kind(method) == "command",
+                ),
                 target,
             )
 
@@ -311,9 +328,10 @@ async def dispatch_vs_instances(
     `capture_debug_bundle_safe`), not an MCP tool name. Command methods are rejected
     unless `allow_commands=True`; a target whose registration does not grant the
     method's capability reports `PERMISSION_DENIED` instead of being called.
-    `timeout_seconds` budgets the whole call, not each target, so targets that
-    cannot start within it report `DEADLINE_EXCEEDED_NOT_STARTED`. Results remain
-    in `process_ids` order and one failed target does not prevent calls to the
+    `timeout_seconds` budgets the whole call — discovery included — not each
+    target, so targets that cannot start within it report
+    `DEADLINE_EXCEEDED_NOT_STARTED`. Results remain in `process_ids` order and
+    one target's transport or protocol failure does not prevent calls to the
     other authenticated targets.
     """
     method = _validate_backend_method(method)
@@ -332,14 +350,18 @@ async def dispatch_vs_instances(
             f"{method} is a command; set allow_commands=True after confirming every target."
         )
 
+    # The budget covers the whole call, discovery included.
+    deadline = asyncio.get_running_loop().time() + timeout
+    discover_budget = remaining_tool_timeout(deadline, timeout) or timeout
     try:
-        jobs, preflight_failures = await _discover_and_prepare(process_ids, method, params)
+        jobs, preflight_failures = await _discover_and_prepare(
+            process_ids, method, params, discover_budget
+        )
     except ide_bridge.IDEBridgeError as error:
         return handle_ide_error(error, "dispatch_vs_instances", method=method)
     except vs_bridge.VSBridgeError as error:
         return handle_ide_error(error, "dispatch_vs_instances", method=method)
 
-    deadline = asyncio.get_running_loop().time() + timeout
     semaphore = asyncio.Semaphore(min(max_concurrency, len(jobs)))
     dispatched = await asyncio.gather(*(
         _dispatch_one(
@@ -365,7 +387,7 @@ async def dispatch_vs_instances(
         "method": method,
         "methodKind": method_kind,
         "requestedProcessIds": process_ids,
-        "maxConcurrency": min(max_concurrency, len(process_ids)),
+        "maxConcurrency": min(max_concurrency, len(jobs)),
         "timeoutSeconds": timeout,
         "selectionBehavior": "does_not_change_selected_vs",
         "success": failure_count == 0,

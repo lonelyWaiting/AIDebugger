@@ -1973,6 +1973,54 @@ asyncio.run(check())
         self.assertTrue(payload["partial"])
         self.assertEqual(["ok", "error"], [item["status"] for item in payload["results"]])
         self.assertEqual("TARGET_NOT_FOUND", payload["results"][1]["error"]["code"])
+        # The drop-out target never dispatched, so the effective concurrency is
+        # one, not the requested two.
+        self.assertEqual(1, payload["maxConcurrency"])
+
+    def test_multi_vs_dispatch_bounds_discovery_and_flags_unknown_command_outcome(self) -> None:
+        from mcp_server import vs_bridge
+        from mcp_server.tool_modules import multi_vs_tools
+
+        instance = self._ide_instance(101, paused=True)
+        instance._registration_snapshot = {
+            "protocol": "aidb/2",
+            "pipeName": instance.pipe_name,
+            "processId": instance.process_id,
+            "processStartTimeUtcTicks": instance.process_start_time_utc_ticks,
+            "serverInstanceId": instance.server_instance_id,
+            "authToken": "private-101",
+            "capabilities": list(vs_bridge._all_vs_capabilities()),
+        }
+
+        discover = mock.AsyncMock(return_value=[instance])
+        transport = mock.AsyncMock(side_effect=OSError("pipe closed"))
+
+        with mock.patch.object(
+            multi_vs_tools.ide_bridge, "discover_instances", discover
+        ), mock.patch.object(
+            multi_vs_tools.vs_bridge, "call_pipe_exact", transport
+        ):
+            asyncio.run(multi_vs_tools.dispatch_vs_instances(
+                "get_debug_status", [101], timeout_seconds=5,
+            ))
+            # timeout_seconds budgets the whole call, so discovery must be
+            # capped by the remaining budget rather than the bridge default.
+            discover_timeout = discover.await_args.kwargs["timeout"]
+            self.assertGreater(discover_timeout, 0.0)
+            self.assertLessEqual(discover_timeout, 5.0)
+
+            # A command that dies on the transport may already have been
+            # accepted by Visual Studio, so it must not be reported as
+            # definitely-not-applied (that would invite a blind re-invoke).
+            command = asyncio.run(multi_vs_tools.dispatch_vs_instances(
+                "continue", [101], allow_commands=True,
+            ))["result"]
+            self.assertIs(True, command["results"][0]["error"]["outcomeUnknown"])
+
+            query = asyncio.run(multi_vs_tools.dispatch_vs_instances(
+                "get_debug_status", [101],
+            ))["result"]
+            self.assertIs(False, query["results"][0]["error"]["outcomeUnknown"])
 
     def test_multi_vs_dispatch_requires_explicit_command_opt_in(self) -> None:
         from mcp.server.fastmcp.exceptions import ToolError
