@@ -12,6 +12,7 @@ namespace VSDebuggerMCP
                 "__init__.py",
                 "capability_tools.py",
                 "vs_instance_tools.py",
+                "multi_vs_tools.py",
                 "snapshot_tools.py",
                 "native_managed_tools.py",
                 "control_tools.py",

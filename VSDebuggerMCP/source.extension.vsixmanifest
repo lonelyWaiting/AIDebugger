@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
   <Metadata>
-    <Identity Id="VSDebuggerMCP.05f75d2f-40fb-469a-906f-8e2e6cedcf01" Version="2.0.3.7" Language="en-US" Publisher="AIDebugger" />
+    <Identity Id="VSDebuggerMCP.05f75d2f-40fb-469a-906f-8e2e6cedcf01" Version="2.0.3.11" Language="en-US" Publisher="AIDebugger" />
     <DisplayName>AIDebugger</DisplayName>
     <Description xml:space="preserve">AIDebugger Visual Studio Extension - Provides debugger information to Cursor IDE via Named Pipe for AI-assisted debugging. Exposes call stacks, local variables, threads, modules, memory, disassembly, and exception information.</Description>
     <MoreInfo>https://github.com/lonelyWaiting/AIDebugger</MoreInfo>

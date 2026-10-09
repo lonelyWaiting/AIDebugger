@@ -10,7 +10,7 @@
 #>
 param(
     [string]$Version,
-    [ValidateSet("All", "VS", "Rider")]
+    [ValidateSet("All", "VS")]
     [string]$Target = "All",
     [switch]$DryRun
 )
@@ -110,20 +110,6 @@ if ($Target -in @("All", "VS")) {
     }
     if ($updatedAssemblyInfo -ne $assemblyInfo) {
         Write-FileAtomically $assemblyInfoPath $updatedAssemblyInfo
-        $changed = $true
-    }
-}
-
-if ($Target -in @("All", "Rider")) {
-    $gradlePath = Join-Path $repoRoot "RiderDebuggerMCP\gradle.properties"
-    if (-not [System.IO.File]::Exists($gradlePath)) { throw "Required version file is missing: $gradlePath" }
-    $properties = [System.IO.File]::ReadAllText($gradlePath, $utf8NoBom)
-    $updatedProperties = $properties -replace 'pluginVersion=[\d\.]+', "pluginVersion=$Version"
-    if ($updatedProperties -eq $properties -and $properties -notmatch "pluginVersion=$([Regex]::Escape($Version))") {
-        throw "Rider pluginVersion field was not found"
-    }
-    if ($updatedProperties -ne $properties) {
-        Write-FileAtomically $gradlePath $updatedProperties
         $changed = $true
     }
 }

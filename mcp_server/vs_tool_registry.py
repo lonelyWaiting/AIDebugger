@@ -1,7 +1,7 @@
-"""Static Visual Studio-only MCP catalog.
+"""Static Visual Studio MCP catalog.
 
-The dedicated VS entrypoint must not import the combined VS/Rider registry merely
-to decide which tools exist.  This catalog describes only its own public surface.
+The entrypoint must not import a broader registry merely to decide which tools
+exist.  This catalog describes only its own public surface.
 """
 
 import json
@@ -32,6 +32,7 @@ VS_TOOL_DOMAINS: Dict[str, List[str]] = {
     "capability": ["debug_capabilities"],
     "instance": [
         "list_vs_instances", "detect_debug_sessions", "select_vs_instance", "clear_vs_selection",
+        "dispatch_vs_instances",
     ],
     "snapshot": [
         "get_debug_status", "get_callstack", "get_call_stack", "get_locals",
@@ -202,6 +203,10 @@ def interrupt_pipe_methods() -> frozenset[str]:
 
 def _backend_methods(tool: str, methods: Dict[str, object]) -> List[str]:
     canonical = LEGACY_ALIASES.get(tool, tool)
+    if canonical == "dispatch_vs_instances":
+        # The selected backend method is an explicit tool parameter. The MCP
+        # annotation and catalog must therefore conservatively cover all methods.
+        return list(methods)
     conditional_route = _PARAMETER_CONDITIONAL_ROUTES.get(canonical)
     if conditional_route:
         return list(dict.fromkeys(

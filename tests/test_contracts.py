@@ -3,26 +3,26 @@ import ast
 import importlib.util
 import os
 import pathlib
-import re
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
-import uuid
 import xml.etree.ElementTree as ET
-from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
+# The VS-only server surface: the FastMCP app plus every tool module that
+# ``tool_modules.register_vs()`` imports.  ``read("mcp_server/vs_server.py")``
+# concatenates these so tool-source assertions keep seeing the whole surface.
 MCP_SERVER_SOURCE_FILES = [
-    "mcp_server/server.py",
-    "mcp_server/mcp_app.py",
+    "mcp_server/vs_mcp_app.py",
     "mcp_server/tool_context.py",
-    "mcp_server/tool_registry.py",
+    "mcp_server/vs_tool_registry.py",
     "mcp_server/tool_modules/capability_tools.py",
-    "mcp_server/tool_modules/instance_tools.py",
+    "mcp_server/tool_modules/vs_instance_tools.py",
+    "mcp_server/tool_modules/multi_vs_tools.py",
     "mcp_server/tool_modules/snapshot_tools.py",
     "mcp_server/tool_modules/native_managed_tools.py",
     "mcp_server/tool_modules/control_tools.py",
@@ -42,7 +42,7 @@ def find_msbuild() -> pathlib.Path | None:
 
 
 def read(path: str) -> str:
-    if path == "mcp_server/server.py":
+    if path == "mcp_server/vs_server.py":
         return "\n".join((ROOT / source_path).read_text(encoding="utf-8") for source_path in MCP_SERVER_SOURCE_FILES)
     if path == "VSDebuggerMCP/DebuggerService.cs":
         sources = [ROOT / path]
@@ -78,8 +78,8 @@ def csharp_slice(source: str, start_marker: str, end_marker: str) -> str:
 
 
 def load_tool_registry():
-    module_path = ROOT / "mcp_server/tool_registry.py"
-    spec = importlib.util.spec_from_file_location("aidb_tool_registry_for_tests", module_path)
+    module_path = ROOT / "mcp_server/vs_tool_registry.py"
+    spec = importlib.util.spec_from_file_location("aidb_vs_tool_registry_for_tests", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module
@@ -120,10 +120,8 @@ def discover_mcp_tool_names() -> list[str]:
             for decorator in node.decorator_list:
                 if not (
                     isinstance(decorator, ast.Call)
-                    and (
-                        (isinstance(decorator.func, ast.Attribute) and decorator.func.attr == "tool")
-                        or (isinstance(decorator.func, ast.Name) and decorator.func.id == "_combined_only_tool")
-                    )
+                    and isinstance(decorator.func, ast.Attribute)
+                    and decorator.func.attr == "tool"
                 ):
                     continue
                 tool_name = node.name
@@ -132,15 +130,6 @@ def discover_mcp_tool_names() -> list[str]:
                         tool_name = keyword.value.value
                 names.append(tool_name)
     return names
-
-
-def discover_rider_dispatch_methods(source: str, coordinator_source: str = "") -> set[str]:
-    start = source.index("return when (method) {")
-    end = source.index("else -> throw UnsupportedOperationException", start)
-    dispatch_table = source[start:end]
-    methods = set(re.findall(r'"([^"]+)"\s*->', dispatch_table))
-    methods.update(re.findall(r'descriptor\.name\s*==\s*"([^"]+)"', coordinator_source))
-    return methods
 
 
 def expected_packaged_mcp_files() -> list[str]:
@@ -155,13 +144,6 @@ def expected_packaged_mcp_files() -> list[str]:
         if path.suffix == ".py" or path.name in {"requirements.txt", "debug_method_manifest.json"}:
             files.append(path.relative_to(mcp_root).as_posix())
     return sorted(files)
-
-
-def rider_base_files(source: str) -> list[str]:
-    match = re.search(r"private\s+val\s+baseFiles\s*=\s*listOf\((.*?)\n\s*\)", source, re.S)
-    if match is None:
-        raise AssertionError("Rider baseFiles list not found")
-    return sorted(re.findall(r'"([^"]+)"', match.group(1)))
 
 
 def vsix_content_items() -> dict[str, dict[str, str]]:
@@ -193,7 +175,7 @@ print(json.dumps({
 }))
 """
         environment = dict(os.environ)
-        environment.update({"AIDB_SERVER_SCOPE": "vs", "AIDB_PREFERRED_IDE": "vs"})
+        environment.update({"AIDB_PREFERRED_IDE": "vs"})
         completed = subprocess.run(
             [sys.executable, "-c", script],
             cwd=ROOT,
@@ -211,12 +193,7 @@ print(json.dumps({
 
     def test_memory_contract_fields_present(self) -> None:
         vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
-        rider_models = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/protocol/DebugModels.kt")
         vs_memory = csharp_slice(vs_models, "public class MemorySearchResult", "    #endregion")
-        rider_memory = rider_models[
-            rider_models.index("data class MemorySearchResult("):
-            rider_models.index("data class OutputWindowResult(", rider_models.index("data class MemorySearchResult("))
-        ]
 
         required_fields = [
             "status",
@@ -228,11 +205,9 @@ print(json.dumps({
         ]
         for field in required_fields:
             self.assertIn(field, vs_memory)
-            self.assertIn(field, rider_memory)
 
         for general_memory_field in ("requestedSize", "bytesRead"):
             self.assertIn(general_memory_field, vs_models)
-            self.assertIn(general_memory_field, rider_models)
 
     def test_memory_search_continuation_fields_do_not_leak_to_threads(self) -> None:
         vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
@@ -243,23 +218,18 @@ print(json.dumps({
 
     def test_snapshot_contract_fields_present(self) -> None:
         vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
-        rider_models = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/protocol/DebugModels.kt")
 
         for field in ("snapshotStable", "snapshotAttempts", "snapshotStatus"):
             self.assertIn(field, vs_models)
-            self.assertIn(field, rider_models)
 
     def test_capability_and_behavior_fields_present(self) -> None:
         vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
-        rider_models = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/protocol/DebugModels.kt")
 
         for field in ("capability", "availableCategories", "behavior"):
             self.assertIn(field, vs_models)
-            self.assertIn(field, rider_models)
 
     def test_p0_bundle_and_stop_reason_contract_fields_present(self) -> None:
         vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
-        rider_models = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/protocol/DebugModels.kt")
 
         for field in (
             "stopReason",
@@ -272,11 +242,9 @@ print(json.dumps({
             "omittedComponents",
         ):
             self.assertIn(field, vs_models)
-            self.assertIn(field, rider_models)
 
     def test_continue_and_wait_contract_fields_present(self) -> None:
         vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
-        rider_models = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/protocol/DebugModels.kt")
 
         for field in (
             "ContinueAndWaitResult",
@@ -289,7 +257,6 @@ print(json.dumps({
             "bundle",
         ):
             self.assertIn(field, vs_models)
-            self.assertIn(field, rider_models)
 
     def test_debug_response_knows_continue_and_wait_result(self) -> None:
         vs_response = read("VSDebuggerMCP/Protocol/DebugResponse.cs")
@@ -297,27 +264,19 @@ print(json.dumps({
 
     def test_named_pipe_bridge_uses_io_timeout(self) -> None:
         vs_bridge = read("mcp_server/vs_bridge.py")
-        rider_bridge = read("mcp_server/rider_bridge.py")
 
-        for bridge_code in (vs_bridge, rider_bridge):
-            self.assertIn("remaining_timeout_ms", bridge_code)
-            self.assertIn("WaitNamedPipeW", bridge_code)
-            self.assertIn("PeekNamedPipe", bridge_code)
-            self.assertIn("_compute_timeouts", bridge_code)
-            self.assertIn("ThreadPoolExecutor", bridge_code)
-            self.assertIn("run_in_executor", bridge_code)
-            self.assertIn("FILE_FLAG_OVERLAPPED", bridge_code)
-            self.assertIn("CancelIoEx", bridge_code)
-            self.assertIn("GetOverlappedResult", bridge_code)
-
-    def test_rider_registration_guards_present(self) -> None:
-        rider_registration = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/McpClientRegistration.kt")
-        self.assertIn("isPythonAvailable()", rider_registration)
-        self.assertIn("computeBundleSignature", rider_registration)
-        self.assertIn(".bundle-signature", rider_registration)
-        self.assertIn("capture_debug_bundle", rider_registration)
-        self.assertIn("evaluate_expressions_batch", rider_registration)
-        self.assertIn("cursor_allowlist_sync.py", rider_registration)
+        for marker in (
+            "remaining_timeout_ms",
+            "WaitNamedPipeW",
+            "PeekNamedPipe",
+            "_compute_timeouts",
+            "ThreadPoolExecutor",
+            "run_in_executor",
+            "FILE_FLAG_OVERLAPPED",
+            "CancelIoEx",
+            "GetOverlappedResult",
+        ):
+            self.assertIn(marker, vs_bridge)
 
     def test_vs_registration_instructions_include_snapshot_workflow(self) -> None:
         vs_registration = read("VSDebuggerMCP/McpClientRegistration.cs")
@@ -341,218 +300,33 @@ print(json.dumps({
 
     def test_named_pipe_security_is_unconditionally_owner_only(self) -> None:
         vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
-        rider_pipe = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/NamedPipeServer.kt")
         self.assertNotIn("WorldSid", vs_pipe)
         self.assertNotIn("AIDB_PIPE_SECURITY", vs_pipe)
-        self.assertNotIn("AIDB_PIPE_SECURITY", rider_pipe)
-        self.assertNotIn(";;;WD", rider_pipe)
-        self.assertIn("current-user owner only", rider_pipe)
-        self.assertIn("RiderInstanceRegistration", rider_pipe)
-        self.assertIn("GetNamedPipeClientProcessId", rider_pipe)
-        self.assertIn("RiderMethodCatalog.catalogHash", rider_pipe)
         self.assertIn("WaitForConnectionAsync", vs_pipe)
         self.assertIn("cancellationToken.Register", vs_pipe)
 
-    def test_rider_uses_authenticated_aidb2_actor_and_command_recovery(self) -> None:
-        rider_pipe = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/NamedPipeServer.kt")
-        rider_registration = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/RiderInstanceRegistration.kt")
-        rider_coordinator = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/RiderRequestCoordinator.kt")
-        rider_catalog = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/protocol/RiderMethodCatalog.kt")
-        rider_bridge = read("mcp_server/rider_bridge.py")
-        rider_trust = read("mcp_server/rider_trust.py")
+    def test_vs_command_recovery_target_is_exact(self) -> None:
         control_tools = read("mcp_server/tool_modules/control_tools.py")
-
-        for token in (
-            "ByteOrder.BIG_ENDIAN", "decodeStrictUtf8", "validateStrictJson",
-            "GetNamedPipeClientProcessId", "clientProcessStartTimeUtcTicks",
-            "serverInstanceId", "isAcceptedUuid7", "RiderRequestCoordinator",
-        ):
-            self.assertIn(token, rider_pipe)
-        self.assertIn("ArrayBlockingQueue(MAX_CONNECTIONS)", rider_pipe)
-        self.assertNotIn("newCachedThreadPool", rider_pipe)
-        self.assertIn('const val protocol = "aidb/2"', rider_catalog)
-        self.assertIn('MessageDigest.getInstance("SHA-256")', rider_catalog)
-        catalog_methods = set(re.findall(r'"([a-z_]+)"', rider_catalog[rider_catalog.index("supportedMethods"):rider_catalog.index("private val manifestBytes")]))
-        service_methods = discover_rider_dispatch_methods(
-            read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt"),
-            rider_coordinator,
-        )
-        self.assertEqual(service_methods, catalog_methods)
-        self.assertIn("SecureRandom", rider_registration)
-        self.assertIn("PROTECTED_DACL_SECURITY_INFORMATION", rider_registration)
-        self.assertIn("writeAtomicallyOwnerOnly", rider_registration)
-        self.assertIn("GetProcessTimes", rider_registration)
-        self.assertNotIn("ProcessHandle.current().info().startInstant()", rider_registration)
-        self.assertNotIn("ProcessHandle.of(actualClientProcessId.toLong())", rider_pipe)
-
-        self.assertIn("ArrayBlockingQueue(QUEUE_CAPACITY)", rider_coordinator)
-        self.assertIn("COMMAND_ACCEPTANCE_WINDOW_MS", rider_coordinator)
-        self.assertIn("MAX_RETAINED_COMMAND_RESPONSE_BYTES", rider_coordinator)
-        self.assertIn("actor.remove(cancelledTask)", rider_coordinator)
-        self.assertIn("validateTargetIdentity", rider_coordinator)
-        self.assertIn('"OUTCOME_UNKNOWN"', rider_coordinator)
-        self.assertIn('descriptor.name == "get_request_status"', rider_coordinator)
-        self.assertIn('descriptor.name == "get_dispatcher_health"', rider_coordinator)
-        self.assertIn("request ID was already used", rider_coordinator)
-
-        self.assertIn('struct.pack(">I", len(payload))', rider_bridge)
-        self.assertIn("object_pairs_hook=_strict_json_object", rider_bridge)
-        self.assertIn("GetNamedPipeServerProcessId", rider_bridge)
-        self.assertIn("outcome_unknown=is_command and write_started", rider_bridge)
-        self.assertIn("_load_rider_registration", rider_bridge)
-        self.assertIn("async def call_pipe_exact", rider_bridge)
-        self.assertIn("debugSessionGeneration", rider_bridge)
-        self.assertNotIn("from .vs_trust", rider_bridge)
-        self.assertNotIn("from vs_trust", rider_bridge)
-        self.assertIn("SE_DACL_PROTECTED", rider_trust)
-        self.assertIn("_validate_same_user_process", rider_trust)
+        vs_bridge = read("mcp_server/vs_bridge.py")
 
         self.assertIn("_call_recovery_target", control_tools)
-        self.assertIn('target["ide"] == "rider"', control_tools)
-        self.assertIn("call_rider_exact", control_tools)
-        self.assertNotIn('"get_request_status", {"requestId": request_id}, timeout=10.0, preferred_ide="vs"', control_tools)
-
-        rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
-        self.assertIn("requestClientLane", rider_service)
-        self.assertIn("clientSelections", rider_service)
-        self.assertIn("captureDebugIdentity", rider_service)
-        self.assertNotIn("private var selectedThreadId", rider_service)
-        self.assertNotIn("private var selectedFrameIndex", rider_service)
-
-    def test_rider_request_ids_are_canonical_uuid7(self) -> None:
-        import mcp_server.rider_bridge as rider_bridge
-
-        values = [rider_bridge._new_request_id() for _ in range(128)]
-        self.assertEqual(values, sorted(values))
-        self.assertEqual(len(values), len(set(values)))
-        for value in values:
-            parsed = uuid.UUID(value)
-            self.assertEqual(7, parsed.version)
-            self.assertEqual(uuid.RFC_4122, parsed.variant)
-
-    def test_rider_registration_rejects_unsafe_path_with_typed_error(self) -> None:
-        import mcp_server.rider_trust as rider_trust
-
-        expected = rider_trust.RiderBridgeError("unsafe registration", code="INVALID_TARGET")
-        with mock.patch.object(rider_trust, "_validate_registration_security", side_effect=expected):
-            with self.assertRaises(rider_trust.RiderBridgeError) as raised:
-                rider_trust._load_rider_registration("AIDebuggerRider_123")
-        self.assertIs(expected, raised.exception)
-
-    def test_rider_pinned_capability_snapshot_cannot_drift(self) -> None:
-        import mcp_server.rider_bridge as rider_bridge
-
-        registration = {
-            "protocol": "aidb/2",
-            "pipeName": "AIDebuggerRider_123",
-            "processId": 123,
-            "processStartTimeUtcTicks": 1,
-            "serverInstanceId": "server",
-            "protocolCatalogHash": "hash",
-            "authToken": "token",
-            "capabilities": ["debug.read"],
-        }
-        changed = dict(registration, capabilities=["debug.read", "debug.execution.control"])
-        with mock.patch.object(rider_bridge, "_load_rider_registration", return_value=changed):
-            with self.assertRaises(rider_bridge.RiderBridgeError) as raised:
-                rider_bridge._bind_registration(registration["pipeName"], registration)
-        self.assertEqual("STALE_TARGET", raised.exception.code)
-
-    def test_rider_registration_snapshot_preserves_debugger_identity(self) -> None:
-        import mcp_server.rider_bridge as rider_bridge
-
-        registration = {
-            "protocol": "aidb/2",
-            "pipeName": "AIDebuggerRider_123",
-            "processId": 123,
-            "processStartTimeUtcTicks": 638000000000000000,
-            "serverInstanceId": "a" * 32,
-            "protocolCatalogHash": "b" * 64,
-            "authToken": "c" * 64,
-            "capabilities": ["debug.read"],
-            "debugSessionGeneration": 4,
-            "breakSequence": 5,
-            "contextEpoch": 6,
-            "identityKnown": True,
-        }
-        copied = rider_bridge._copy_registration(registration)
-        self.assertEqual(4, copied["debugSessionGeneration"])
-        self.assertEqual(5, copied["breakSequence"])
-        self.assertEqual(6, copied["contextEpoch"])
-        self.assertTrue(copied["identityKnown"])
-
-    def test_rider_stale_selection_is_transactional(self) -> None:
-        import mcp_server.rider_bridge as rider_bridge
-
-        previous = {
-            "protocol": "aidb/2",
-            "pipeName": "AIDebuggerRider_100",
-            "processId": 100,
-            "processStartTimeUtcTicks": 1000,
-            "serverInstanceId": "a" * 32,
-            "protocolCatalogHash": "b" * 64,
-            "authToken": "c" * 64,
-            "capabilities": ["debug.read"],
-        }
-        candidate = dict(
-            previous,
-            pipeName="AIDebuggerRider_200",
-            processId=200,
-            processStartTimeUtcTicks=2000,
-            serverInstanceId="d" * 32,
+        self.assertIn("_build_recovery_target", control_tools)
+        self.assertIn('"ide": "vs"', control_tools)
+        self.assertIn('pipe_name != f"AIDebuggerVS_{process_id}"', control_tools)
+        self.assertIn(
+            "Exact recovery requires all target identity fields from the original error",
+            control_tools,
         )
-        stale_target = {
-            "pipeName": candidate["pipeName"],
-            "processId": candidate["processId"],
-            "processStartTimeUtcTicks": 1999,
-            "serverInstanceId": candidate["serverInstanceId"],
-        }
-        bridge = rider_bridge.RiderBridge()
-        bridge._selected_pipe = previous["pipeName"]
-        bridge._selected_registration = rider_bridge._copy_registration(previous)
-        try:
-            with mock.patch.object(rider_bridge, "_load_rider_registration", return_value=candidate):
-                with self.assertRaises(rider_bridge.RiderBridgeError) as raised:
-                    bridge.select_instance(
-                        pipe_name=candidate["pipeName"],
-                        registration_snapshot=candidate,
-                        target_identity=stale_target,
-                    )
-            self.assertEqual("STALE_TARGET", raised.exception.code)
-            self.assertEqual(previous["pipeName"], bridge._selected_pipe)
-            self.assertEqual(1000, bridge._selected_registration["processStartTimeUtcTicks"])
-        finally:
-            bridge._executor.shutdown(wait=False, cancel_futures=True)
-
-    def test_rider_exact_recovery_rejects_reused_process_identity(self) -> None:
-        import asyncio
-        import mcp_server.rider_bridge as rider_bridge
-
-        target = {
-            "pipeName": "AIDebuggerRider_123",
-            "processId": 123,
-            "processStartTimeUtcTicks": 638000000000000000,
-            "serverInstanceId": "a" * 32,
-        }
-        changed = {
-            "protocol": "aidb/2",
-            **target,
-            "processStartTimeUtcTicks": target["processStartTimeUtcTicks"] + 1,
-            "protocolCatalogHash": "b" * 64,
-            "authToken": "c" * 64,
-            "capabilities": ["server.control"],
-        }
-        with mock.patch.object(rider_bridge, "_load_rider_registration", return_value=changed):
-            with self.assertRaises(rider_bridge.RiderBridgeError) as raised:
-                asyncio.run(rider_bridge.call_pipe_exact(
-                    target,
-                    "get_request_status",
-                    {"requestId": str(uuid.uuid4())},
-                ))
-        self.assertEqual("STALE_TARGET", raised.exception.code)
+        self.assertIn(
+            'exact_target = {key: value for key, value in target.items() if key != "ide"}',
+            control_tools,
+        )
+        self.assertIn("vs_bridge.call_pipe_exact(exact_target", control_tools)
+        self.assertNotIn('target["ide"] == "rider"', control_tools)
+        self.assertIn("async def call_pipe_exact", vs_bridge)
 
     def test_server_exposes_p0_tools(self) -> None:
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
         for tool_name in (
             "capture_debug_bundle",
             "crash_triage",
@@ -563,7 +337,7 @@ print(json.dumps({
             self.assertIn(f"@mcp.tool()\nasync def {tool_name}", server_py)
 
     def test_server_exposes_active_debugging_tools_and_aliases(self) -> None:
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
 
         for tool_name in (
             "debug_capabilities",
@@ -602,9 +376,8 @@ print(json.dumps({
         self.assertNotIn("ide_bridge.call", watchpoint_alias)
 
     def test_stop_and_detach_discovery_terms_are_indexed(self) -> None:
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
         vs_registration = read("VSDebuggerMCP/McpClientRegistration.cs")
-        rider_registration = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/McpClientRegistration.kt")
 
         for keyword in (
             "Use this before concluding a debugger capability is missing",
@@ -615,7 +388,6 @@ print(json.dumps({
             "debug_control(action='stop')",
             "detach_process",
             "detach_debugger",
-            "Rider is not exposed as a supported detach backend",
         ):
             self.assertIn(keyword, server_py)
 
@@ -623,9 +395,6 @@ print(json.dumps({
         self.assertIn("debug_stop", vs_registration)
         self.assertNotIn("stop_debugging", vs_registration)
         self.assertIn('debug_control(action=', vs_registration)
-        self.assertIn("stop debugging", rider_registration)
-        self.assertIn("stop_debugging", rider_registration)
-        self.assertIn('debug_control(action=', rider_registration)
 
     def test_vs_active_debugging_protocol_is_routed(self) -> None:
         vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
@@ -671,7 +440,7 @@ print(json.dumps({
         self.assertIn("KnownType(typeof(DebugProcessesResult))", vs_response)
 
     def test_no_source_native_tools_are_exposed_without_patch_surface(self) -> None:
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
         capability_tools = read("mcp_server/tool_modules/capability_tools.py")
 
         for tool_name in (
@@ -687,7 +456,7 @@ print(json.dumps({
         self.assertIn("module+RVA", capability_tools)
         self.assertIn("No write-memory or patching tool is exposed", capability_tools)
         self.assertIn("Visual Studio only", capability_tools)
-        self.assertIn("Rider support is explicitly missing", capability_tools)
+        self.assertIn("require the Visual Studio backend", capability_tools)
         self.assertIn("NATIVE_CONTEXT_TIMEOUT_SECONDS = 45.0", server_py)
         self.assertIn("timeout=float(timeout_seconds + NATIVE_CONTEXT_TIMEOUT_SECONDS)", function_source(server_py, "continue_and_capture_native"))
         for tool_name in (
@@ -1023,14 +792,12 @@ print(json.dumps({
         models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
         router = read("VSDebuggerMCP/Ipc/NamedPipeMethodRouter.cs")
         vs_bridge_py = read("mcp_server/vs_bridge.py")
-        ide_bridge_py = read("mcp_server/ide_bridge.py")
         capability_module = read("mcp_server/tool_modules/capability_tools.py")
-        capabilities = function_source(read("mcp_server/server.py"), "debug_capabilities")
+        capabilities = function_source(read("mcp_server/vs_server.py"), "debug_capabilities")
 
         for marker in ("allowedCapabilities", "accessMode"):
             self.assertIn(marker, models)
             self.assertIn(marker, vs_bridge_py)
-            self.assertIn(marker, ide_bridge_py)
         self.assertIn("_allowedCapabilities.SetEquals", router)
         self.assertIn("instanceAccess", capabilities)
         self.assertIn("effectiveInstance", capabilities)
@@ -1087,7 +854,7 @@ print(json.dumps({
 
     def test_vs_native_context_is_snapshot_oriented_and_read_only(self) -> None:
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
         capability_tools = read("mcp_server/tool_modules/capability_tools.py")
 
         native_context = csharp_slice(vs_service, "public NativeContextResult CaptureNativeContext", "        public NativeContinueResult ContinueAndCaptureNative")
@@ -1113,7 +880,7 @@ print(json.dumps({
         self.assertIn('"includeModules": include_modules', function_source(server_py, "continue_and_capture_native"))
 
     def test_no_source_managed_and_hybrid_tools_are_exposed(self) -> None:
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
         capability_tools = read("mcp_server/tool_modules/capability_tools.py")
         vs_registration = read("VSDebuggerMCP/McpClientRegistration.cs")
 
@@ -1440,7 +1207,7 @@ print(json.dumps({
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
         native_service = read("VSDebuggerMCP/Services/DebuggerService.Native.cs")
         breakpoint_service = read("VSDebuggerMCP/Services/DebuggerService.Breakpoints.cs")
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
 
         hybrid = csharp_slice(native_service, "public HybridContextResult CaptureHybridContext", "        public BreakpointsResult GetBreakpointBindings")
         for marker in (
@@ -1531,7 +1298,7 @@ print(json.dumps({
     def test_breakpoint_binding_verification_surfaces_optimized_or_unbound_locations(self) -> None:
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
         vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
 
         for field in (
             "bindingVerificationStatus",
@@ -1573,12 +1340,6 @@ print(json.dumps({
         self.assertIn("ApplyBreakpointOperationVerification(result, breakpointInfo, debugger, requireBoundInActiveSession: true)", set_breakpoint)
         self.assertIn("breakpoint_binding_verification", function_source(server_py, "debug_capabilities"))
 
-    def test_rider_detach_is_explicitly_unsupported(self) -> None:
-        rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
-
-        self.assertIn('"detach" -> debugDetach()', rider_service)
-        self.assertIn("Detach is not supported by the Rider MCP bridge", rider_service)
-
     def test_vs_registration_instructions_include_active_debugging_workflow(self) -> None:
         vs_registration = read("VSDebuggerMCP/McpClientRegistration.cs")
 
@@ -1597,9 +1358,8 @@ print(json.dumps({
             self.assertIn(keyword, vs_registration)
 
     def test_heavy_debug_tools_have_explicit_timeouts(self) -> None:
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
-        rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
 
         self.assertIn("BATCH_EVALUATION_TIMEOUT_SECONDS", server_py)
         self.assertIn("EVALUATION_TIMEOUT_SECONDS", server_py)
@@ -1635,9 +1395,6 @@ print(json.dumps({
         self.assertNotIn("allowSideEffects", vs_service)
         self.assertIn("GetExpression(expression, false, ExpressionEvaluationTimeoutMs)", vs_service)
         self.assertIn("budget.IsIncomplete", vs_service)
-        self.assertIn("variableExpansionBudgetMs", rider_service)
-        self.assertIn("allowSideEffects", rider_service)
-        self.assertIn("Expansion truncated", rider_service)
 
     def test_bootstrap_requires_manifest_pinned_offline_wheels(self) -> None:
         bootstrap_py = read("mcp_server/bootstrap.py")
@@ -1723,12 +1480,10 @@ print(json.dumps({
             self.assertFalse(bootstrap._target_marker_matches(repair_dirs[0], stamp))
 
     def test_thread_enumeration_is_budgeted(self) -> None:
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
         vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
-        rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
         vs_models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
-        rider_models = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/protocol/DebugModels.kt")
 
         self.assertIn("timeout_seconds: Optional[float] = None", function_source(server_py, "get_threads"))
         self.assertIn("max_frames_per_thread: Optional[int] = None", function_source(server_py, "get_threads"))
@@ -1760,25 +1515,13 @@ print(json.dumps({
         self.assertIn("AddPartialReason(partialReasons", vs_service)
         self.assertIn("DetermineThreadsSnapshotStatus", vs_service)
 
-        self.assertIn('val includeFrames = getParam(request.params, "includeFrames", true)', rider_service)
-        self.assertIn("normalizeThreadFrameLimit", rider_service)
-        self.assertIn("normalizeThreadNodeLimit", rider_service)
-        self.assertIn("normalizeThreadBudgetMs", rider_service)
-        self.assertIn("budgetMs < 0 -> threadEnumerationBudgetMs", rider_service)
-        self.assertIn("budgetMs == 0 -> 115000L", rider_service)
-        self.assertIn("collectStackFramesWithStatus", rider_service)
-        self.assertIn("budget.remainingMs()", rider_service)
-        self.assertIn("determineThreadsSnapshotStatus", rider_service)
-
-        for models in (vs_models, rider_models):
-            self.assertIn("partial", models)
-            self.assertIn("error", models)
+        self.assertIn("partial", vs_models)
+        self.assertIn("error", vs_models)
 
     def test_thread_budget_flows_through_bundle_and_full_context(self) -> None:
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
         vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
-        rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
 
         for body_name in ("get_full_context", "capture_debug_bundle", "continue_and_wait_for_break"):
             body = function_source(server_py, body_name)
@@ -1798,7 +1541,6 @@ print(json.dumps({
             '"threadBudgetMs"',
         ):
             self.assertIn(field, vs_pipe)
-            self.assertIn(field, rider_service)
 
         self.assertIn("public FullContextResult GetFullContext(", vs_service)
         self.assertIn("public DebugBundleResult CaptureDebugBundle(", vs_service)
@@ -1808,15 +1550,8 @@ print(json.dumps({
         self.assertIn("threadMaxNodes", vs_service)
         self.assertIn("threadBudgetMs", vs_service)
 
-        self.assertIn("private fun getFullContext(", rider_service)
-        self.assertIn("private fun captureDebugBundle(", rider_service)
-        self.assertIn("private fun continueAndWaitForBreak(", rider_service)
-        self.assertIn("threadMaxFramesPerThread", rider_service)
-        self.assertIn("threadMaxNodes", rider_service)
-        self.assertIn("threadBudgetMs", rider_service)
-
     def test_composite_tools_use_end_to_end_timeout_budget(self) -> None:
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
         crash_triage = function_source(server_py, "crash_triage")
         step_and_capture = function_source(server_py, "step_and_capture")
 
@@ -1836,15 +1571,11 @@ print(json.dumps({
 
     def test_empty_thread_snapshot_is_not_reported_ok(self) -> None:
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
-        rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
 
         self.assertIn('return threads.Threads.Count > 0 ? "ok" : "unavailable";', vs_service)
-        self.assertIn('return if (threads.threads.isNotEmpty()) "ok" else "unavailable"', rider_service)
         self.assertIn('result.Threads.Count > 0 ? "best_effort" : "unavailable"', vs_service)
         self.assertIn("bundle.Threads = RetainBundleComponent(", vs_service)
-        self.assertIn("it.snapshotStatus = determineThreadsSnapshotStatus(it, true)", rider_service)
         self.assertIn('new ThreadSnapshotHeader { Error = "Current debug program unavailable" }', vs_service)
-        self.assertIn('result.error = "No execution stacks available"', rider_service)
 
     def test_vs_locals_uses_explicit_non_ui_frame_context(self) -> None:
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
@@ -1868,7 +1599,7 @@ print(json.dumps({
         router = read("VSDebuggerMCP/Ipc/NamedPipeMethodRouter.cs")
         schema = read("VSDebuggerMCP/Ipc/DebugRequestSchemaValidator.cs")
         catalog = read("VSDebuggerMCP/Protocol/DebugMethodCatalog.cs")
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
         models = read("VSDebuggerMCP/Protocol/DebugModels.cs")
 
         self.assertNotIn("foreach (EnvDTE.Breakpoint", vs_service)
@@ -1976,7 +1707,7 @@ print(json.dumps({
         self.assertIn("SymbolPath = ReadMinidumpCodeViewPdbPath", vs_service)
 
     def test_start_debugging_uses_control_timeout(self) -> None:
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
 
         start_debugging = function_source(server_py, "start_debugging")
@@ -2021,147 +1752,126 @@ print(json.dumps({
         self.assertNotIn('<Reference Include="UIAutomationClient" />', vs_project)
         self.assertNotIn('<Reference Include="UIAutomationTypes" />', vs_project)
 
-    def test_ide_bridge_preserves_stale_immutable_selection(self) -> None:
-        bridge = read("mcp_server/ide_bridge.py")
+    def test_combined_and_rider_surfaces_no_longer_exist(self) -> None:
+        for relative in (
+            "mcp_server/ide_bridge.py",
+            "mcp_server/server.py",
+            "mcp_server/mcp_app.py",
+            "mcp_server/tool_registry.py",
+            "mcp_server/rider_bridge.py",
+            "mcp_server/rider_trust.py",
+            "mcp_server/rider_errors.py",
+            "mcp_server/tool_modules/instance_tools.py",
+            "RiderBuild.csproj",
+            "RiderBuildDummy.cs",
+            "docs/DeepReview-VS-Rider-Alignment.md",
+        ):
+            with self.subTest(relative=relative):
+                self.assertFalse((ROOT / relative).exists(), relative)
+        self.assertFalse((ROOT / "RiderDebuggerMCP").exists())
 
-        self.assertIn("_is_stale_selected_instance_error", bridge)
-        self.assertIn("selected_pipe = self._selected_pipe", bridge)
-        self.assertIn("selected_target = dict(self._selected_target)", bridge)
-        self.assertIn("selected_registration = (", bridge)
-        self.assertIn("vs_bridge.call_pipe_exact(", bridge)
-        self.assertIn("self._call_vs_exact_and_advance(", bridge)
-        self.assertIn("selected_registration,", bridge)
-        selected_vs_branch = bridge[
-            bridge.index('if selected_ide == "vs":'):
-            bridge.index('elif selected_ide == "rider":')
-        ]
-        self.assertNotIn("clear_selection()", selected_vs_branch)
-        self.assertIn("access denied", bridge)
-        non_stale_start = bridge.index("non_stale_markers = (")
-        stale_start = bridge.index("stale_markers = (", non_stale_start + len("non_stale_markers = ("))
-        self.assertIn("return False", bridge[non_stale_start:stale_start])
-        self.assertNotIn('"not found"', bridge[bridge.index("stale_markers = ("):bridge.index("return any(marker", bridge.index("stale_markers = ("))])
-        self.assertNotIn('"named pipe"', bridge[bridge.index("stale_markers = ("):bridge.index("return any(marker", bridge.index("stale_markers = ("))])
-        self.assertIn("broken pipe", bridge)
-        self.assertIn("empty response received from pipe", bridge)
+    def test_vs_bridge_preserves_stale_immutable_selection(self) -> None:
+        vs_bridge_py = read("mcp_server/vs_bridge.py")
+        multi_vs_tools = read("mcp_server/tool_modules/multi_vs_tools.py")
+
+        self.assertIn("_bind_registration_snapshot(", vs_bridge_py)
+        self.assertIn('code="STALE_TARGET"', vs_bridge_py)
+        self.assertIn("async def _advance_selected_target(", vs_bridge_py)
+        self.assertIn("if response_epoch >= current_epoch", vs_bridge_py)
+        self.assertIn("error.original_target_identity = dict(target)", vs_bridge_py)
+        self.assertIn("error.current_target_identity = dict(response_target)", vs_bridge_py)
+        self.assertIn("advance_selection: bool = True", vs_bridge_py)
+        # Multi-target dispatch must never redirect the pinned single-instance target.
+        self.assertIn("advance_selection=False", multi_vs_tools)
 
     def test_bridge_does_not_hold_selection_lock_across_calls(self) -> None:
-        ide_bridge_py = read("mcp_server/ide_bridge.py")
         vs_bridge_py = read("mcp_server/vs_bridge.py")
-        rider_bridge_py = read("mcp_server/rider_bridge.py")
-
-        self.assertIn("selected_ide = self._selected_ide", ide_bridge_py)
-        self.assertIn("selected_pipe = self._selected_pipe", ide_bridge_py)
-        self.assertIn("selected_target = dict(self._selected_target)", ide_bridge_py)
-        self.assertIn("selected_registration = (", ide_bridge_py)
-        self.assertIn("vs_bridge.call_pipe_exact(", ide_bridge_py)
-        self.assertIn("self._call_vs_exact_and_advance(", ide_bridge_py)
-        self.assertIn("selected_registration,", ide_bridge_py)
-        self.assertIn("return await rider_bridge.call_pipe(selected_pipe, method, params, remaining)", ide_bridge_py)
-        self.assertIn("selected.target_identity()", ide_bridge_py)
-        self.assertIn("instances = await self.discover_instances(preferred_ide=preferred, timeout=discovery_budget)", ide_bridge_py)
+        vs_session_py = read("mcp_server/vs_session.py")
 
         self.assertIn("pipe_name = self._selected_pipe", vs_bridge_py)
         self.assertIn("selected_target = dict(self._selected_target)", vs_bridge_py)
         self.assertIn("selected_registration = (", vs_bridge_py)
         self.assertIn("registration_snapshot=selected_registration", vs_bridge_py)
         self.assertIn("async def call_pipe", vs_bridge_py)
+        self.assertIn("async def call_pipe_exact", vs_bridge_py)
         self.assertIn("loop.run_in_executor", vs_bridge_py)
+        self.assertIn("async with self._lock:", vs_bridge_py)
         self.assertIn("self._cached_instances = instances", vs_bridge_py)
         self.assertIn("selected_instance = self._find_best_instance(instances)", vs_bridge_py)
         self.assertIn("selected_instance.registration_snapshot()", vs_bridge_py)
-        self.assertIn("pipe_name = self._selected_pipe", rider_bridge_py)
-        self.assertIn("async def call_pipe", rider_bridge_py)
-        self.assertIn("loop.run_in_executor", rider_bridge_py)
-        self.assertIn("self._cached_instances = instances", rider_bridge_py)
-        self.assertIn("return await self.call_pipe(pipe_name, method, params, timeout)", rider_bridge_py)
+
+        # The VS session manager is a thin delegation layer and owns no lock of its own.
+        self.assertIn("return await self._bridge.call(", vs_session_py)
+        self.assertIn("return await get_bridge().call(", vs_session_py)
+        self.assertNotIn("self._lock", vs_session_py)
 
     def test_unreachable_pipes_are_diagnostic_only(self) -> None:
         vs_bridge_py = read("mcp_server/vs_bridge.py")
-        rider_bridge_py = read("mcp_server/rider_bridge.py")
-        ide_bridge_py = read("mcp_server/ide_bridge.py")
 
-        for bridge_py in (vs_bridge_py, rider_bridge_py):
-            self.assertIn('self.connection_status = "ok"', bridge_py)
-            self.assertIn('"connectionStatus": "unreachable"', bridge_py)
-            self.assertIn('instances = [i for i in instances if i.connection_status == "ok"]', bridge_py)
-            self.assertIn('return any(i.connection_status == "ok" for i in instances)', bridge_py)
-
+        self.assertIn('self.connection_status = "ok"', vs_bridge_py)
+        self.assertIn('"connectionStatus": "unreachable"', vs_bridge_py)
+        self.assertIn('instances = [i for i in instances if i.connection_status == "ok"]', vs_bridge_py)
+        self.assertIn('return any(i.connection_status == "ok" for i in instances)', vs_bridge_py)
         self.assertIn('"lastError": str(e)', vs_bridge_py)
-        self.assertIn('"lastError": str(error)', rider_bridge_py)
-
         self.assertIn("Multiple VS instances found or no reachable instance could be auto-selected", vs_bridge_py)
-        self.assertIn('self.connection_status = getattr(instance, "connection_status", "ok")', ide_bridge_py)
-        self.assertIn('"connectionStatus": self.connection_status', ide_bridge_py)
-        self.assertIn('instances = [i for i in instances if i.connection_status == "ok"]', ide_bridge_py)
-        self.assertIn('return any(i.connection_status == "ok" for i in instances)', ide_bridge_py)
+        self.assertIn("Only registrations that passed owner/process validation are visible", vs_bridge_py)
 
     def test_list_and_detect_preserve_explicit_selection_truth(self) -> None:
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
 
         list_vs = function_source(server_py, "list_vs_instances")
-        list_ide = function_source(server_py, "list_ide_instances")
         detect = function_source(server_py, "detect_debug_sessions")
 
-        self.assertIn("_instances_with_selection", list_vs)
-        self.assertIn("_instances_with_selection", list_ide)
-        self.assertIn('"selected": has_selection', list_vs)
-        self.assertIn('result["selected"] = has_selection', list_ide)
-        self.assertIn('"selectedInstance": selected_payload', list_vs)
-        self.assertIn('result["selectedInstance"] = selected_payload', list_ide)
-        self.assertIn("wouldAutoSelect", list_vs)
-        self.assertIn("wouldAutoSelect", list_ide)
-        self.assertIn('"unreachable": len(instances) - len(selectable_instances)', list_vs)
-        self.assertIn('"unreachable": len(instances) - len(selectable_instances)', list_ide)
+        self.assertIn('"selected": selected is not None', list_vs)
+        self.assertIn('"selectedInstance": selected', list_vs)
+        self.assertIn("hasPinnedSelection", list_vs)
+        self.assertIn('"unreachableCount": len(instances) - reachable_count', list_vs)
+        self.assertNotIn("wouldAutoSelect", list_vs)
         self.assertNotIn("autoSelected", list_vs)
-        self.assertNotIn("autoSelected", list_ide)
+
         self.assertIn("autoSelected", detect)
-        self.assertIn("if has_selection:", detect)
-        self.assertIn("detect_debug_sessions 不会覆盖显式选择", detect)
-        self.assertIn("未自动切换到其他实例", detect)
+        self.assertIn("wouldAutoSelectInstance", detect)
+        self.assertIn("if pinned is not None or not instances:", detect)
+        self.assertIn("the newer selection was preserved", detect)
+        self.assertIn("select one explicitly", detect)
 
     def test_preferred_ide_discovery_is_scoped(self) -> None:
-        server_py = read("mcp_server/server.py")
-        ide_bridge_py = read("mcp_server/ide_bridge.py")
+        server_py = read("mcp_server/vs_server.py")
+        vs_session_py = read("mcp_server/vs_session.py")
 
-        self.assertIn("async def discover_instances(\n        self,\n        preferred_ide: Optional[str] = None,\n        timeout: Optional[float] = None", ide_bridge_py)
-        self.assertIn("preferred_ide: Optional[str] = None", ide_bridge_py)
-        self.assertIn("preferred_ide must be 'vs' or 'rider'", ide_bridge_py)
-        self.assertIn("requires {preferred.upper()}", ide_bridge_py)
-        self.assertIn("requires {requested_preferred.upper()}", ide_bridge_py)
-        self.assertIn("bridge.call(method, params, timeout, preferred_ide=preferred_ide)", ide_bridge_py)
-        self.assertIn('if preferred in (None, "vs") and vs_bridge is not None:', ide_bridge_py)
-        self.assertIn('if preferred in (None, "rider") and rider_bridge is not None:', ide_bridge_py)
-        self.assertIn('_configured_ide != "rider"', ide_bridge_py)
-        self.assertIn('_configured_ide != "vs"', ide_bridge_py)
-        self.assertIn("async def discover_instances(\n    preferred_ide: Optional[str] = None,\n    timeout: Optional[float] = None", ide_bridge_py)
-        self.assertIn('discover_instances(preferred_ide="vs")', function_source(server_py, "list_vs_instances"))
-        self.assertIn("discover_instances(preferred_ide=ide_key)", function_source(server_py, "select_ide_instance"))
-        self.assertIn('discover_instances(preferred_ide="vs")', function_source(server_py, "select_vs_instance"))
-        self.assertIn("discover_instances(preferred_ide=prefer_ide)", function_source(server_py, "detect_debug_sessions"))
+        self.assertIn("async def discover_instances(\n        self,\n        preferred_ide: Optional[str] = None,\n        timeout: Optional[float] = None", vs_session_py)
+        self.assertIn("preferred_ide: Optional[str] = None", vs_session_py)
+        self.assertIn("This MCP server supports Visual Studio only.", vs_session_py)
+        self.assertIn('normalized not in ("vs", "visualstudio", "visual-studio", "visual_studio")', vs_session_py)
+        self.assertIn("async def discover_instances(\n    preferred_ide: Optional[str] = None,\n    timeout: Optional[float] = None", vs_session_py)
+        self.assertIn('return "vs"', vs_session_py)
+        self.assertIn("discover_instances()", function_source(server_py, "list_vs_instances"))
+        self.assertIn("discover_instances()", function_source(server_py, "select_vs_instance"))
+        self.assertIn("discover_instances()", function_source(server_py, "detect_debug_sessions"))
+        self.assertIn("preferred_ide=bridge.get_preferred_ide(),", function_source(server_py, "debug_capabilities"))
 
     def test_mcp_tools_are_split_into_domain_modules(self) -> None:
-        server_entry = (ROOT / "mcp_server/server.py").read_text(encoding="utf-8")
-        server_py = read("mcp_server/server.py")
+        server_entry = (ROOT / "mcp_server/vs_server.py").read_text(encoding="utf-8")
         module_files = sorted(
             path.stem
             for path in (ROOT / "mcp_server/tool_modules").glob("*.py")
             if path.name != "__init__.py"
         )
 
-        self.assertIn("from .tool_modules import register_all", server_entry)
-        self.assertIn("from tool_modules import register_all", server_entry)
-        self.assertIn("register_all()", server_entry)
+        self.assertIn("from .tool_modules import register_vs", server_entry)
+        self.assertIn("from tool_modules import register_vs", server_entry)
+        self.assertIn("register_vs()", server_entry)
         self.assertNotIn("@mcp.tool", server_entry)
         self.assertNotIn("async def get_debug_status", server_entry)
         self.assertEqual(module_files, sorted(registered_tool_module_names()))
 
         for source_path in (
-            "mcp_server/mcp_app.py",
+            "mcp_server/vs_mcp_app.py",
             "mcp_server/tool_context.py",
-            "mcp_server/tool_registry.py",
+            "mcp_server/vs_tool_registry.py",
             "mcp_server/tool_modules/capability_tools.py",
-            "mcp_server/tool_modules/instance_tools.py",
+            "mcp_server/tool_modules/vs_instance_tools.py",
+            "mcp_server/tool_modules/multi_vs_tools.py",
             "mcp_server/tool_modules/snapshot_tools.py",
             "mcp_server/tool_modules/native_managed_tools.py",
             "mcp_server/tool_modules/control_tools.py",
@@ -2170,19 +1880,21 @@ print(json.dumps({
         ):
             self.assertTrue((ROOT / source_path).is_file(), source_path)
 
-        self.assertIn("DOMAIN_MODULES", server_py)
-        self.assertIn("ToolSpec", server_py)
-        self.assertIn('"snapshot": "tool_modules.snapshot_tools"', server_py)
-        self.assertIn('"breakpoint": "tool_modules.breakpoint_tools"', server_py)
-        self.assertIn('"memory": "tool_modules.memory_tools"', server_py)
+        registry = read("mcp_server/vs_tool_registry.py")
+        self.assertIn("VS_TOOL_DOMAINS", registry)
+        self.assertIn('"snapshot": [', registry)
+        self.assertIn('"breakpoint": [', registry)
+        self.assertIn('"memory": [', registry)
+        tool_modules_init = read("mcp_server/tool_modules/__init__.py")
+        self.assertIn("def register_vs()", tool_modules_init)
+        self.assertIn("from . import capability_tools", tool_modules_init)
         tool_context = read("mcp_server/tool_context.py")
         self.assertIn("__all__ = [", tool_context)
         self.assertIn('"format_result"', tool_context)
         self.assertIn('"handle_ide_error"', tool_context)
 
-    def test_split_server_files_are_packaged_for_vsix_and_rider(self) -> None:
+    def test_split_server_files_are_packaged_for_vsix(self) -> None:
         csproj_items = vsix_content_items()
-        rider_registration = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/McpClientRegistration.kt")
         all_runtime_files = expected_packaged_mcp_files()
         vs_root_files = {
             "vs_server.py", "vs_launcher.py", "vs_bridge.py", "vs_errors.py", "vs_session.py", "vs_mcp_app.py",
@@ -2191,7 +1903,8 @@ print(json.dumps({
         }
         vs_tool_modules = {
             "tool_modules/__init__.py", "tool_modules/capability_tools.py",
-            "tool_modules/vs_instance_tools.py", "tool_modules/snapshot_tools.py",
+            "tool_modules/vs_instance_tools.py", "tool_modules/multi_vs_tools.py",
+            "tool_modules/snapshot_tools.py",
             "tool_modules/native_managed_tools.py", "tool_modules/control_tools.py",
             "tool_modules/breakpoint_tools.py", "tool_modules/memory_tools.py",
         }
@@ -2221,40 +1934,25 @@ print(json.dumps({
                     self.assertEqual("true", csproj_items[include_path].get("IncludeInVSIX"))
                     self.assertEqual("PreserveNewest", csproj_items[include_path].get("CopyToOutputDirectory"))
 
-        expected_rider_files = [
-            path for path in all_runtime_files
-            if path not in {
-                "vs_server.py", "vs_launcher.py", "vs_session.py", "vs_mcp_app.py",
-                "vs_tool_registry.py", "tool_modules/vs_instance_tools.py",
-            }
-        ]
-        self.assertEqual(expected_rider_files, rider_base_files(rider_registration))
         self.assertNotIn(r"..\mcp_server\rider_bridge.py", csproj_items)
         self.assertNotIn(r"..\mcp_server\server.py", csproj_items)
-
-        self.assertIn('val filesToCopy = (baseFiles + "vendor/wheels/manifest.json" + manifestFiles).distinct()', rider_registration)
-        self.assertIn('val seedFiles = (baseFiles + "vendor/wheels/manifest.json" + manifestFiles).distinct()', rider_registration)
-        self.assertIn("digest.update(fileName.toByteArray(StandardCharsets.UTF_8))", rider_registration)
-        self.assertNotIn("manifestFiles.sorted().forEach", rider_registration)
-        self.assertIn("for (fileName in filesToCopy)", rider_registration)
+        self.assertNotIn(r"..\mcp_server\ide_bridge.py", csproj_items)
 
     def test_split_server_supports_script_and_package_import_modes(self) -> None:
-        server_entry = (ROOT / "mcp_server/server.py").read_text(encoding="utf-8")
-        mcp_app_py = read("mcp_server/mcp_app.py")
-        ide_bridge_py = read("mcp_server/ide_bridge.py")
+        server_entry = (ROOT / "mcp_server/vs_server.py").read_text(encoding="utf-8")
+        mcp_app_py = read("mcp_server/vs_mcp_app.py")
+        vs_session_py = read("mcp_server/vs_session.py")
         tool_modules_init = read("mcp_server/tool_modules/__init__.py")
 
         self.assertIn("from . import bootstrap", server_entry)
         self.assertIn("import bootstrap", server_entry)
-        self.assertIn("from .mcp_app import mcp", server_entry)
-        self.assertIn("from mcp_app import mcp", server_entry)
-        self.assertIn("from .tool_modules import register_all", server_entry)
-        self.assertIn("from tool_modules import register_all", server_entry)
+        self.assertIn("from .vs_mcp_app import mcp", server_entry)
+        self.assertIn("from vs_mcp_app import mcp", server_entry)
+        self.assertIn("from .tool_modules import register_vs", server_entry)
+        self.assertIn("from tool_modules import register_vs", server_entry)
 
-        self.assertIn("from . import vs_bridge", ide_bridge_py)
-        self.assertIn("import vs_bridge", ide_bridge_py)
-        self.assertIn("from . import rider_bridge", ide_bridge_py)
-        self.assertIn("import rider_bridge", ide_bridge_py)
+        self.assertIn("from . import vs_bridge", vs_session_py)
+        self.assertIn("import vs_bridge", vs_session_py)
 
         self.assertIn("bootstrap.ensure_deps()", mcp_app_py)
         self.assertIn("from . import capability_tools", tool_modules_init)
@@ -2263,19 +1961,19 @@ print(json.dumps({
         commands = [
             (
                 "script-style",
-                "import sys; sys.path.insert(0, r'mcp_server'); import server; print('script-style import ok')",
+                "import sys; sys.path.insert(0, r'mcp_server'); import vs_server; print('script-style import ok')",
             ),
             (
                 "package",
-                "import runpy; runpy.run_module('mcp_server.server', run_name='aidb_package_smoke'); print('package import ok')",
+                "import runpy; runpy.run_module('mcp_server.vs_server', run_name='aidb_package_smoke'); print('package import ok')",
             ),
             (
-                "package-register-all",
-                "from mcp_server.tool_modules import register_all; register_all(); print('package register_all import ok')",
+                "package-register-vs",
+                "from mcp_server.tool_modules import register_vs; register_vs(); print('package register_vs import ok')",
             ),
             (
-                "script-style-register-all",
-                "import sys; sys.path.insert(0, r'mcp_server'); from tool_modules import register_all; register_all(); print('script-style register_all import ok')",
+                "script-style-register-vs",
+                "import sys; sys.path.insert(0, r'mcp_server'); from tool_modules import register_vs; register_vs(); print('script-style register_vs import ok')",
             ),
         ]
         for mode, script in commands:
@@ -2295,42 +1993,55 @@ print(json.dumps({
 
         self.assertNotIn("actions/cache", workflow)
         self.assertNotIn("Cache NuGet", workflow)
-        self.assertNotIn("Cache Rider SDK", workflow)
         self.assertNotIn("cache-read-only", workflow)
-        self.assertNotIn("gradle-home-cache-excludes", workflow)
-        self.assertIn("cache-disabled: true", workflow)
+        # The Gradle/Rider build is gone; no step may reintroduce action caching.
+        self.assertNotIn("gradle", workflow)
 
-    def test_tool_registry_matches_backend_matrix(self) -> None:
+    def test_vs_tool_registry_matches_backend_matrix(self) -> None:
         registry = load_tool_registry()
-        rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
-        rider_coordinator = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/RiderRequestCoordinator.kt")
-        ide_bridge_py = read("mcp_server/ide_bridge.py")
 
         method_manifest = json.loads(read("mcp_server/debug_method_manifest.json"))
         self.assertEqual("aidb/2", method_manifest["protocol"])
         vs_methods = set(method_manifest["methods"])
-        rider_methods = discover_rider_dispatch_methods(rider_service, rider_coordinator)
         tool_names = discover_mcp_tool_names()
 
-        self.assertEqual([], registry.validate_tool_specs(vs_methods, rider_methods, tool_names))
-        self.assertEqual("vs", registry.preferred_ide_for_backend_method("attach_process"))
-        self.assertEqual("vs", registry.preferred_ide_for_backend_method("start_debugging"))
-        self.assertEqual("vs", registry.preferred_ide_for_backend_method("get_debug_processes"))
-        self.assertEqual("vs", registry.preferred_ide_for_backend_method("switch_process"))
-        self.assertIsNone(registry.preferred_ide_for_backend_method("delete_breakpoint"))
-        self.assertEqual("delete_breakpoint", registry.TOOLS["clear_breakpoint"].alias_for)
-        self.assertEqual("set_data_breakpoint", registry.TOOLS["set_watchpoint"].alias_for)
-        self.assertIn("_registry_preferred_ide_for_method", ide_bridge_py)
-        self.assertIn("preferred_ide = _registry_preferred_ide_for_method(method)", ide_bridge_py)
-        self.assertNotIn("except Exception:\n        return None", ide_bridge_py)
+        # The whole backend catalogue is Visual Studio only.
+        self.assertEqual(vs_methods, set(registry.DEBUG_METHOD_MANIFEST))
+        self.assertEqual(["vs"], registry.tool_registry_summary()["methodBackends"]["attach_process"])
+
+        # Legacy aliases resolve to their canonical Visual Studio backend method.
+        self.assertEqual("delete_breakpoint", registry.LEGACY_ALIASES["clear_breakpoint"])
+        self.assertEqual("set_data_breakpoint", registry.LEGACY_ALIASES["set_watchpoint"])
+        self.assertEqual(("delete_breakpoint",), registry.backend_methods_for_tool("clear_breakpoint"))
+        self.assertEqual(("set_data_breakpoint",), registry.backend_methods_for_tool("set_watchpoint"))
+        self.assertEqual(("attach_process",), registry.backend_methods_for_tool("attach_process"))
+
+        # Every discovered MCP tool belongs to exactly one declared VS domain.
+        domain_tools = {tool for tools in registry.VS_TOOL_DOMAINS.values() for tool in tools}
+        self.assertEqual(set(), set(tool_names) - domain_tools)
 
         summary = registry.tool_registry_summary()
-        self.assertIn("set_watchpoint", summary["vsOnlyTools"])
-        self.assertEqual(["vs"], summary["toolSupport"]["set_watchpoint"]["supportedBackends"])
-        self.assertEqual(["rider"], summary["toolSupport"]["detach_process"]["unsupportedBackends"])
-        self.assertEqual(["vs"], summary["toolSupport"]["detach_process"]["supportedBackends"])
+        self.assertEqual("visual_studio", summary["scope"])
+        self.assertIn("set_data_breakpoint", summary["vsOnlyTools"])
         self.assertIn("detach_process", summary["vsOnlyTools"])
         self.assertIn("switch_process", summary["vsOnlyTools"])
+        # Legacy aliases are hidden unless explicitly enabled; the canonical name
+        # is what the catalog advertises in the default configuration.
+        self.assertEqual(
+            os.environ.get("AIDB_ENABLE_LEGACY_ALIASES") == "1",
+            summary["legacyAliasesEnabled"],
+        )
+        if not summary["legacyAliasesEnabled"]:
+            self.assertEqual({}, summary["aliases"])
+            self.assertIn("set_data_breakpoint", summary["vsOnlyTools"])
+            self.assertNotIn("set_watchpoint", summary["vsOnlyTools"])
+        for tool, support in summary["toolSupport"].items():
+            with self.subTest(tool=tool):
+                self.assertEqual(["vs"], support["supportedBackends"])
+                self.assertEqual(["vs"], support["routableBackends"])
+                self.assertEqual([], support["unsupportedBackends"])
+                self.assertEqual("vs", support["preferredIde"])
+        self.assertEqual(["vs"], summary["toolSupport"]["set_data_breakpoint"]["supportedBackends"])
         self.assertEqual(["vs"], summary["toolSupport"]["get_debug_processes"]["supportedBackends"])
         self.assertEqual(["vs"], summary["toolSupport"]["switch_process"]["routableBackends"])
 
@@ -2340,8 +2051,8 @@ print(json.dumps({
         categorized_tools = {tool for tools in categories.values() for tool in tools}
         self.assertEqual(set(summary["toolSupport"]), categorized_tools)
 
-    def test_vs_only_active_debugging_tools_do_not_route_to_rider(self) -> None:
-        server_py = read("mcp_server/server.py")
+    def test_vs_only_active_debugging_tools_pin_vs_backend(self) -> None:
+        server_py = read("mcp_server/vs_server.py")
 
         for tool_name in (
             "attach_process", "get_debug_processes", "switch_process",
@@ -2363,9 +2074,8 @@ print(json.dumps({
         self.assertNotIn("ide_bridge.call", clear_breakpoint)
 
     def test_vs_memory_search_contract_matches_backend_limit(self) -> None:
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
-        rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
 
         search_memory = function_source(server_py, "search_memory")
         vs_execute_search = csharp_slice(vs_service, "public MemorySearchResult SearchMemory(", "        private MemorySearchResult CreateUnavailableMemorySearchResult")
@@ -2427,15 +2137,6 @@ print(json.dumps({
         self.assertNotIn("pattern.Trim().Length == 2", vs_parse_pattern)
         self.assertIn("result.Truncated = true", vs_service)
         self.assertIn("result.NextStartAddress", vs_service)
-        self.assertIn('val patternFormat = getParam(request.params, "patternFormat", "auto")', rider_service)
-        self.assertIn('val startOffset = getParam(request.params, "startOffset", 0L)', rider_service)
-        self.assertIn("resolvedAddress + startOffset.coerceAtLeast(0L)", rider_service)
-        self.assertIn("parsePattern(pattern, patternFormat)", rider_service)
-        self.assertIn("looksLikeSpacedHex", rider_service)
-        self.assertIn('val hex = trimmed.replace(Regex("\\\\s+"), "")', rider_service)
-        self.assertIn("hex.substring(index * 2, index * 2 + 2).toInt(16).toByte()", rider_service)
-        self.assertIn("truncated = truncated", rider_service)
-        self.assertIn("nextStartAddress = nextStartAddress", rider_service)
 
     def test_vs_memory_search_safety_contracts(self) -> None:
         secondary = read("VSDebuggerMCP/Services/DebuggerService.SecondaryInspection.cs")
@@ -2493,11 +2194,9 @@ print(json.dumps({
         self.assertIn("terminal_backend_no_continuation", memory_tools)
 
     def test_debug_bundle_safe_defaults_are_advertised(self) -> None:
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
         vs_pipe = read("VSDebuggerMCP/NamedPipeServer.cs")
-        rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
         vs_registration = read("VSDebuggerMCP/McpClientRegistration.cs")
-        rider_registration = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/McpClientRegistration.kt")
         readme = read("README.md")
 
         for text in (
@@ -2507,13 +2206,13 @@ print(json.dumps({
         ):
             self.assertIn(text, server_py)
 
-        for code in (vs_pipe, rider_service):
-            self.assertIn('"includeLocals"', code)
-            self.assertIn('"includeOutput"', code)
+        self.assertIn('"includeLocals"', vs_pipe)
+        self.assertIn('"includeOutput"', vs_pipe)
         self.assertIn('"evaluationPolicy"', vs_pipe)
-        self.assertIn('"allowSideEffects"', rider_service)
+        # Visual Studio cannot enforce allowSideEffects, so the parameter is rejected outright.
+        self.assertIn("Parameter 'allowSideEffects' was removed because Visual Studio cannot enforce it.", vs_pipe)
 
-        for doc in (vs_registration, rider_registration, readme):
+        for doc in (vs_registration, readme):
             self.assertIn("low-blocking", doc)
             self.assertIn("value/error/timeout", doc)
 
@@ -2525,15 +2224,13 @@ print(json.dumps({
         self.assertIn("timeout_seconds", function_source(server_py, "get_disassembly_at"))
 
     def test_expression_calls_are_attempted_instead_of_pre_rejected(self) -> None:
-        server_py = read("mcp_server/server.py")
+        server_py = read("mcp_server/vs_server.py")
         vs_service = read("VSDebuggerMCP/DebuggerService.cs")
-        rider_service = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/DebuggerService.kt")
 
         single_eval = function_source(server_py, "evaluate_expression")
         self.assertNotIn("return rejection", single_eval)
         self.assertNotIn("side_effect_rejection", server_py)
         self.assertNotIn("FindPotentialSideEffectCalls", vs_service)
-        self.assertNotIn("findPotentialSideEffectCalls", rider_service)
 
         for name in (
             "evaluate_expressions_batch",
@@ -2544,32 +2241,23 @@ print(json.dumps({
             self.assertNotIn("return rejection", body)
             self.assertIn('"evaluationPolicy": evaluation_policy', body)
 
-    def test_cursor_allowlist_helper_is_bundled(self) -> None:
+    def test_cursor_allowlist_helper_is_not_bundled_in_vsix(self) -> None:
         helper_py = read("mcp_server/cursor_allowlist_sync.py")
         vs_project = read("VSDebuggerMCP/VSDebuggerMCP.csproj")
-        rider_registration = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/McpClientRegistration.kt")
 
         self.assertIn("mcpAllowedTools", helper_py)
         self.assertIn("state.vscdb", helper_py)
         self.assertNotIn("cursor_allowlist_sync.py", vs_project)
-        self.assertIn("cursor_allowlist_sync.py", rider_registration)
 
-    def test_codex_registration_is_wired_for_vs_and_rider(self) -> None:
+    def test_codex_registration_is_wired_for_vs(self) -> None:
         vs_package = read("VSDebuggerMCP/VSDebuggerMCPPackage.cs")
         vs_registration = read("VSDebuggerMCP/McpClientRegistration.cs")
-        rider_plugin = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/RiderDebuggerPlugin.kt")
-        rider_registration = read("RiderDebuggerMCP/src/main/kotlin/com/vsdebugger/rider/McpClientRegistration.kt")
 
         self.assertIn("RegisterWithCodex", vs_package)
         self.assertIn("GetCodexConfigPath", vs_registration)
         self.assertIn("RegisterWithCodex", vs_registration)
         self.assertIn("config.toml", vs_registration)
         self.assertIn("CODEX_HOME", vs_registration)
-        self.assertIn("registerWithCodex()", rider_plugin)
-        self.assertIn("getCodexConfigPath", rider_registration)
-        self.assertIn("registerWithCodex", rider_registration)
-        self.assertIn("config.toml", rider_registration)
-        self.assertIn("CODEX_HOME", rider_registration)
 
 
 if __name__ == "__main__":

@@ -4,20 +4,18 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## Project Overview
 
-AIDebugger MCP is a Model Context Protocol server that enables Cursor IDE to access Visual Studio and Rider debugging information. The architecture follows a three-tier design:
+AIDebugger MCP is a Model Context Protocol server that enables MCP clients to access Visual Studio debugging information. The architecture is:
 
 ```
-Visual Studio (VSIX) ──┐
-                       ├── Named Pipes ──> Python MCP Server ──> Cursor (stdio)
-Rider (IntelliJ Plugin)┘
+Visual Studio (VSIX) ── authenticated AIDB/2 named pipe ──> Python MCP Server ── stdio ──> MCP client
 ```
 
 ## Build Commands
 
-### Full Solution Build (VS + Rider)
+### Full Solution Build
 ```bash
 # Open AIDebugger.sln in Visual Studio and build Release
-# This builds the VSIX and triggers Rider plugin build via RiderBuild.csproj
+# This builds the VSIX.
 msbuild AIDebugger.sln /p:Configuration=Release
 ```
 
@@ -47,21 +45,11 @@ Note: `VSDebuggerMCP/bin/Release/VSDebuggerMCP.vsix` is an intermediate package 
 The explicit VS setup command seeds VS-only MCP files transactionally to
 `~/.ai-debugger/mcp_server_vs`.
 
-### Rider Plugin Only
-```bash
-# Requires JDK 21+ (set JAVA_HOME or use Rider's bundled JBR)
-cd RiderDebuggerMCP
-./gradlew.bat buildPlugin
-```
-Output: `RiderDebuggerMCP/build/distributions/*.zip`
-
-To build against a local Rider installation, set `RIDER_HOME` to the Rider install directory.
-
 ### Run MCP Server Directly (Development)
 ```bash
 cd mcp_server
 pip install -r requirements.txt  # dev only; extensions bundle wheels
-python server.py
+python vs_server.py
 ```
 
 ## Testing
@@ -88,7 +76,6 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 | Component | Location | Language | Purpose |
 |-----------|----------|----------|---------|
 | VS Extension | `VSDebuggerMCP/` | C# (.NET 4.7.2) | VSIX package exposing EnvDTE debugger APIs via Named Pipe |
-| Rider Plugin | `RiderDebuggerMCP/` | Kotlin (JDK 21) | IntelliJ plugin exposing Rider debugger APIs via Named Pipe |
 | MCP Server | `mcp_server/` | Python 3.10-3.14 (x64) | FastMCP server bridging Named Pipes to MCP stdio |
 
 ### Key Files
@@ -105,20 +92,14 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 - `McpClientRegistration.cs` / `Registration/McpClientRegistration.*.cs` - Explicit setup-only bundle deployment and atomic client registration
 - `Protocol/DebugModels.cs` - Shared data models for responses
 
-**Rider Plugin:**
-- `RiderDebuggerPlugin.kt` - Plugin entry point
-- `DebuggerService.kt` - Debugger operations (mirrors VS implementation)
-- `NamedPipeServer.kt` - Authenticated AIDB/2 host (`\\.\pipe\AIDebuggerRider_<PID>`)
-- `RiderInstanceRegistration.kt` / `RiderRequestCoordinator.kt` - owner-only
-  rendezvous, immutable instance identity, single actor, command tombstones,
-  status recovery, and dispatcher health
-- `McpClientRegistration.kt` - MCP registration with Python version check
-
 **MCP Server:**
-- `server.py` - Combined thin entry point for all 86 MCP tools
-- `vs_server.py` - VS-only entry point; never imports or discovers Rider
-- `ide_bridge.py` - Unified bridge with auto-selection logic for multiple IDE instances
-- `vs_bridge.py` / `rider_bridge.py` - Named Pipe clients with overlapped I/O and timeout handling
+- `vs_server.py` - FastMCP stdio entry point and VS tool registration
+- `vs_launcher.py` - Stable, version-independent launcher for the active `vs_server.py`
+- `vs_mcp_app.py` - `VisualStudioFastMCP` application instance
+- `vs_tool_registry.py` - VS tool catalog, aliases, and backend method matrix
+- `tool_modules/` - Domain tool modules registered through `register_vs()`
+- `vs_session.py` - `VSSessionManager` target selection and dispatch
+- `vs_bridge.py` - Named Pipe client with overlapped I/O and timeout handling
 - `bootstrap.py` - Extracts bundled wheels to `~/.ai-debugger/pydeps` on first run
 
 ### Communication Protocol
@@ -139,8 +120,8 @@ Visual Studio uses authenticated AIDB/2 length-prefixed messages. Requests inclu
 
 ### Multi-Instance Support
 
-- Each IDE instance creates a unique pipe: `AIDebuggerVS_<PID>` or `AIDebuggerRider_<PID>`
-- `AIDB_PREFERRED_IDE` env var locks MCP server to `vs` or `rider`
+- Each Visual Studio instance creates a unique pipe: `AIDebuggerVS_<PID>`
+- `AIDB_PREFERRED_IDE` env var is set to `vs` for the Visual Studio server
 - Auto-selection priority: paused at breakpoint > debugging > single instance
 - VS pipe/instance registration default to current-user owner-only ACLs
 - `AIDB_ALLOWED_CAPABILITIES` optionally restricts the VS server capability set
@@ -163,7 +144,6 @@ produces the same version number regardless of where it is built.
 | Build system | Mechanism |
 |-------------|-----------|
 | VS Extension (MSBuild) | Pre-build target calls `tools/Stamp-Version.ps1`, which updates `source.extension.vsixmanifest` and `AssemblyInfo.cs` |
-| Rider Plugin (Gradle) | `build.gradle.kts` runs `git describe` / `git rev-list --count` at configuration time |
 | GitHub Actions | Same as local — `fetch-depth: 0` ensures full git history is available |
 
 ### Manual override
@@ -178,20 +158,13 @@ powershell tools/Stamp-Version.ps1 -DryRun
 
 ## Development Notes
 
-### VS/Rider Feature Parity
-
-See `docs/DeepReview-VS-Rider-Alignment.md` for detailed capability matrix. Key differences:
-- VS has richer module/exception metadata
-- Rider output limited to debug console (VS supports multiple panes)
-- Rider `add_watch` only evaluates (VS persists to Watch window)
-- Memory operations return `status/bytesRead/partial` for reliability
-
 ### Response Contracts
 
 All responses include capability declarations:
-- `capability` - Feature support level (e.g., `limited_to_debug_console`)
-- `behavior` - Semantic differences (e.g., `evaluate_only` vs `persisted_watch`)
+- `capability` - Feature support level for a backend method
+- `behavior` - Semantic differences (e.g., `persisted_watch` for `add_watch`)
 - `snapshotStable/snapshotStatus` - Consistency indicators for callstack/threads
+- Memory operations return `status/bytesRead/partial` for reliability
 
 ### Standardized Stop Reasons
 

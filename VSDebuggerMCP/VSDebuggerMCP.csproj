@@ -225,7 +225,7 @@
       <IncludeInVSIX>true</IncludeInVSIX>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="..\mcp_server\tool_modules\__init__.py;..\mcp_server\tool_modules\capability_tools.py;..\mcp_server\tool_modules\vs_instance_tools.py;..\mcp_server\tool_modules\snapshot_tools.py;..\mcp_server\tool_modules\native_managed_tools.py;..\mcp_server\tool_modules\control_tools.py;..\mcp_server\tool_modules\breakpoint_tools.py;..\mcp_server\tool_modules\memory_tools.py">
+    <Content Include="..\mcp_server\tool_modules\__init__.py;..\mcp_server\tool_modules\capability_tools.py;..\mcp_server\tool_modules\vs_instance_tools.py;..\mcp_server\tool_modules\multi_vs_tools.py;..\mcp_server\tool_modules\snapshot_tools.py;..\mcp_server\tool_modules\native_managed_tools.py;..\mcp_server\tool_modules\control_tools.py;..\mcp_server\tool_modules\breakpoint_tools.py;..\mcp_server\tool_modules\memory_tools.py">
       <Link>mcp_server\tool_modules\%(Filename)%(Extension)</Link>
       <IncludeInVSIX>true</IncludeInVSIX>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

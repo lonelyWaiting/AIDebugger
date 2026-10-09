@@ -1,6 +1,5 @@
 from typing import Any, Dict, List, Optional
 import asyncio
-import os
 
 try:
     from ..tool_runtime import backend as ide_bridge, mcp
@@ -13,21 +12,20 @@ except ImportError:
 @mcp.prompt()
 def debug_guide() -> str:
     """
-    AIDebugger 工具使用指南 - 用于调试 Visual Studio / Rider 程序。
+    AIDebugger 工具使用指南 - 用于调试 Visual Studio 程序。
     当需要分析调试现场时，请先阅读此指南。
     """
-    if os.environ.get("AIDB_SERVER_SCOPE") == "vs":
-        return """# AIDebugger Visual Studio guide
-
-Use detect_debug_sessions() or list_vs_instances() first. If several Visual Studio
-instances are reachable, pin one with select_vs_instance(process_id=...). Use
-capture_debug_bundle() for a bounded first snapshot, then request locals,
-expressions, memory, or execution control only when the selected instance declares
-the required capability. This server never discovers or selects Rider.
-"""
-    return """# AIDebugger MCP 工具使用指南
+    return """# AIDebugger Visual Studio guide
 
 ## 快速入门
+
+Use detect_debug_sessions() or list_vs_instances() first. If several Visual Studio
+instances are reachable, pin one with select_vs_instance(process_id=...), or use
+dispatch_vs_instances(method="capture_debug_bundle_safe", process_ids=[...]) to
+query explicit VS targets concurrently without changing that pinned selection. Use
+capture_debug_bundle() for a bounded first snapshot, then request locals,
+expressions, memory, or execution control only when the selected instance declares
+the required capability.
 
 当用户提到调试、崩溃、异常等场景时，推荐的调用顺序：
 
@@ -37,7 +35,7 @@ capture_debug_bundle()
 ```
 Visual Studio read-only mode returns status, call stack, and budgeted threads.
 Exception, locals, registers, and expressions require full-access unsafe-evaluation capability.
-默认只返回状态、堆栈、预算化线程；异常需显式 include_exception=True，避免 exception/locals/modules/registers/output 等重操作卡住 VS/Rider UI 线程。
+默认只返回状态、堆栈、预算化线程；异常需显式 include_exception=True，避免 exception/locals/modules/registers/output 等重操作卡住 VS UI 线程。
 
 ### 2. 按需分步获取重信息
 ```
@@ -80,9 +78,10 @@ question depends on the new stop location.
 
 ## 多实例场景
 
-如果有多个 VS/Rider 实例运行：
-1. 调用 list_ide_instances() 查看所有实例
-2. 调用 select_ide_instance(ide="vs", process_id=12345) 选择特定实例
+如果有多个 Visual Studio 实例运行：
+1. 调用 list_vs_instances() 查看所有实例
+2. 调用 select_vs_instance(process_id=12345) 选择特定实例
+3. 需要同时采集多个 Visual Studio 时，调用 dispatch_vs_instances(method="capture_debug_bundle_safe", process_ids=[12345, 23456])；它不会覆盖当前选择。命令型 method 必须显式传 allow_commands=True。
 """
 
 def _categories_with_registry_coverage(registry: Dict[str, Any]) -> Dict[str, List[str]]:
@@ -91,6 +90,7 @@ def _categories_with_registry_coverage(registry: Dict[str, Any]) -> Dict[str, Li
             "detect_debug_sessions",
             "list_vs_instances",
             "select_vs_instance",
+            "dispatch_vs_instances",
             "attach_process",
             "start_debugging",
             "get_debug_status",
@@ -215,6 +215,7 @@ def _recommended_workflow_for_access(effective_instance: Optional[Dict[str, Any]
     if access_mode == "full_access":
         return [
             "detect_debug_sessions(prefer_ide='vs') or list_vs_instances()",
+            "For concurrent Visual Studio-only inspection, dispatch_vs_instances(method='capture_debug_bundle_safe', process_ids=[...]) keeps the pinned single target unchanged; command methods require allow_commands=True.",
             "attach_process(...) or start_debugging(...) if no debug session is active",
             "Visual Studio multi-process session: get_debug_processes(), then switch_process(process_handle=...) while paused",
             "set_breakpoint(...) / set_function_breakpoint(...) / set_data_breakpoint(...)",
@@ -329,15 +330,16 @@ async def debug_capabilities() -> str:
             "crash_triage": "Focused Visual Studio crash/dump first pass: captures exception, callstack, modules, registers, output tail, nearby disassembly, and stack memory when available.",
             "expression_evaluation": "Expressions are attempted by default with bounded IDE timeouts. If a function call is unavailable or unsafe in the debug engine, the IDE result is returned instead of pre-rejecting it.",
             "stop": "Supported. Use debug_stop, stop_debugging, or debug_control(action='stop') to stop debugging / terminate the current debug session.",
-            "detach": "Visual Studio detach is supported for the current debugged process via detach_process or debug_control(action='detach'). Rider is not exposed as a supported detach backend because no reliable public detach path is available here.",
-            "same_session_process_selection": "Visual Studio only: call get_debug_processes, then switch_process(process_handle=...). The opaque handle binds session generation, PID, and OS creation time; switching never attaches a new local process. Rider exposes no equivalent multi-process selection contract.",
+            "detach": "Visual Studio detach is supported for the current debugged process via detach_process or debug_control(action='detach').",
+            "same_session_process_selection": "Call get_debug_processes, then switch_process(process_handle=...). The opaque handle binds session generation, PID, and OS creation time; switching never attaches a new local process.",
+            "multi_vs_dispatch": "Visual Studio only: dispatch_vs_instances routes one explicit AIDB/2 backend method to several authenticated VS process IDs concurrently. It never redirects or resets the pinned single-instance selection; commands require allow_commands=True and each target's declared capability.",
             "set_data_breakpoint": "Uses Visual Studio native data breakpoints/watchpoints where supported by the active debug engine.",
             "search_memory": "One source-neutral memory search: a numeric start_address searches a bounded live or dump range; omitting it on an active VS dump scans mapped dump memory and returns an opaque continuation.",
             "breakpoint_binding_verification": "Breakpoint results include bindingVerificationStatus, isRelocated, nearbyProbeAttempted, optimizedCodeSuspected, and verificationStatus so optimized-away or unbound source locations are explicit instead of treated as successful hits.",
             "no_source_native": "Information-only native debugging surface: normalize addresses as module+RVA, inspect PE layout, set address breakpoints, capture registers/disassembly/stack memory/modules, and let the AI decide the next probe. No write-memory or patching tool is exposed.",
             "no_source_managed": "Read-only managed assembly analysis: enumerate metadata, select types/methods, and decode IL instructions/tokens without source or UI automation.",
             "no_source_hybrid": "Breakpoint-oriented dynamic loop: collect binding status, continue until the next stop, then capture native context plus managed thread/frame data in one snapshot.",
-            "no_source_backend_support": "The no-source native/managed/hybrid tools are Visual Studio only in this version. Rider support is explicitly missing rather than inferred from VS behavior.",
+            "no_source_backend_support": "The no-source native/managed/hybrid tools require the Visual Studio backend; their behavior is never inferred from another debugger.",
             "logpoints": "Non-breaking Visual Studio tracepoint/logpoint actions are not exposed as a tool because EnvDTE has no reliable public action/message API.",
             "aliases": (
                 "Legacy short aliases are registered and listed in toolRegistry.aliases."

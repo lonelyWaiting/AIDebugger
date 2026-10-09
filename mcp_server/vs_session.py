@@ -1,8 +1,8 @@
 """Visual Studio-only session manager used by the dedicated VS MCP server.
 
-This module deliberately has no Rider import, IDE discriminator, or cross-backend
-selection state.  It presents the small compatibility surface consumed by the
-shared tool implementations while delegating directly to VSBridge.
+This module deliberately has no IDE discriminator or cross-backend selection
+state.  It presents the small compatibility surface consumed by the shared tool
+implementations while delegating directly to VSBridge.
 """
 
 from typing import Any, Dict, List, Optional, Tuple

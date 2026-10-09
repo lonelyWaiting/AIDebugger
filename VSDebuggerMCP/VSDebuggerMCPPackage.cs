@@ -102,7 +102,7 @@ namespace VSDebuggerMCP
             commandService.AddCommand(new MenuCommand(
                 (_, __) => RequestClientUninstall(),
                 new CommandID(CommandSetGuid, UninstallClientsCommandId)));
-            commandService.AddCommand(new MenuCommand(
+            commandService.AddCommand(new OleMenuCommand(
                 StartAutomationTestServer,
                 new CommandID(CommandSetGuid, StartAutomationTestServerCommandId)));
         }

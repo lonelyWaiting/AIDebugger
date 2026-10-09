@@ -45,7 +45,7 @@ async def get_command_status(
     target_process_id: Optional[int] = None,
     target_process_start_time_utc_ticks: Optional[int] = None,
 ) -> str:
-    """查询一次可能丢失响应的 VS 或 Rider 修改型命令是否已完成。"""
+    """查询一次可能丢失响应的 VS 修改型命令是否已完成。"""
     try:
         target = _build_recovery_target(
             target_pipe_name,
@@ -69,7 +69,7 @@ async def cancel_debug_request(
     target_process_id: Optional[int] = None,
     target_process_start_time_utc_ticks: Optional[int] = None,
 ) -> str:
-    """请求取消所选 VS 或 Rider 后端中尚未完成的调试请求。"""
+    """请求取消所选 VS 后端中尚未完成的调试请求。"""
     try:
         target = _build_recovery_target(
             target_pipe_name,
@@ -117,16 +117,12 @@ def _build_recovery_target(
         raise invalid("Invalid recovery target process identity")
     if not isinstance(pipe_name, str):
         raise invalid("Recovery target pipe name does not match its process id")
-    if pipe_name == f"AIDebuggerVS_{process_id}":
-        ide = "vs"
-    elif pipe_name == f"AIDebuggerRider_{process_id}":
-        ide = "rider"
-    else:
+    if pipe_name != f"AIDebuggerVS_{process_id}":
         raise invalid("Recovery target pipe name does not match its process id")
     if not isinstance(server_instance_id, str) or not re.fullmatch(r"[0-9a-f]{32}", server_instance_id):
         raise invalid("Recovery target server instance id is invalid")
     return {
-        "ide": ide,
+        "ide": "vs",
         "pipeName": pipe_name,
         "serverInstanceId": server_instance_id,
         "processId": process_id,
@@ -143,14 +139,6 @@ async def _call_recovery_target(
     if target is None:
         return await ide_bridge.call(method, params, timeout=timeout)
     exact_target = {key: value for key, value in target.items() if key != "ide"}
-    if target["ide"] == "rider":
-        exact_call = getattr(ide_bridge, "call_rider_exact", None)
-        if exact_call is None:
-            raise ide_bridge.IDEBridgeError(
-                "This MCP server was started without exact Rider recovery support",
-                code="BACKEND_UNAVAILABLE",
-            )
-        return await exact_call(exact_target, method, params, timeout=timeout)
     return await vs_bridge.call_pipe_exact(exact_target, method, params, timeout=timeout)
 
 
@@ -629,7 +617,7 @@ async def pause() -> str:
 async def debug_stop() -> str:
     """
     Stop debugging / stop debug / terminate debug session (Shift+F5).
-    Stops the current Visual Studio or Rider debugging session.
+    Stops the current Visual Studio debugging session.
     stop current Visual Studio debugging session.
     terminate current debug session.
 
@@ -654,7 +642,7 @@ async def detach_process() -> str:
     """
     Detach the Visual Studio debugger from the current debugged process without
     terminating it. Use for detach debugger / detach process / stop debugging
-    without killing the process. Rider is not routed as a supported detach backend.
+    without killing the process.
     """
     try:
         result = await ide_bridge.call("detach", preferred_ide="vs")

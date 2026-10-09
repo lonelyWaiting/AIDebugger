@@ -2006,8 +2006,14 @@ class VSBridge:
         timeout: float = DEFAULT_TIMEOUT,
         include_target: bool = False,
         registration_snapshot: Optional[Dict[str, Any]] = None,
+        advance_selection: bool = True,
     ) -> Any:
-        """Call only the immutable authenticated VS instance described by target."""
+        """Call only the immutable authenticated VS instance described by target.
+
+        ``advance_selection=False`` leaves the pinned single-instance target
+        untouched. Callers that must not redirect what a later bare tool call
+        resolves to (for example multi-target dispatch) pass it explicitly.
+        """
         pipe_name = str(target.get("pipeName") or "")
         if registration_snapshot is None and isinstance(target, BoundVSTarget):
             registration_snapshot = target.registration_snapshot()
@@ -2043,10 +2049,11 @@ class VSBridge:
             )
         except VSBridgeError as error:
             current_target = getattr(error, "current_target_identity", None)
-            if isinstance(current_target, dict):
+            if advance_selection and isinstance(current_target, dict):
                 await self._advance_selected_target(target, current_target)
             raise
-        await self._advance_selected_target(target, response_target)
+        if advance_selection:
+            await self._advance_selected_target(target, response_target)
         if (
             expected_context
             and _backend_method_kind(method) != "command"
@@ -2283,6 +2290,7 @@ async def call_pipe_exact(
     timeout: float = DEFAULT_TIMEOUT,
     include_target: bool = False,
     registration_snapshot: Optional[Dict[str, Any]] = None,
+    advance_selection: bool = True,
 ) -> Any:
     """Call the exact authenticated server instance recorded for lost-response recovery."""
     return await get_bridge().call_pipe_exact(
@@ -2292,6 +2300,7 @@ async def call_pipe_exact(
         timeout,
         include_target=include_target,
         registration_snapshot=registration_snapshot,
+        advance_selection=advance_selection,
     )
 
 

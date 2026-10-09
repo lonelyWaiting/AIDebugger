@@ -421,6 +421,45 @@ class InstanceSelectionPayload(StrictPayload):
     errorCode: Optional[Literal["SELECTION_CHANGED"]] = None
 
 
+class MultiVSTargetPayload(StrictPayload):
+    pipeName: str
+    processId: int
+    processStartTimeUtcTicks: int
+    serverInstanceId: str
+    debugSessionGeneration: Optional[int] = None
+    breakSequence: Optional[int] = None
+    contextEpoch: Optional[int] = None
+
+
+class MultiVSDispatchErrorPayload(StrictPayload):
+    code: str
+    message: str
+    outcomeUnknown: bool
+    requestId: Optional[str] = None
+
+
+class MultiVSDispatchItemPayload(StrictPayload):
+    processId: int
+    status: Literal["ok", "error"]
+    target: Optional[MultiVSTargetPayload] = None
+    result: Optional[Any] = None
+    error: Optional[MultiVSDispatchErrorPayload] = None
+
+
+class MultiVSDispatchPayload(StrictPayload):
+    method: str
+    methodKind: Literal["query", "command"]
+    requestedProcessIds: List[int]
+    maxConcurrency: int
+    timeoutSeconds: float
+    selectionBehavior: Literal["does_not_change_selected_vs"]
+    success: bool
+    partial: bool
+    successCount: int
+    failureCount: int
+    results: List[MultiVSDispatchItemPayload]
+
+
 class CommandStatusPayload(StrictPayload):
     requestId: str
     state: str
@@ -1114,11 +1153,12 @@ _MODEL_BY_TOOL: Dict[str, Type[StrictPayload]] = {
     "get_command_status": CommandStatusPayload,
     "cancel_debug_request": CommandStatusPayload,
     **{name: InstanceListPayload for name in (
-        "list_vs_instances", "list_ide_instances", "detect_debug_sessions",
+        "list_vs_instances", "detect_debug_sessions",
     )},
     **{name: InstanceSelectionPayload for name in (
-        "select_ide_instance", "clear_ide_selection", "select_vs_instance", "clear_vs_selection",
+        "select_vs_instance", "clear_vs_selection",
     )},
+    "dispatch_vs_instances": MultiVSDispatchPayload,
     "get_debug_status": DebugStatusPayload,
     "get_callstack": CallStackPayload,
     "get_call_stack": CallStackPayload,
@@ -1181,25 +1221,14 @@ _MODEL_BY_TOOL: Dict[str, Type[StrictPayload]] = {
 
 
 def _verify_registry_coverage() -> None:
-    vs_scope = __import__("os").environ.get("AIDB_SERVER_SCOPE") == "vs"
-    if not vs_scope:
-        try:
-            try:
-                from .tool_registry import TOOLS
-            except ImportError:
-                from tool_registry import TOOLS
-            tools = set(TOOLS)
-        except ImportError:
-            vs_scope = True
-    if vs_scope:
-        try:
-            from .vs_tool_registry import VS_TOOL_DOMAINS
-        except ImportError:
-            from vs_tool_registry import VS_TOOL_DOMAINS
-        tools = {name for names in VS_TOOL_DOMAINS.values() for name in names}
+    try:
+        from .vs_tool_registry import VS_TOOL_DOMAINS
+    except ImportError:
+        from vs_tool_registry import VS_TOOL_DOMAINS
+    tools = {name for names in VS_TOOL_DOMAINS.values() for name in names}
 
     missing = sorted(tools - set(_MODEL_BY_TOOL))
-    stale = [] if vs_scope else sorted(set(_MODEL_BY_TOOL) - tools)
+    stale = sorted(set(_MODEL_BY_TOOL) - tools)
     if missing or stale:
         raise RuntimeError(f"MCP output-model registry mismatch: missing={missing}, stale={stale}")
 

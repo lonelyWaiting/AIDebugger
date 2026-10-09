@@ -1,6 +1,6 @@
 # AIDebugger MCP
 
-AIDebugger exposes Visual Studio and JetBrains Rider debugger state through a
+AIDebugger exposes Visual Studio debugger state through a
 Model Context Protocol (MCP) server. It is intended for MCP clients such as
 Cursor, Codex, Claude Desktop, Claude Code, and OpenCode.
 
@@ -12,23 +12,22 @@ execution control, and Visual Studio-only no-source native/managed workflows.
 
 ```
 Visual Studio VSIX -- authenticated AIDB/2 pipe --> VS-only FastMCP entry -- stdio --> MCP client
-Rider plugin       -- authenticated AIDB/2 pipe --> Rider FastMCP entry --- stdio --> MCP client
 ```
 
-Each IDE instance owns a named pipe:
+A Visual Studio instance owns a paired data/control named pipe:
 
-- Visual Studio data: `\\.\pipe\AIDebuggerVS_<PID>`
-- Visual Studio control: `\\.\pipe\AIDebuggerVS_<PID>_control` (paired with the data pipe; not a separate IDE instance)
-- Rider: `\\.\pipe\AIDebuggerRider_<PID>`
+- Data: `\\.\pipe\AIDebuggerVS_<PID>`
+- Control: `\\.\pipe\AIDebuggerVS_<PID>_control` (paired with the data pipe; not a separate instance)
 
-Both backends are discovered through owner-only instance registrations rather
-than pipe names alone. A selected target is pinned by PID, process creation time,
-server instance nonce, authentication token, and granted-capability snapshot.
+Visual Studio instances are discovered through owner-only instance registrations
+rather than pipe names alone. A selected target is pinned by PID, process
+creation time, server instance nonce, authentication token, and
+granted-capability snapshot.
 Authentication data remains private and is never serialized in MCP results.
 Composite/context-sensitive calls additionally pin
 the debug-session generation and break/context epoch. The bridge never silently
-redirects a failed selected request to another IDE instance; a stale pin must be
-explicitly cleared or reselected.
+redirects a failed selected request to another Visual Studio instance; a stale
+pin must be explicitly cleared or reselected.
 
 The Visual Studio extension refuses to start its MCP server or modify per-user
 MCP client configuration when `devenv.exe` is elevated. Run Visual Studio at
@@ -67,46 +66,26 @@ same-session debug-process enumeration/selection, detach, data/address
 breakpoints, native address/module inspection, managed IL inspection, and
 hybrid no-source capture flows.
 
-### Rider Plugin
-
-Location: `RiderDebuggerMCP/`
-
-Important files:
-
-- `RiderDebuggerPlugin.kt` - plugin startup and MCP client registration.
-- `DebuggerService.kt` - Rider debugger operations.
-- `NamedPipeServer.kt` - authenticated, length-prefixed AIDB/2 host with strict
-  UTF-8/JSON validation and immutable process/instance binding.
-- `RiderInstanceRegistration.kt` - owner-only atomic registration and per-instance token.
-- `RiderRequestCoordinator.kt` - bounded single actor, command tombstones,
-  result recovery, cancellation admission, and dispatcher health.
-- `protocol/RiderMethodCatalog.kt` - loads and hashes the shared backend manifest.
-- `McpClientRegistration.kt` - seeds the Python MCP server and registers MCP clients.
-- `protocol/DebugModels.kt` - response models aligned with the VS contracts.
-
-Rider supports the common snapshot, stepping, breakpoint, memory, disassembly,
-and stop flows. Rider detach, same-session multi-process selection, and the
-VS-only no-source/native-managed tools are not exposed as supported Rider
-backends.
-
 ### Python MCP Server
 
 Location: `mcp_server/`
 
 Important files:
 
-- `server.py` - combined thin stdio entry point.
-- `vs_server.py` - strict VS-only entry point that does not import Rider.
-- `mcp_app.py` - shared FastMCP application instance.
+- `vs_server.py` - Visual Studio MCP stdio entry point.
+- `vs_launcher.py` - stable, version-independent launcher that validates the
+  signed bundle and runs the active `vs_server.py`.
+- `vs_mcp_app.py` - `VisualStudioFastMCP` application instance.
 - `tool_modules/` - domain modules for capability, instance, snapshot, control,
-  breakpoint, memory, and native/managed tools.
-- `tool_registry.py` - declarative tool/backend matrix, aliases, timeout classes,
+  breakpoint, memory, and native/managed tools; registered through
+  `tool_modules/__init__.py::register_vs()`.
+- `vs_tool_registry.py` - declarative tool/backend matrix, aliases, timeout classes,
   supported backends, and registry validation.
 - `debug_method_manifest.json` - shared VSIX/Python source of truth for backend
   method kind, base capabilities, and conditional capabilities.
 - `tool_context.py` - shared formatting, error handling, timeout, and request helpers.
-- `ide_bridge.py` - backend selection and preferred-IDE routing.
-- `vs_bridge.py` / `rider_bridge.py` - named pipe clients.
+- `vs_session.py` - `VSSessionManager` target selection, pinning, and dispatch.
+- `vs_bridge.py` - named pipe client.
 - `bootstrap.py` - extracts bundled wheels to a content-addressed
   `~/.ai-debugger/pydeps/...` directory and validates the exact plain-file tree
   before adding it to `sys.path`; the wheel directory must exactly match its
@@ -120,10 +99,9 @@ assuming a fixed flat tool list.
 
 ## Tool Domains
 
-The combined entry point exposes 86 MCP tools. The VS-only entry point exposes
-68 canonical tools by default: cross-IDE selectors and deprecated compatibility
+The server exposes 69 canonical MCP tools by default; deprecated compatibility
 aliases are omitted. Set `AIDB_ENABLE_LEGACY_ALIASES=1` only for migration.
-The registry in `mcp_server/tool_registry.py` is the source of truth for tool
+The registry in `mcp_server/vs_tool_registry.py` is the source of truth for tool
 names, aliases, backend support, and timeout classes. Backend method kind and
 capability policy come from `mcp_server/debug_method_manifest.json`, which is
 embedded into the VSIX assembly and shipped with the Python runtime.
@@ -132,16 +110,20 @@ embedded into the VSIX assembly and shipped with the Python runtime.
 
 - `debug_capabilities`
 - `detect_debug_sessions`
-- Combined entry only: `list_ide_instances`, `select_ide_instance`, `clear_ide_selection`
-- VS-only entry: `list_vs_instances`, `select_vs_instance`, `clear_vs_selection`
+- `list_vs_instances`, `select_vs_instance`, `clear_vs_selection`
+- Multi-target dispatch: `dispatch_vs_instances(method, process_ids, ...)`
+  uses independently authenticated immutable VS targets concurrently and leaves
+  the normal pinned single-instance target unchanged. It accepts AIDB/2 backend
+  method names rather than MCP tool names; command methods require
+  `allow_commands=True`.
 
 ### Snapshot and Inspection
 
 - `get_debug_status`
-- `get_callstack` (`get_call_stack` is a combined/legacy alias)
+- `get_callstack` (`get_call_stack` is a legacy alias)
 - `get_locals`
 - `evaluate_expression`, `evaluate_expressions_batch`
-- `get_threads` (`list_threads` is a combined/legacy alias)
+- `get_threads` (`list_threads` is a legacy alias)
 - `get_modules`, `get_exception`
 - `get_build_errors`, `get_errors_only`, `get_warnings_only`
 - `get_debug_output`, `search_output`
@@ -187,9 +169,6 @@ captured in one immutable snapshot; they never silently start another scan.
 debug session. While paused, pass one returned PID to `switch_process`; it does
 not enumerate ordinary local processes or attach a new target. The switch
 invalidates previously captured thread/frame context handles.
-
-For Rider, use stop tools to terminate the current debugging session; detach and
-same-session multi-process switching are not advertised as supported.
 
 ### Breakpoints and Navigation
 
@@ -241,10 +220,8 @@ These tools are Visual Studio only in the current implementation.
 
 ### Prerequisites
 
-- Windows 10/11 for the IDE debugger integrations.
+- Windows 10/11 for the Visual Studio debugger integration.
 - Visual Studio 2022 17.0+ or Visual Studio 2026 18.0+.
-- JetBrains Rider for the Rider plugin.
-- JDK 21+ for Rider plugin builds.
 - Python 3.10-3.14 x64 for the MCP server.
 - One or more MCP clients: Cursor, Codex, Claude Desktop, Claude Code, or OpenCode.
 
@@ -310,21 +287,6 @@ The stable launcher rejects unexpected files/directories, bytecode caches,
 symbolic links, junctions, and other reparse points. Setup applies the same
 strict tree policy so a rejected bundle is rebuilt instead of remaining stuck.
 
-### Build Rider Plugin
-
-```powershell
-cd RiderDebuggerMCP
-./gradlew.bat buildPlugin
-```
-
-Output:
-
-- `RiderDebuggerMCP/build/distributions/*.zip`
-
-Set `RIDER_HOME` to a local Rider installation if you need to build against that
-installation. Otherwise Gradle uses the platform version configured in
-`RiderDebuggerMCP/gradle.properties`.
-
 ### Explicit MCP Client Registration
 
 Visual Studio no longer starts the pipe server or modifies external client
@@ -334,9 +296,7 @@ configuration on every IDE startup. Invoke these commands from **Tools**:
 - **Start AIDebugger MCP Server (Full Access)** — explicitly enables expression, memory, breakpoint, debugger-context, execution-control, and session-write capabilities
 - **Configure AIDebugger MCP Clients...**
 
-Visual Studio setup registers only `AIDebuggerVS` with
-`AIDB_PREFERRED_IDE=vs`. Rider owns its independent `AIDebuggerRider`
-registration and is not discovered or configured by the VS-only server.
+Visual Studio setup registers `AIDebuggerVS` with `AIDB_PREFERRED_IDE=vs`.
 
 Supported registration targets:
 
@@ -387,10 +347,13 @@ It never downloads packages with `pip`.
 8. For first-pass crash/bug diagnosis, prefer `capture_debug_bundle()` in its
    default low-blocking mode and opt in to heavier data only when needed.
 
-When multiple Visual Studio instances are running through the VS-only entry,
-use `list_vs_instances` and `select_vs_instance` to pin the target. The combined
-entry uses `list_ide_instances` and `select_ide_instance`. Without a manual
-selection, the bridge prefers a uniquely paused or uniquely debugging instance.
+When multiple Visual Studio instances are running, use `list_vs_instances` and
+`select_vs_instance` to pin the target. Without a manual selection, the bridge
+prefers a uniquely paused or uniquely debugging instance.
+For one concurrent operation across several VS instances, use
+`dispatch_vs_instances(method="capture_debug_bundle_safe", process_ids=[...])`;
+each result reports its exact target identity and an unavailable target does not
+prevent the other authenticated targets from running.
 
 ## Development
 
@@ -398,7 +361,7 @@ Run the MCP server directly:
 
 ```powershell
 cd mcp_server
-python server.py
+python vs_server.py
 ```
 
 For development-only dependency installation:
@@ -427,18 +390,18 @@ cd mcp_server
 python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_available()))"
 ```
 
-GitHub Actions builds intentionally disable NuGet, Gradle, and Rider SDK cache
-writing to avoid consuming the repository cache quota.
+GitHub Actions builds intentionally disable NuGet cache writing to avoid
+consuming the repository cache quota.
 
 ## Troubleshooting
 
 ### Cannot connect to IDE
 
-1. Confirm Visual Studio or Rider is running.
-2. Confirm the matching AIDebugger extension/plugin is installed.
-3. Check the AIDebugger output/logs in the IDE.
-4. With the VS-only server, use `list_vs_instances` or `detect_debug_sessions`; the explicit combined development entry also provides `list_ide_instances`.
-5. Restart the IDE if the named pipe is stale.
+1. Confirm Visual Studio is running.
+2. Confirm the AIDebugger extension is installed.
+3. Check the AIDebugger output/logs in Visual Studio.
+4. Use `list_vs_instances` or `detect_debug_sessions` to discover the target.
+5. Restart Visual Studio if the named pipe is stale.
 
 ### Not in break mode
 
@@ -447,21 +410,20 @@ a breakpoint, break manually, or use `continue_and_wait_for_break`.
 
 ### Preferred IDE not found
 
-The MCP entry is strict. `AIDebuggerVS` only routes to Visual Studio and
-`AIDebuggerRider` only routes to Rider. Start the matching IDE or use the other
-MCP entry.
+The MCP entry is strict: `AIDebuggerVS` only routes to Visual Studio. Start
+Visual Studio, and confirm the client sets `AIDB_PREFERRED_IDE=vs`.
 
 ### Check named pipes
 
 ```powershell
 Get-ChildItem \\.\pipe\ | Where-Object { $_.Name -match '^AIDebuggerVS_[1-9][0-9]*(?:_control)?$' }
-Get-ChildItem \\.\pipe\ | Where-Object { $_.Name -like "AIDebuggerRider_*" }
 ```
 
 ## Protocol
 
-Both Visual Studio and Rider use AIDB/2: a four-byte big-endian payload length followed by
-strict UTF-8 JSON. Frames, parameters, results, and deadlines are bounded.
+The Visual Studio extension uses AIDB/2: a four-byte big-endian payload length
+followed by strict UTF-8 JSON. Frames, parameters, results, and deadlines are
+bounded.
 Every request is authenticated and declares its command/query kind, primary
 capability, immutable target identity, deadline, and debug-session generation.
 The server catalog additionally enforces every capability required by composite
@@ -494,7 +456,7 @@ operations (for example execution control plus read access):
 
 The owner-only instance registration and every response also carry a
 `protocolCatalogHash` (SHA-256 of the shared method manifest). Discovery fails
-with `PROTOCOL_CATALOG_MISMATCH` when the deployed IDE plugin and Python bundle
+with `PROTOCOL_CATALOG_MISMATCH` when the deployed VSIX and Python bundle
 do not describe the same protocol surface.
 
 Successful response:
@@ -514,8 +476,8 @@ a bounded 24-hour acceptance window. Completed tombstones remain fail-closed for
 that whole window; expired IDs are rejected before they can execute, so bounded
 reclamation never permits replay. Response bodies have a separate bounded cache.
 Transport loss after command acceptance returns `OUTCOME_UNKNOWN`; clients query
-`get_command_status` rather than replaying the command. Rider and VS both retain
-24-hour command tombstones and bounded response bodies. VS additionally retains
+`get_command_status` rather than replaying the command. Visual Studio retains
+24-hour command tombstones and bounded response bodies, and additionally retains
 queries that finish after the transport deadline in a bounded five-minute result
 journal.
 
@@ -527,13 +489,8 @@ puts the process-wide dispatcher into `poisoned`. Use `get_dispatcher_health` fo
 the active request/effect state plus actor queue depth, configured listener pool,
 command-ledger capacity, and query-journal usage; recovery requires restarting
 that Visual Studio process and cannot be bypassed by toggling the MCP server.
-
-Rider uses a bounded single debug-session actor, so mutable thread/frame state
-cannot race across pipe connections. `get_dispatcher_health`,
-`get_command_status`, and queued-request cancellation bypass debugger execution
-and remain available while the actor is busy. A running Rider command is not
-forcibly interrupted; deadline or transport loss is reported as
-`OUTCOME_UNKNOWN` until its ledger entry reaches a definitive result.
+`get_dispatcher_health`, `get_command_status`, and queued-request cancellation
+bypass debugger execution and remain available while the actor is busy.
 
 For Visual Studio, `AIDB_ALLOWED_CAPABILITIES` can restrict the server to a
 comma-separated subset. Pipe and instance-registration ACLs are always

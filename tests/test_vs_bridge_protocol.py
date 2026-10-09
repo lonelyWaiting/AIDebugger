@@ -20,7 +20,7 @@ from mcp_server import bootstrap
 
 bootstrap.ensure_deps()
 
-from mcp_server import ide_bridge, tool_registry, vs_bridge, vs_tool_registry
+from mcp_server import vs_bridge, vs_session, vs_tool_registry
 
 
 class VSBridgeResponseTests(unittest.TestCase):
@@ -281,44 +281,48 @@ class VSBridgeResponseTests(unittest.TestCase):
         self.assertEqual(["cancel", ("reap", True)], calls)
 
     def test_capability_mapping_matches_method_risk(self) -> None:
-        self.assertEqual("debug.execution.control", tool_registry.backend_method_capability("continue"))
-        self.assertEqual("debug.evaluate.unsafe", tool_registry.backend_method_capability("evaluate_expression"))
-        self.assertEqual("debug.memory.read", tool_registry.backend_method_capability("read_memory"))
-        self.assertEqual("debug.context.write", tool_registry.backend_method_capability("switch_thread"))
-        self.assertEqual("debug.read", tool_registry.backend_method_capability("get_debug_processes"))
-        self.assertEqual("debug.context.write", tool_registry.backend_method_capability("switch_process"))
-        self.assertEqual("server.control", tool_registry.backend_method_capability("cancel_request"))
-        self.assertEqual("command", tool_registry.backend_method_kind("cancel_request"))
+        self.assertEqual("debug.execution.control", vs_tool_registry.backend_method_capability("continue"))
+        self.assertEqual("debug.evaluate.unsafe", vs_tool_registry.backend_method_capability("evaluate_expression"))
+        self.assertEqual("debug.memory.read", vs_tool_registry.backend_method_capability("read_memory"))
+        self.assertEqual("debug.context.write", vs_tool_registry.backend_method_capability("switch_thread"))
+        self.assertEqual("debug.read", vs_tool_registry.backend_method_capability("get_debug_processes"))
+        self.assertEqual("debug.context.write", vs_tool_registry.backend_method_capability("switch_process"))
+        self.assertEqual("server.control", vs_tool_registry.backend_method_capability("cancel_request"))
+        self.assertEqual("command", vs_tool_registry.backend_method_kind("cancel_request"))
         cancel_annotations = vs_tool_registry.tool_annotation_values("cancel_debug_request")
         self.assertFalse(cancel_annotations["readOnlyHint"])
         self.assertTrue(cancel_annotations["destructiveHint"])
         self.assertTrue(cancel_annotations["idempotentHint"])
+        multi_annotations = vs_tool_registry.tool_annotation_values("dispatch_vs_instances")
+        self.assertFalse(multi_annotations["readOnlyHint"])
+        self.assertTrue(multi_annotations["destructiveHint"])
+        self.assertFalse(multi_annotations["idempotentHint"])
         self.assertEqual(
             ("debug.execution.control", "debug.memory.read", "debug.read"),
-            tool_registry.backend_method_capabilities("continue_and_capture_breakpoint"),
+            vs_tool_registry.backend_method_capabilities("continue_and_capture_breakpoint"),
         )
         self.assertEqual(
             ("debug.read",),
-            tool_registry.backend_method_capabilities("capture_debug_bundle_safe"),
+            vs_tool_registry.backend_method_capabilities("capture_debug_bundle_safe"),
         )
         self.assertEqual(
             ("debug.execution.control", "debug.read"),
-            tool_registry.backend_method_capabilities("continue_and_wait_for_break_safe"),
+            vs_tool_registry.backend_method_capabilities("continue_and_wait_for_break_safe"),
         )
         self.assertEqual(
             ("debug.evaluate.unsafe", "debug.read"),
-            tool_registry.backend_method_capabilities("get_locals"),
+            vs_tool_registry.backend_method_capabilities("get_locals"),
         )
         for method in ("get_locals", "get_full_context", "get_exception"):
             with self.subTest(method=method):
-                self.assertEqual("command", tool_registry.backend_method_kind(method))
+                self.assertEqual("command", vs_tool_registry.backend_method_kind(method))
         self.assertEqual(
             ("debug.memory.read", "debug.read"),
-            tool_registry.backend_method_capabilities("capture_native_context"),
+            vs_tool_registry.backend_method_capabilities("capture_native_context"),
         )
         self.assertIn(
             "debug.memory.read",
-            tool_registry.backend_method_capabilities("capture_debug_bundle", {"includeRegisters": True}),
+            vs_tool_registry.backend_method_capabilities("capture_debug_bundle", {"includeRegisters": True}),
         )
 
     def test_vs_registry_models_parameter_conditional_safe_routes(self) -> None:
@@ -442,7 +446,7 @@ class VSBridgeResponseTests(unittest.TestCase):
             self.assertEqual("INVALID_TARGET", raised.exception.code)
 
 
-class IDEBridgeRetryTests(unittest.IsolatedAsyncioTestCase):
+class VSBridgeSelectionTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     async def wait_until(predicate, timeout: float = 0.5) -> bool:
         deadline = asyncio.get_running_loop().time() + timeout
@@ -452,71 +456,36 @@ class IDEBridgeRetryTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         return bool(predicate())
 
-    async def test_ide_discovery_consumes_the_single_call_deadline(self) -> None:
-        bridge = ide_bridge.IDEBridge()
-        instance = ide_bridge.IDEInstance("vs", SimpleNamespace(
-            pipe_name="AIDebuggerVS_42",
-            process_id=42,
-            solution_name="test",
-            solution_path="test.sln",
-            is_debugging=False,
-            is_paused=False,
-            debug_mode="design",
-            current_process=None,
-            connection_status="ok",
-            last_error="",
-        ))
+    async def test_exact_call_advances_selected_epoch_on_authenticated_error_without_replay(self) -> None:
+        """A failed exact call advances the pinned epoch but is never replayed.
 
-        async def slow_discovery(preferred_ide=None, timeout=None):
-            self.assertLessEqual(timeout, 0.2)
-            await asyncio.sleep(0.15)
-            return [instance]
-
-        transport = AsyncMock()
-        with patch.object(bridge, "discover_instances", side_effect=slow_discovery), \
-             patch.object(ide_bridge.vs_bridge, "call_pipe", transport):
-            with self.assertRaises(ide_bridge.IDEBridgeError) as raised:
-                await bridge.call("get_debug_status", timeout=0.2, preferred_ide="vs")
-
-        self.assertEqual("DEADLINE_EXCEEDED_NOT_STARTED", raised.exception.code)
-        transport.assert_not_awaited()
-
-    async def test_authenticated_error_advances_ide_selection_epoch_without_replay(self) -> None:
-        bridge = ide_bridge.IDEBridge()
-        target = {
-            "pipeName": "AIDebuggerVS_42",
-            "processId": 42,
-            "processStartTimeUtcTicks": 123456,
-            "serverInstanceId": "instance",
-            "debugSessionGeneration": 3,
-            "breakSequence": 5,
-            "contextEpoch": 7,
-        }
-        current = dict(
-            target,
-            debugSessionGeneration=4,
-            breakSequence=1,
-            contextEpoch=2,
-        )
-        bridge._selected_ide = "vs"
+        The deleted combined bridge performed this advance inside
+        ``_call_vs_exact_and_advance``; the VS-only bridge now owns the same
+        behavior in ``VSBridge.call_pipe_exact``/``_advance_selected_target``.
+        """
+        bridge = vs_bridge.VSBridge()
+        registration = self.registration("AIDebuggerVS_42")
+        target = dict(registration, debugSessionGeneration=3, breakSequence=5, contextEpoch=7)
+        current = dict(target, debugSessionGeneration=4, breakSequence=1, contextEpoch=2)
         bridge._selected_pipe = target["pipeName"]
         bridge._selected_target = dict(target)
-        bridge._selection_generation = 9
+        bridge._selected_registration = dict(registration)
         error = vs_bridge.VSBridgeError("session changed", code="STALE_DEBUG_SESSION")
         error.current_target_identity = current
+        error.original_target_identity = dict(target)
+        error.target_identity = current
         transport = AsyncMock(side_effect=error)
 
-        with patch.object(ide_bridge.vs_bridge, "call_pipe_exact", transport):
-            with self.assertRaises(vs_bridge.VSBridgeError):
-                await bridge._call_vs_exact_and_advance(
-                    target,
-                    "get_debug_status",
-                    {},
-                    1.0,
-                    None,
-                    9,
-                    False,
-                )
+        try:
+            with patch.object(bridge, "call_pipe", transport):
+                with self.assertRaises(vs_bridge.VSBridgeError):
+                    await bridge.call_pipe_exact(
+                        target,
+                        "get_debug_status",
+                        registration_snapshot=registration,
+                    )
+        finally:
+            bridge._executor.shutdown(wait=True)
 
         transport.assert_awaited_once()
         self.assertEqual(current, bridge._selected_target)
@@ -591,36 +560,48 @@ class IDEBridgeRetryTests(unittest.IsolatedAsyncioTestCase):
     async def assert_selected_failure_is_not_retried(
         self,
         method: str,
-        expected_code: str,
+        expected_outcome_unknown: bool,
     ) -> None:
-        bridge = ide_bridge.IDEBridge()
-        bridge._selected_ide = "vs"
-        bridge._selected_pipe = "AIDebuggerVS_42"
-        bridge._selected_target = self.registration(bridge._selected_pipe)
+        """A pinned-target failure must neither be replayed nor redirected.
+
+        The VS-only bridge preserves the transport error code verbatim (the old
+        combined bridge rewrote it to OUTCOME_UNKNOWN/STALE_TARGET, which no
+        longer exists), but the safety contract is unchanged: exactly one
+        dispatch, no discovery fallback, and the pinned selection left intact.
+        """
+        bridge = vs_bridge.VSBridge()
+        registration = self.registration("AIDebuggerVS_42")
+        bridge._selected_pipe = registration["pipeName"]
+        bridge._selected_target = dict(registration)
+        bridge._selected_registration = dict(registration)
 
         transport_error = vs_bridge.VSBridgeError(
             "Pipe disconnected by server",
             code="PIPE_DISCONNECTED",
-            outcome_unknown=True,
+            outcome_unknown=expected_outcome_unknown,
         )
         call_pipe_exact = AsyncMock(side_effect=transport_error)
         discover = AsyncMock()
-        with patch.object(ide_bridge.vs_bridge, "call_pipe_exact", call_pipe_exact), patch.object(
-            bridge, "discover_instances", discover
-        ):
-            with self.assertRaises(ide_bridge.IDEBridgeError) as raised:
-                await bridge.call(method)
+        try:
+            with patch.object(bridge, "call_pipe_exact", call_pipe_exact), patch.object(
+                bridge, "discover_instances", discover
+            ):
+                with self.assertRaises(vs_bridge.VSBridgeError) as raised:
+                    await bridge.call(method)
 
-        self.assertEqual(expected_code, raised.exception.code)
-        self.assertEqual("vs", bridge._selected_ide)
-        self.assertEqual("AIDebuggerVS_42", bridge._selected_pipe)
-        self.assertEqual(self.registration(bridge._selected_pipe), bridge._selected_target)
-        call_pipe_exact.assert_awaited_once()
-        discover.assert_not_awaited()
+            self.assertEqual("PIPE_DISCONNECTED", raised.exception.code)
+            self.assertEqual(expected_outcome_unknown, raised.exception.outcome_unknown)
+            self.assertEqual("AIDebuggerVS_42", bridge._selected_pipe)
+            self.assertEqual(registration, bridge._selected_target)
+            self.assertEqual(registration, bridge._selected_registration)
+            call_pipe_exact.assert_awaited_once()
+            discover.assert_not_awaited()
+        finally:
+            bridge._executor.shutdown(wait=True)
 
-    async def test_command_transport_failure_reports_unknown_outcome(self) -> None:
-        self.assertEqual("command", tool_registry.backend_method_kind("continue"))
-        await self.assert_selected_failure_is_not_retried("continue", "OUTCOME_UNKNOWN")
+    async def test_command_transport_failure_is_not_retried_and_flags_unknown_outcome(self) -> None:
+        self.assertEqual("command", vs_tool_registry.backend_method_kind("continue"))
+        await self.assert_selected_failure_is_not_retried("continue", True)
 
     async def test_process_started_unknown_outcome_preserves_recovery_evidence(self) -> None:
         bridge = vs_bridge.VSBridge()
@@ -660,24 +641,29 @@ class IDEBridgeRetryTests(unittest.IsolatedAsyncioTestCase):
                 vs_bridge._INSTANCE_STATE.pop((pipe_name, "instance"), None)
             bridge._executor.shutdown(wait=True)
 
-    async def test_query_transport_failure_reports_stale_target(self) -> None:
-        self.assertEqual("query", tool_registry.backend_method_kind("get_debug_status"))
-        await self.assert_selected_failure_is_not_retried("get_debug_status", "STALE_TARGET")
+    async def test_query_transport_failure_is_not_retried_or_redirected(self) -> None:
+        self.assertEqual("query", vs_tool_registry.backend_method_kind("get_debug_status"))
+        await self.assert_selected_failure_is_not_retried("get_debug_status", False)
 
     async def test_backend_typed_error_is_preserved_without_clearing_target(self) -> None:
-        bridge = ide_bridge.IDEBridge()
-        bridge._selected_ide = "vs"
-        bridge._selected_pipe = "AIDebuggerVS_42"
-        bridge._selected_target = self.registration(bridge._selected_pipe)
+        bridge = vs_bridge.VSBridge()
+        registration = self.registration("AIDebuggerVS_42")
+        bridge._selected_pipe = registration["pipeName"]
+        bridge._selected_target = dict(registration)
+        bridge._selected_registration = dict(registration)
         backend_error = vs_bridge.VSBridgeError("Debugger must be paused", code="NOT_PAUSED")
 
-        with patch.object(ide_bridge.vs_bridge, "call_pipe_exact", AsyncMock(side_effect=backend_error)):
-            with self.assertRaises(ide_bridge.IDEBridgeError) as raised:
-                await bridge.call("get_locals")
+        try:
+            with patch.object(bridge, "call_pipe_exact", AsyncMock(side_effect=backend_error)):
+                with self.assertRaises(vs_bridge.VSBridgeError) as raised:
+                    await bridge.call("get_locals")
+        finally:
+            bridge._executor.shutdown(wait=True)
 
         self.assertEqual("NOT_PAUSED", raised.exception.code)
-        self.assertEqual("vs", bridge._selected_ide)
         self.assertEqual("AIDebuggerVS_42", bridge._selected_pipe)
+        self.assertEqual(registration, bridge._selected_target)
+        self.assertEqual(registration, bridge._selected_registration)
 
     def test_response_status_must_match_exactly_one_result_or_error(self) -> None:
         request_id = "7e93aa46-d9e4-4a79-8781-71e77e936fec"
@@ -711,29 +697,26 @@ class IDEBridgeRetryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("INVALID_RESPONSE", raised.exception.code)
 
     async def test_pinned_call_deducts_selection_lock_wait_from_deadline(self) -> None:
-        bridge = ide_bridge.IDEBridge()
-        target = self.registration("AIDebuggerVS_42")
-        bridge._selected_ide = "vs"
-        bridge._selected_pipe = target["pipeName"]
-        bridge._selected_target = dict(target)
-        response_target = dict(
-            target,
-            debugSessionGeneration=1,
-            breakSequence=1,
-            contextEpoch=1,
-        )
-        transport = AsyncMock(return_value=({"isPaused": True}, response_target))
+        bridge = vs_bridge.VSBridge()
+        registration = self.registration("AIDebuggerVS_42")
+        bridge._selected_pipe = registration["pipeName"]
+        bridge._selected_target = dict(registration)
+        bridge._selected_registration = dict(registration)
+        transport = AsyncMock(return_value={"isPaused": True})
 
-        await bridge._lock.acquire()
         try:
-            with patch.object(ide_bridge.vs_bridge, "call_pipe_exact", transport):
-                task = asyncio.create_task(bridge.call("get_debug_status", timeout=0.4))
-                await asyncio.sleep(0.15)
-                bridge._lock.release()
-                self.assertEqual({"isPaused": True}, await task)
+            await bridge._lock.acquire()
+            try:
+                with patch.object(bridge, "call_pipe_exact", transport):
+                    task = asyncio.create_task(bridge.call("get_debug_status", timeout=0.4))
+                    await asyncio.sleep(0.15)
+                    bridge._lock.release()
+                    self.assertEqual({"isPaused": True}, await task)
+            finally:
+                if bridge._lock.locked():
+                    bridge._lock.release()
         finally:
-            if bridge._lock.locked():
-                bridge._lock.release()
+            bridge._executor.shutdown(wait=True)
 
         forwarded_timeout = transport.await_args.args[3]
         self.assertGreater(forwarded_timeout, 0.1)
@@ -789,6 +772,46 @@ class IDEBridgeRetryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             bridge._executor.shutdown(wait=True)
 
+    async def test_exact_call_can_skip_advancing_the_selected_target(self) -> None:
+        """Multi-target dispatch must not rewrite the pinned single-instance target."""
+        bridge = vs_bridge.VSBridge()
+        registration = self.registration("AIDebuggerVS_42")
+        target = dict(
+            registration,
+            debugSessionGeneration=7,
+            breakSequence=8,
+            contextEpoch=9,
+        )
+        response_target = dict(
+            target,
+            debugSessionGeneration=8,
+            breakSequence=0,
+            contextEpoch=10,
+        )
+        bridge._selected_pipe = target["pipeName"]
+        bridge._selected_target = dict(target)
+        bridge._selected_registration = dict(registration)
+        try:
+            with patch.object(
+                bridge,
+                "call_pipe",
+                AsyncMock(return_value=({"isPaused": False}, response_target)),
+            ):
+                result, returned_target = await bridge.call_pipe_exact(
+                    target,
+                    "get_debug_status",
+                    registration_snapshot=registration,
+                    include_target=True,
+                    advance_selection=False,
+                )
+            self.assertEqual({"isPaused": False}, result)
+            # The caller still learns the new epoch from the return value...
+            self.assertEqual(response_target, returned_target)
+            # ...but the pinned target a later bare call resolves to is untouched.
+            self.assertEqual(target, bridge._selected_target)
+        finally:
+            bridge._executor.shutdown(wait=True)
+
     async def test_non_refresh_query_rejects_changed_debug_epoch(self) -> None:
         bridge = vs_bridge.VSBridge()
         registration = self.registration("AIDebuggerVS_42")
@@ -815,10 +838,11 @@ class IDEBridgeRetryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             bridge._executor.shutdown(wait=True)
 
-    async def test_unified_selected_target_advances_after_session_refresh(self) -> None:
-        bridge = ide_bridge.IDEBridge()
+    async def test_selected_target_advances_after_session_refresh_via_call(self) -> None:
+        bridge = vs_bridge.VSBridge()
+        registration = self.registration("AIDebuggerVS_42")
         target = dict(
-            self.registration("AIDebuggerVS_42"),
+            registration,
             debugSessionGeneration=7,
             breakSequence=8,
             contextEpoch=9,
@@ -829,16 +853,18 @@ class IDEBridgeRetryTests(unittest.IsolatedAsyncioTestCase):
             breakSequence=0,
             contextEpoch=10,
         )
-        bridge._selected_ide = "vs"
         bridge._selected_pipe = target["pipeName"]
         bridge._selected_target = dict(target)
-        bridge._selected_registration = self.registration(target["pipeName"])
-        with patch.object(
-            ide_bridge.vs_bridge,
-            "call_pipe_exact",
-            AsyncMock(return_value=({"isPaused": False}, response_target)),
-        ):
-            result = await bridge.call("get_debug_status")
+        bridge._selected_registration = dict(registration)
+        try:
+            with patch.object(
+                bridge,
+                "call_pipe",
+                AsyncMock(return_value=({"isPaused": False}, response_target)),
+            ):
+                result = await bridge.call("get_debug_status")
+        finally:
+            bridge._executor.shutdown(wait=True)
         self.assertEqual({"isPaused": False}, result)
         self.assertEqual(response_target, bridge._selected_target)
 
@@ -1248,8 +1274,8 @@ class IDEBridgeRetryTests(unittest.IsolatedAsyncioTestCase):
                 vs_bridge._INSTANCE_STATE.pop((pipe_name, "instance"), None)
             bridge._executor.shutdown(wait=True)
 
-    async def test_unified_auto_selection_reuses_discovery_registration_for_selection_and_call(self) -> None:
-        bridge = ide_bridge.IDEBridge()
+    async def test_auto_selection_reuses_discovery_registration_for_selection_and_call(self) -> None:
+        bridge = vs_bridge.VSBridge()
         pipe_name = "AIDebuggerVS_42"
         registration = dict(
             self.registration(pipe_name),
@@ -1265,35 +1291,30 @@ class IDEBridgeRetryTests(unittest.IsolatedAsyncioTestCase):
             "isPaused": True,
             "isDebugging": True,
         }, registration_snapshot=registration)
-        instance = ide_bridge.IDEInstance("vs", discovered)
-        select = Mock(return_value=instance.target_identity())
-        call = AsyncMock(return_value=({"isPaused": True}, instance.target_identity()))
+        call = AsyncMock(return_value={"isPaused": True})
 
-        with patch.object(bridge, "discover_instances", AsyncMock(return_value=[instance])), \
-             patch.object(ide_bridge.vs_bridge, "select_instance", select), \
-             patch.object(
-                 ide_bridge.vs_bridge,
-                 "get_selected_registration_snapshot",
-                 return_value=registration,
-             ), \
-             patch.object(ide_bridge.vs_bridge, "call_pipe_exact", call):
-            result = await bridge.call("get_debug_status", preferred_ide="vs")
+        try:
+            with patch.object(bridge, "discover_instances", AsyncMock(return_value=[discovered])) as discover, \
+                 patch.object(bridge, "call_pipe_exact", call):
+                result = await bridge.call("get_debug_status")
+        finally:
+            bridge._executor.shutdown(wait=True)
 
         self.assertEqual({"isPaused": True}, result)
-        self.assertEqual(
-            vs_bridge._copy_registration_snapshot(registration),
-            select.call_args.kwargs["registration_snapshot"],
-        )
         expected_snapshot = vs_bridge._copy_registration_snapshot(registration)
         self.assertEqual(expected_snapshot, call.await_args.kwargs["registration_snapshot"])
         self.assertEqual(expected_snapshot, bridge._selected_registration)
+        # Auto-selection pins the immutable instance identity before dispatching.
+        self.assertEqual(discovered.target_identity(), call.await_args.args[0])
+        self.assertEqual(discovered.target_identity(), bridge._selected_target)
+        discover.assert_awaited_once()
 
     async def test_concurrent_explicit_selection_wins_over_inflight_auto_selection(self) -> None:
-        bridge = ide_bridge.IDEBridge()
+        bridge = vs_bridge.VSBridge()
         entered_discovery = asyncio.Event()
         release_discovery = asyncio.Event()
 
-        def discovered_instance(process_id: int, token: str) -> ide_bridge.IDEInstance:
+        def discovered_instance(process_id: int, token: str) -> tuple[vs_bridge.VSInstance, dict]:
             pipe_name = f"AIDebuggerVS_{process_id}"
             registration = {
                 "protocol": vs_bridge.PROTOCOL_VERSION,
@@ -1304,55 +1325,55 @@ class IDEBridgeRetryTests(unittest.IsolatedAsyncioTestCase):
                 "authToken": token,
                 "capabilities": ["server.control", "debug.read"],
             }
-            return ide_bridge.IDEInstance("vs", vs_bridge.VSInstance(pipe_name, {
+            instance = vs_bridge.VSInstance(pipe_name, {
                 "processId": process_id,
                 "processStartTimeUtcTicks": registration["processStartTimeUtcTicks"],
                 "serverInstanceId": registration["serverInstanceId"],
                 "connectionStatus": "ok",
                 "isPaused": True,
                 "isDebugging": True,
-            }, registration_snapshot=registration))
+            }, registration_snapshot=registration)
+            return instance, registration
 
-        automatic = discovered_instance(41, "token-a")
-        explicit = discovered_instance(42, "token-b")
+        automatic, _ = discovered_instance(41, "token-a")
+        explicit, explicit_registration = discovered_instance(42, "token-b")
 
-        async def discovery(preferred_ide=None, timeout=None):
+        async def discovery(*args, **kwargs):
             entered_discovery.set()
             await release_discovery.wait()
             return [automatic]
 
-        transport = AsyncMock(return_value=({"isPaused": True}, explicit.target_identity()))
-        select_backend = Mock(side_effect=lambda **kwargs: dict(kwargs["target_identity"]))
-        with patch.object(bridge, "discover_instances", side_effect=discovery), \
-             patch.object(ide_bridge.vs_bridge, "select_instance", select_backend), \
-             patch.object(
-                 ide_bridge.vs_bridge,
-                 "get_selected_registration_snapshot",
-                 return_value=explicit.registration_snapshot(),
-             ), \
-             patch.object(ide_bridge.vs_bridge, "call_pipe_exact", transport):
-            request = asyncio.create_task(
-                bridge.call("get_debug_status", preferred_ide="vs")
-            )
-            await asyncio.wait_for(entered_discovery.wait(), timeout=0.2)
-            bridge.select_instance(
-                "vs",
-                pipe_name=explicit.pipe_name,
-                target_identity=explicit.target_identity(),
-                registration_snapshot=explicit.registration_snapshot(),
-            )
-            release_discovery.set()
-            result = await request
+        transport = AsyncMock(return_value={"isPaused": True})
+        try:
+            with patch.object(bridge, "discover_instances", side_effect=discovery), \
+                 patch.object(bridge, "call_pipe_exact", transport):
+                request = asyncio.create_task(bridge.call("get_debug_status"))
+                await asyncio.wait_for(entered_discovery.wait(), timeout=0.5)
+                bridge.select_instance(
+                    pipe_name=explicit.pipe_name,
+                    target_identity=explicit.target_identity(),
+                    registration_snapshot=explicit.registration_snapshot(),
+                )
+                release_discovery.set()
+                result = await request
 
-        self.assertEqual({"isPaused": True}, result)
-        self.assertEqual(explicit.target_identity(), transport.await_args.args[0])
-        self.assertEqual(
-            explicit.registration_snapshot(),
-            transport.await_args.kwargs["registration_snapshot"],
-        )
-        self.assertEqual(("vs", explicit.pipe_name), await bridge.get_selected_target())
-        self.assertEqual(explicit.target_identity(), await bridge.get_selected_target_identity())
-        self.assertEqual(1, select_backend.call_count)
+            expected_identity = vs_bridge._target_identity_from_registration(
+                explicit.pipe_name, explicit_registration
+            )
+            self.assertEqual({"isPaused": True}, result)
+            # The in-flight auto request is redirected to the explicit selection.
+            self.assertEqual(expected_identity, transport.await_args.args[0])
+            self.assertEqual(
+                explicit.registration_snapshot(),
+                transport.await_args.kwargs["registration_snapshot"],
+            )
+            ide, pipe_name, target, _ = await bridge.get_selection_snapshot()
+            self.assertEqual("vs", ide)
+            self.assertEqual(explicit.pipe_name, pipe_name)
+            self.assertEqual(expected_identity, target)
+        finally:
+            release_discovery.set()
+            bridge._executor.shutdown(wait=True)
 
     async def test_guard_timeout_returns_without_waiting_for_remote_cleanup(self) -> None:
         bridge = vs_bridge.VSBridge()
@@ -1431,6 +1452,54 @@ class IDEBridgeRetryTests(unittest.IsolatedAsyncioTestCase):
                 vs_bridge._INSTANCE_STATE.pop((pipe_name, "instance"), None)
             bridge._executor.shutdown(wait=True)
             bridge._control_executor.shutdown(wait=True)
+
+
+class VSSessionManagerTests(unittest.IsolatedAsyncioTestCase):
+    """The thin VS-only session wrapper that replaced the combined IDEBridge."""
+
+    def test_preferred_ide_is_always_vs(self) -> None:
+        self.assertEqual("vs", vs_session.VSSessionManager.get_preferred_ide())
+
+    async def test_non_vs_preference_is_rejected_before_dispatch(self) -> None:
+        backend = Mock()
+        backend.discover_instances = AsyncMock()
+        manager = vs_session.VSSessionManager(bridge=backend)
+
+        with self.assertRaises(vs_session.IDEBridgeError) as raised:
+            await manager.discover_instances(preferred_ide="rider")
+        self.assertEqual("INVALID_ARGUMENT", raised.exception.code)
+
+        with self.assertRaises(vs_session.IDEBridgeError) as raised:
+            manager.select_instance(ide="rider")
+        self.assertEqual("INVALID_ARGUMENT", raised.exception.code)
+
+        backend.discover_instances.assert_not_awaited()
+
+    async def test_call_forwards_include_target_and_accepts_vs_preference(self) -> None:
+        backend = Mock()
+        backend.call = AsyncMock(return_value={"isPaused": True})
+        manager = vs_session.VSSessionManager(bridge=backend)
+
+        result = await manager.call(
+            "get_debug_status",
+            {"depth": 1},
+            3.0,
+            preferred_ide="vs",
+            _include_target=True,
+        )
+
+        self.assertEqual({"isPaused": True}, result)
+        backend.call.assert_awaited_once_with(
+            "get_debug_status", {"depth": 1}, 3.0, include_target=True
+        )
+
+    async def test_discover_instances_defaults_to_bridge_timeout(self) -> None:
+        backend = Mock()
+        backend.discover_instances = AsyncMock(return_value=[])
+        manager = vs_session.VSSessionManager(bridge=backend)
+
+        self.assertEqual([], await manager.discover_instances(preferred_ide=None, timeout=None))
+        backend.discover_instances.assert_awaited_once_with(timeout=vs_bridge.DEFAULT_TIMEOUT)
 
 
 if __name__ == "__main__":

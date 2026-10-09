@@ -357,8 +357,14 @@ def use_vs_safe_backend(
         and preferred in {"vs", "visualstudio", "visual-studio", "visual_studio"}
     )
 
-def handle_ide_error(e: Exception, operation: str) -> None:
-    """Raise a typed MCP tool error instead of returning success-shaped error text."""
+def handle_ide_error(e: Exception, operation: str, *, method: Optional[str] = None) -> None:
+    """Raise a typed MCP tool error instead of returning success-shaped error text.
+
+    ``method`` lets a tool that forwards an arbitrary caller-chosen backend
+    method (for example multi-target dispatch) report the kind of the method
+    that actually failed, rather than a conservative union over every method
+    the tool could route.
+    """
     code = getattr(e, "code", "IDE_BRIDGE_ERROR")
     try:
         try:
@@ -368,7 +374,7 @@ def handle_ide_error(e: Exception, operation: str) -> None:
             )
         except ImportError:
             from vs_tool_registry import DEBUG_METHOD_MANIFEST, backend_methods_for_tool
-        backend_methods = backend_methods_for_tool(operation)
+        backend_methods = (method,) if method is not None else backend_methods_for_tool(operation)
         if not backend_methods and operation in DEBUG_METHOD_MANIFEST:
             backend_methods = (operation,)
         operation_kind = (

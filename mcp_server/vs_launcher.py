@@ -36,6 +36,7 @@ _TOOL_MODULE_FILES = {
     "capability_tools.py",
     "control_tools.py",
     "memory_tools.py",
+    "multi_vs_tools.py",
     "native_managed_tools.py",
     "snapshot_tools.py",
     "vs_instance_tools.py",

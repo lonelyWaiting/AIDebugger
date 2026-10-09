@@ -65,7 +65,16 @@ def _current_process_start_time_utc_ticks() -> int:
         return _CLIENT_PROCESS_START_TICKS
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.argtypes = []
     kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
     handle = kernel32.GetCurrentProcess()
     creation = wintypes.FILETIME()
     exit_time = wintypes.FILETIME()

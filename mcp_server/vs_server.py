@@ -5,7 +5,6 @@ import os
 import sys
 
 os.environ["AIDB_PREFERRED_IDE"] = "vs"
-os.environ["AIDB_SERVER_SCOPE"] = "vs"
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")

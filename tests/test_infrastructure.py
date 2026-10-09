@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import copy
+import ctypes
+from ctypes import wintypes
 import importlib.util
 import json
 import os
@@ -13,7 +15,6 @@ import sys
 import tempfile
 import threading
 import time
-import types
 import unittest
 import zipfile
 from unittest import mock
@@ -32,25 +33,42 @@ class InfrastructureBehaviorTests(unittest.TestCase):
         debugging: bool = False,
         connection_status: str = "ok",
     ):
-        from mcp_server.ide_bridge import IDEInstance
+        from mcp_server.vs_bridge import VSInstance
 
-        return IDEInstance("vs", types.SimpleNamespace(
-            pipe_name=f"AIDebuggerVS_{process_id}",
-            process_id=process_id,
-            solution_name=f"Solution{process_id}",
-            solution_path=f"C:/src/Solution{process_id}.sln",
-            is_debugging=debugging or paused,
-            is_paused=paused,
-            debug_mode="break" if paused else ("run" if debugging else "design"),
-            current_process="game.exe" if debugging or paused else "",
-            connection_status=connection_status,
-            last_error="" if connection_status == "ok" else "unreachable",
-            allowed_capabilities=["server.control", "debug.read"],
-            access_mode="read_only",
-            ide_version="17.0",
-            process_start_time_utc_ticks=process_id * 1000,
-            server_instance_id=f"server-{process_id}",
-        ))
+        return VSInstance(
+            f"AIDebuggerVS_{process_id}",
+            {
+                "processId": process_id,
+                "solutionName": f"Solution{process_id}",
+                "solutionPath": f"C:/src/Solution{process_id}.sln",
+                "isDebugging": debugging or paused,
+                "isPaused": paused,
+                "debugMode": "break" if paused else ("run" if debugging else "design"),
+                "currentProcess": "game.exe" if debugging or paused else "",
+                "vsVersion": "17.0",
+                "connectionStatus": connection_status,
+                "lastError": "" if connection_status == "ok" else "unreachable",
+                "allowedCapabilities": ["server.control", "debug.read"],
+                "accessMode": "read_only",
+                "processStartTimeUtcTicks": process_id * 1000,
+                "serverInstanceId": f"server-{process_id}",
+            },
+        )
+
+    @staticmethod
+    def _tool(tool):
+        """Return a tool's undecorated function, bypassing MCP output validation.
+
+        Behavior tests inject deliberately partial backend fixtures that the
+        structured output contract would reject; the output contract itself is
+        covered by the schema/registry tests. This mirrors the pre-refactor
+        wrapper, which returned the raw tool payload.
+        """
+        return getattr(tool, "__wrapped__", tool)
+
+    @staticmethod
+    def _payload(response):
+        return response.get("result", response) if isinstance(response, dict) else response
 
     def test_dependency_extraction_lock_serializes_same_stamp(self) -> None:
         from mcp_server import bootstrap
@@ -158,6 +176,51 @@ class InfrastructureBehaviorTests(unittest.TestCase):
         self.assertEqual(payload["authToken"], registration["authToken"])
         self.assertEqual(payload["capabilities"], registration["capabilities"])
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows process-time ABI")
+    def test_vs_client_process_time_declares_pointer_sized_kernel32_signature(self) -> None:
+        from mcp_server import vs_trust
+
+        expected_filetime = 0x123456789
+
+        class FakeKernel32:
+            def __init__(self) -> None:
+                self.GetCurrentProcess = mock.Mock(return_value=wintypes.HANDLE(-1))
+                self.GetProcessTimes = mock.Mock(side_effect=self._get_process_times)
+
+            @staticmethod
+            def _get_process_times(handle, creation, exit_time, kernel, user):
+                filetime = ctypes.cast(
+                    creation,
+                    ctypes.POINTER(wintypes.FILETIME),
+                ).contents
+                filetime.dwLowDateTime = expected_filetime & 0xFFFFFFFF
+                filetime.dwHighDateTime = expected_filetime >> 32
+                return True
+
+        fake_kernel32 = FakeKernel32()
+        previous = vs_trust._CLIENT_PROCESS_START_TICKS
+        try:
+            vs_trust._CLIENT_PROCESS_START_TICKS = None
+            with mock.patch.object(vs_trust.ctypes, "WinDLL", return_value=fake_kernel32):
+                actual = vs_trust._current_process_start_time_utc_ticks()
+        finally:
+            vs_trust._CLIENT_PROCESS_START_TICKS = previous
+
+        self.assertEqual(expected_filetime + 504_911_232_000_000_000, actual)
+        self.assertEqual([], fake_kernel32.GetCurrentProcess.argtypes)
+        self.assertIs(wintypes.HANDLE, fake_kernel32.GetCurrentProcess.restype)
+        self.assertIs(wintypes.BOOL, fake_kernel32.GetProcessTimes.restype)
+        self.assertEqual(
+            [
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+            ],
+            fake_kernel32.GetProcessTimes.argtypes,
+        )
+
     def test_instance_registration_rejects_protocol_catalog_mismatch(self) -> None:
         from mcp_server import vs_trust
 
@@ -247,7 +310,8 @@ class InfrastructureBehaviorTests(unittest.TestCase):
         )
         tool_files = (
             "__init__.py", "capability_tools.py", "vs_instance_tools.py", "snapshot_tools.py",
-            "native_managed_tools.py", "control_tools.py", "breakpoint_tools.py", "memory_tools.py",
+            "multi_vs_tools.py", "native_managed_tools.py", "control_tools.py", "breakpoint_tools.py",
+            "memory_tools.py",
         )
         with tempfile.TemporaryDirectory() as temporary_directory:
             target = pathlib.Path(temporary_directory)
@@ -262,7 +326,6 @@ class InfrastructureBehaviorTests(unittest.TestCase):
 
             program = r'''
 import asyncio, os
-os.environ["AIDB_SERVER_SCOPE"] = "vs"
 os.environ["AIDB_PREFERRED_IDE"] = "vs"
 import vs_server, vs_bridge, vs_session, vs_tool_registry
 
@@ -315,6 +378,18 @@ async def check():
     ):
         _, payload = await vs_server.mcp.call_tool(name, arguments)
         assert isinstance(payload["result"], dict), name
+    async def exact(target, method, params=None, timeout=10.0, include_target=False, registration_snapshot=None, advance_selection=True):
+        assert method == "get_debug_status"
+        assert registration_snapshot["processId"] == 42
+        assert advance_selection is False
+        return {"isDebugging": True}, dict(target)
+    vs_bridge.call_pipe_exact = exact
+    _, dispatched = await vs_server.mcp.call_tool(
+        "dispatch_vs_instances",
+        {"method": "get_debug_status", "process_ids": [42]},
+    )
+    assert dispatched["result"]["success"] is True
+    assert dispatched["result"]["results"][0]["target"]["processId"] == 42
     fake.conflict = True
     _, selected = await vs_server.mcp.call_tool("select_vs_instance", {"process_id": 42})
     assert selected["result"]["errorCode"] == "SELECTION_CHANGED"
@@ -350,6 +425,91 @@ asyncio.run(check())
             launcher._payload_signature(ROOT / "tests" / "fixtures" / "VsBundleSignature"),
         )
 
+    def test_vs_payload_allowlists_agree_across_python_powershell_and_csharp(self) -> None:
+        """The VS bundle allowlist is duplicated across four languages; they must match.
+
+        A module added to the bundle but missing from any one copy makes the
+        launcher's signature check reject every shipped bundle.
+        """
+        spec = importlib.util.spec_from_file_location(
+            "aidb_vs_launcher_allowlist_test", ROOT / "mcp_server" / "vs_launcher.py"
+        )
+        launcher = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(launcher)
+
+        def ps_array(text: str, variable: str) -> set:
+            match = re.search(
+                r"\$" + variable + r"\s*=\s*@\((?P<body>.*?)\)", text, re.DOTALL
+            )
+            self.assertIsNotNone(match, f"${variable} array not found")
+            return set(re.findall(r'"([^"]+)"', match.group("body")))
+
+        def cs_hash_set(text: str, name: str) -> set:
+            match = re.search(
+                name + r"\s*=\s*new HashSet<string>\([^)]*\)\s*\{(?P<body>.*?)\}",
+                text,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(match, f"{name} not found")
+            return set(re.findall(r'"([^"]+)"', match.group("body")))
+
+        def cs_root_files(text: str) -> set:
+            match = re.search(
+                r"IsVsRuntimeRootFile\(string fileName\).*?\n(?P<body>.*?)\n        \}",
+                text,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(match, "IsVsRuntimeRootFile not found")
+            return set(re.findall(r'case\s+"([^"]+)"', match.group("body")))
+
+        scripts = (
+            ("tools/Verify-Vsix.ps1", (ROOT / "tools" / "Verify-Vsix.ps1").read_text(encoding="utf-8")),
+            (
+                "VSDebuggerMCP/Install-VSIX.ps1",
+                (ROOT / "VSDebuggerMCP" / "Install-VSIX.ps1").read_text(encoding="utf-8"),
+            ),
+        )
+        bundle_policy = (
+            ROOT / "VSDebuggerMCP" / "Registration" / "BundlePathPolicy.cs"
+        ).read_text(encoding="utf-8")
+
+        python_modules = set(launcher._TOOL_MODULE_FILES)
+        self.assertIn("multi_vs_tools.py", python_modules)
+        self.assertTrue(
+            launcher._is_payload_file("tool_modules/multi_vs_tools.py"),
+            "vs_launcher must accept the multi-instance dispatch tool module",
+        )
+        self.assertEqual(
+            python_modules,
+            cs_hash_set(bundle_policy, "VsToolModuleFiles"),
+            "vs_launcher._TOOL_MODULE_FILES and BundlePathPolicy.VsToolModuleFiles disagree",
+        )
+        for name, script in scripts:
+            prefixed = ps_array(script, "toolModules")
+            self.assertTrue(
+                all(entry.startswith("tool_modules/") for entry in prefixed),
+                f"{name} $toolModules entries must be tool_modules/-prefixed",
+            )
+            self.assertEqual(
+                python_modules,
+                {entry.split("/", 1)[1] for entry in prefixed},
+                f"{name} $toolModules disagrees with vs_launcher._TOOL_MODULE_FILES",
+            )
+
+        python_root = set(launcher._ROOT_FILES)
+        self.assertEqual(
+            python_root,
+            cs_root_files(bundle_policy),
+            "vs_launcher._ROOT_FILES and BundlePathPolicy.IsVsRuntimeRootFile disagree",
+        )
+        for name, script in scripts:
+            self.assertEqual(
+                python_root,
+                ps_array(script, "rootFiles"),
+                f"{name} $rootFiles disagrees with vs_launcher._ROOT_FILES",
+            )
+
     def test_vs_launcher_validates_canonical_signature_and_honors_explicit_rollback(self) -> None:
         spec = importlib.util.spec_from_file_location(
             "aidb_vs_launcher_test", ROOT / "mcp_server" / "vs_launcher.py"
@@ -368,6 +528,7 @@ asyncio.run(check())
                 (staging / "tool_modules").mkdir()
                 (staging / "tool_modules" / "__init__.py").write_text("", encoding="utf-8")
                 (staging / "tool_modules" / "breakpoint_tools.py").write_text("X = 1\n", encoding="utf-8")
+                (staging / "tool_modules" / "multi_vs_tools.py").write_text("Y = 2\n", encoding="utf-8")
                 signature = launcher._payload_signature(staging)
                 self.assertRegex(signature, r"^[0-9a-f]{64}$")
                 identity = f"{version.replace('.', '_')}_{signature[:16]}"
@@ -535,24 +696,6 @@ asyncio.run(check())
         )
         self.assertIn(f"Stamp-Version: {expected} (target=VS)", result.stdout)
 
-    def test_vs_only_entrypoint_does_not_import_rider_backend(self) -> None:
-        environment = os.environ.copy()
-        environment["AIDB_PREFERRED_IDE"] = "vs"
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "import sys; import mcp_server.ide_bridge as b; "
-                "assert b.rider_bridge is None; assert 'mcp_server.rider_bridge' not in sys.modules",
-            ],
-            cwd=ROOT,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-
     def test_vs_only_tool_surface_omits_cross_ide_selection_aliases(self) -> None:
         environment = os.environ.copy()
         environment["AIDB_PREFERRED_IDE"] = "vs"
@@ -562,10 +705,10 @@ asyncio.run(check())
                 "-c",
                 "import asyncio; "
                 "from mcp_server import bootstrap; bootstrap.ensure_deps(); "
-                "from mcp_server.mcp_app import mcp; "
-                "from mcp_server.tool_modules import register_all; register_all(); "
+                "from mcp_server.vs_mcp_app import mcp; "
+                "from mcp_server.tool_modules import register_vs; register_vs(); "
                 "names={tool.name for tool in asyncio.run(mcp.list_tools())}; "
-                "assert {'list_vs_instances','select_vs_instance','clear_vs_selection'} <= names; "
+                "assert {'list_vs_instances','select_vs_instance','clear_vs_selection','dispatch_vs_instances'} <= names; "
                 "assert not {'list_ide_instances','select_ide_instance','clear_ide_selection'} & names; "
                 "assert not {'get_call_stack','list_threads','continue','step_over','step_into','step_out','pause','stop_debugging'} & names",
             ],
@@ -581,7 +724,6 @@ asyncio.run(check())
         for aliases_enabled in (False, True):
             with self.subTest(aliases_enabled=aliases_enabled):
                 environment = os.environ.copy()
-                environment["AIDB_SERVER_SCOPE"] = "vs"
                 environment["AIDB_PREFERRED_IDE"] = "vs"
                 if aliases_enabled:
                     environment["AIDB_ENABLE_LEGACY_ALIASES"] = "1"
@@ -612,12 +754,14 @@ asyncio.run(check())
                 self.assertEqual(0, result.returncode, result.stdout + result.stderr)
 
     def test_all_mcp_tools_publish_and_return_structured_content(self) -> None:
-        from mcp_server.mcp_app import mcp
-        from mcp_server.tool_modules import register_all
+        from mcp_server.vs_mcp_app import mcp
+        from mcp_server.tool_modules import register_vs
 
-        register_all()
+        register_vs()
         tools = asyncio.run(mcp.list_tools())
-        self.assertGreater(len(tools), 70)
+        # The Visual Studio-only server exposes the full VS tool surface, which
+        # is smaller than the former VS+Rider combined catalog.
+        self.assertGreater(len(tools), 60)
         schema_shapes = set()
         for tool in tools:
             with self.subTest(tool=tool.name):
@@ -655,9 +799,10 @@ asyncio.run(check())
     def test_output_models_are_strict_and_cover_the_registry(self) -> None:
         from pydantic import ValidationError
         from mcp_server.output_models import _MODEL_BY_TOOL, output_model_for
-        from mcp_server.tool_registry import TOOLS
+        from mcp_server.vs_tool_registry import VS_TOOL_DOMAINS
 
-        self.assertEqual(set(TOOLS), set(_MODEL_BY_TOOL))
+        tools = {name for names in VS_TOOL_DOMAINS.values() for name in names}
+        self.assertEqual(tools, set(_MODEL_BY_TOOL))
         status_model = output_model_for("get_debug_status")
         validated = status_model.model_validate({
             "result": {"isDebugging": False, "isPaused": False, "debugMode": "design"}
@@ -1065,7 +1210,11 @@ asyncio.run(check())
         self.assertEqual("ok", result["status"])
         self.assertFalse(result["partial"])
         self.assertFalse(result["hasMore"])
-        self.assertNotIn("errorCode", result)
+        # The VS MCP wrapper now serializes the full structured output model, so
+        # an absent optional error is a present-and-null field rather than a
+        # missing key. The semantic assertion is unchanged: no error occurred.
+        self.assertIsNone(result["errorCode"])
+        self.assertIsNone(result["error"])
         self.assertEqual(["0x10100000"], result["matches"])
 
     def test_get_locals_requires_complete_frame_context(self) -> None:
@@ -1077,7 +1226,7 @@ asyncio.run(check())
 
         call = mock.AsyncMock(return_value={"variables": []})
         with mock.patch.object(snapshot_tools.ide_bridge, "call", call):
-            asyncio.run(snapshot_tools.get_locals(
+            asyncio.run(self._tool(snapshot_tools.get_locals)(
                 debug_session_generation=3,
                 break_sequence=4,
                 context_epoch=5,
@@ -1092,7 +1241,7 @@ asyncio.run(check())
         self.assertEqual("3:4:5:123:7:0", params["frameId"])
 
         with self.assertRaises(ToolError):
-            asyncio.run(snapshot_tools.get_locals(
+            asyncio.run(self._tool(snapshot_tools.get_locals)(
                 debug_session_generation=3,
                 break_sequence=4,
                 context_epoch=5,
@@ -1111,7 +1260,7 @@ asyncio.run(check())
 
         call = mock.AsyncMock(return_value={"modules": []})
         with mock.patch.object(snapshot_tools.ide_bridge, "call", call):
-            asyncio.run(snapshot_tools.get_modules(
+            asyncio.run(self._tool(snapshot_tools.get_modules)(
                 start_module_index=7,
                 scan_continuation_token="scan-token",
             ))
@@ -1121,13 +1270,13 @@ asyncio.run(check())
         self.assertNotIn("moduleSnapshotId", params)
 
         with self.assertRaises(ToolError):
-            asyncio.run(snapshot_tools.get_modules(
+            asyncio.run(self._tool(snapshot_tools.get_modules)(
                 module_snapshot_id="page-token",
                 scan_continuation_token="scan-token",
             ))
         for invalid in ("   ", "x" * 129):
             with self.subTest(scan_token=invalid), self.assertRaises(ToolError):
-                asyncio.run(snapshot_tools.get_modules(scan_continuation_token=invalid))
+                asyncio.run(self._tool(snapshot_tools.get_modules)(scan_continuation_token=invalid))
 
     def test_crash_triage_uses_only_stable_available_stack_registers(self) -> None:
         from mcp_server.tool_modules.snapshot_tools import _stack_pointer_from_bundle
@@ -1160,15 +1309,15 @@ asyncio.run(check())
 
     def test_tool_error_preserves_transport_outcome_unknown_and_request_id(self) -> None:
         from mcp.server.fastmcp.exceptions import ToolError
-        from mcp_server import ide_bridge
+        from mcp_server import vs_session
         from mcp_server.tool_context import handle_ide_error
 
-        error = ide_bridge.IDEBridgeError(
+        error = vs_session.IDEBridgeError(
             "response pipe disconnected",
             code="PIPE_DISCONNECTED",
             outcome_unknown=True,
-            request_id="7e93aa46-d9e4-4a79-8781-71e77e936fec",
         )
+        error.request_id = "7e93aa46-d9e4-4a79-8781-71e77e936fec"
         with self.assertRaises(ToolError) as raised:
             handle_ide_error(error, "continue")
         payload = json.loads(str(raised.exception))
@@ -1178,7 +1327,7 @@ asyncio.run(check())
 
     def test_stale_errors_require_refresh_and_are_never_blindly_retryable(self) -> None:
         from mcp.server.fastmcp.exceptions import ToolError
-        from mcp_server import ide_bridge
+        from mcp_server import vs_session
         from mcp_server.tool_context import handle_ide_error
 
         cases = (
@@ -1188,7 +1337,7 @@ asyncio.run(check())
         for operation, code, kind, target_refresh, context_refresh in cases:
             with self.subTest(operation=operation, code=code):
                 with self.assertRaises(ToolError) as raised:
-                    handle_ide_error(ide_bridge.IDEBridgeError("stale", code=code), operation)
+                    handle_ide_error(vs_session.IDEBridgeError("stale", code=code), operation)
                 payload = json.loads(str(raised.exception))
                 self.assertEqual(kind, payload["operationKind"])
                 self.assertFalse(payload["retryable"])
@@ -1199,12 +1348,12 @@ asyncio.run(check())
 
     def test_not_started_command_is_explicitly_safe_to_reinvoke_with_new_id(self) -> None:
         from mcp.server.fastmcp.exceptions import ToolError
-        from mcp_server import ide_bridge
+        from mcp_server import vs_session
         from mcp_server.tool_context import handle_ide_error
 
         with self.assertRaises(ToolError) as raised:
             handle_ide_error(
-                ide_bridge.IDEBridgeError("not started", code="DEADLINE_EXCEEDED_NOT_STARTED"),
+                vs_session.IDEBridgeError("not started", code="DEADLINE_EXCEEDED_NOT_STARTED"),
                 "continue",
             )
         payload = json.loads(str(raised.exception))
@@ -1214,7 +1363,7 @@ asyncio.run(check())
         self.assertTrue(payload["safeToReinvokeWithNewRequestId"])
 
     def test_step_and_capture_preserves_completed_step_when_bundle_fails(self) -> None:
-        from mcp_server import ide_bridge
+        from mcp_server import vs_session
         from mcp_server.tool_modules import snapshot_tools
 
         step = {
@@ -1223,12 +1372,12 @@ asyncio.run(check())
             "commandIssued": True,
             "outcome": "completed",
         }
-        bundle_error = ide_bridge.IDEBridgeError(
+        bundle_error = vs_session.IDEBridgeError(
             "capture disconnected",
             code="PIPE_DISCONNECTED",
             outcome_unknown=True,
-            request_id="59b5d26d-318e-4e6f-8dc1-a5990487f72f",
         )
+        bundle_error.request_id = "59b5d26d-318e-4e6f-8dc1-a5990487f72f"
         target = {
             "pipeName": "AIDebuggerVS_123",
             "processId": 123,
@@ -1242,9 +1391,9 @@ asyncio.run(check())
         bundle_call = mock.AsyncMock(side_effect=bundle_error)
         with mock.patch.object(snapshot_tools.ide_bridge, "call_with_target", step_call), \
              mock.patch.object(snapshot_tools.vs_bridge, "call_pipe_exact", bundle_call):
-            response = asyncio.run(snapshot_tools.step_and_capture())
+            response = asyncio.run(self._tool(snapshot_tools.step_and_capture)())
 
-        payload = response["result"]
+        payload = self._payload(response)
         self.assertEqual(step, payload["step"])
         self.assertIsNone(payload["bundle"])
         self.assertEqual("PIPE_DISCONNECTED", payload["bundleErrorCode"])
@@ -1252,7 +1401,7 @@ asyncio.run(check())
         self.assertEqual(bundle_error.request_id, payload["bundleRequestId"])
 
     def test_chunked_memory_search_preserves_prefix_when_later_chunk_fails(self) -> None:
-        from mcp_server import ide_bridge, vs_bridge
+        from mcp_server import vs_bridge
         from mcp_server.tool_modules import memory_tools
 
         chunk_size = memory_tools.MAX_MEMORY_SEARCH_CHUNK_SIZE
@@ -1349,7 +1498,9 @@ asyncio.run(check())
 
     def test_unified_memory_search_uses_vs_mapped_path_without_an_address(self) -> None:
         from mcp_server.tool_modules import memory_tools
-        from mcp_server.tool_registry import TOOLS
+        from mcp_server.vs_tool_registry import VS_TOOL_DOMAINS
+
+        tools = {name for names in VS_TOOL_DOMAINS.values() for name in names}
 
         backend_result = {
             "pattern": "AA",
@@ -1376,14 +1527,17 @@ asyncio.run(check())
                 continuation="eyJ2ZXJzaW9uIjoxfQ",
             ))
 
-        self.assertEqual(backend_result, response["result"])
+        payload = response["result"]
+        for key, value in backend_result.items():
+            with self.subTest(field=key):
+                self.assertEqual(value, payload[key])
         self.assertEqual("search_memory", call.await_args.args[0])
         params = call.await_args.args[1]
         self.assertNotIn("startAddress", params)
         self.assertEqual("eyJ2ZXJzaW9uIjoxfQ", params["continuation"])
         self.assertEqual("vs", call.await_args.kwargs["preferred_ide"])
-        self.assertIn("search_memory", TOOLS)
-        self.assertNotIn("search_dump_memory", TOOLS)
+        self.assertIn("search_memory", tools)
+        self.assertNotIn("search_dump_memory", tools)
 
     def test_step_and_capture_uses_safe_bundle_unless_unsafe_fields_are_requested(self) -> None:
         from mcp_server.tool_modules import snapshot_tools
@@ -1401,12 +1555,12 @@ asyncio.run(check())
         with mock.patch.dict(os.environ, {"AIDB_PREFERRED_IDE": "vs"}), \
              mock.patch.object(snapshot_tools.ide_bridge, "call_with_target", mock.AsyncMock(return_value=(step, target))), \
              mock.patch.object(snapshot_tools.vs_bridge, "call_pipe_exact", mock.AsyncMock(return_value={})) as bundle_call:
-            asyncio.run(snapshot_tools.step_and_capture())
+            asyncio.run(self._tool(snapshot_tools.step_and_capture)())
             self.assertIn("waitTimeoutMs", snapshot_tools.ide_bridge.call_with_target.await_args.args[1])
             self.assertEqual("capture_debug_bundle_safe", bundle_call.await_args.args[1])
             self.assertNotIn("includeException", bundle_call.await_args.args[2])
 
-            asyncio.run(snapshot_tools.step_and_capture(include_exception=True))
+            asyncio.run(self._tool(snapshot_tools.step_and_capture)(include_exception=True))
             self.assertEqual("capture_debug_bundle", bundle_call.await_args.args[1])
             self.assertTrue(bundle_call.await_args.args[2]["includeException"])
 
@@ -1452,9 +1606,9 @@ asyncio.run(check())
             "call_pipe_exact",
             mock.AsyncMock(side_effect=exact_call),
         ) as exact:
-            response = asyncio.run(snapshot_tools.crash_triage())
+            response = asyncio.run(self._tool(snapshot_tools.crash_triage)())
 
-        payload = response["result"]
+        payload = self._payload(response)
         self.assertEqual("0x140000000", payload["stackMemoryAddress"])
         self.assertEqual("@rsp", payload["stackMemoryAddressExpression"])
         self.assertNotIn("stackMemoryError", payload)
@@ -1501,21 +1655,6 @@ asyncio.run(check())
                 638000000000000000,
             ),
         )
-        self.assertEqual(
-            {
-                "ide": "rider",
-                "pipeName": "AIDebuggerRider_42",
-                "serverInstanceId": nonce,
-                "processId": 42,
-                "processStartTimeUtcTicks": 638000000000000000,
-            },
-            _build_recovery_target(
-                "AIDebuggerRider_42",
-                nonce,
-                42,
-                638000000000000000,
-            ),
-        )
         invalid_values = (
             ("AIDebuggerVS_1", nonce, True, 638000000000000000),
             ("AIDebuggerVS_42", nonce, 42, False),
@@ -1530,21 +1669,20 @@ asyncio.run(check())
             self.assertFalse(payload["retryable"])
             self.assertFalse(payload["outcomeUnknown"])
 
-    def test_exact_recovery_routes_to_original_backend(self) -> None:
+    def test_exact_recovery_routes_to_visual_studio_backend(self) -> None:
         from mcp_server.tool_modules import control_tools
 
         target = {
-            "ide": "rider",
-            "pipeName": "AIDebuggerRider_42",
+            "ide": "vs",
+            "pipeName": "AIDebuggerVS_42",
             "serverInstanceId": "a" * 32,
             "processId": 42,
             "processStartTimeUtcTicks": 638000000000000000,
         }
         with mock.patch.object(
-            control_tools.ide_bridge,
-            "call_rider_exact",
+            control_tools.vs_bridge,
+            "call_pipe_exact",
             mock.AsyncMock(return_value={"state": "completed"}),
-            create=True,
         ) as exact_call:
             result = asyncio.run(control_tools._call_recovery_target(
                 target,
@@ -1555,7 +1693,7 @@ asyncio.run(check())
         self.assertEqual({"state": "completed"}, result)
         exact_call.assert_awaited_once_with(
             {
-                "pipeName": "AIDebuggerRider_42",
+                "pipeName": "AIDebuggerVS_42",
                 "serverInstanceId": "a" * 32,
                 "processId": 42,
                 "processStartTimeUtcTicks": 638000000000000000,
@@ -1565,101 +1703,34 @@ asyncio.run(check())
             timeout=10.0,
         )
 
-    def test_combined_ide_instance_preserves_rider_registration_snapshot(self) -> None:
-        from mcp_server import ide_bridge, rider_bridge
-
-        registration = {
-            "protocol": "aidb/2",
-            "pipeName": "AIDebuggerRider_42",
-            "processId": 42,
-            "processStartTimeUtcTicks": 638000000000000000,
-            "serverInstanceId": "a" * 32,
-            "protocolCatalogHash": "b" * 64,
-            "authToken": "c" * 64,
-            "capabilities": ["server.control", "debug.read"],
-            "debugSessionGeneration": 7,
-            "breakSequence": 8,
-            "contextEpoch": 9,
-            "identityKnown": True,
-        }
-        rider = rider_bridge.RiderInstance(
-            registration["pipeName"],
-            {"processId": 42, "connectionStatus": "ok"},
-            registration,
-        )
-        combined = ide_bridge.IDEInstance("rider", rider)
-        self.assertEqual(registration, combined.registration_snapshot())
-        self.assertEqual(9, combined.target_identity()["contextEpoch"])
-
-    def test_combined_selection_pins_rider_registration(self) -> None:
-        from mcp_server import ide_bridge
-
-        registration = {
-            "protocol": "aidb/2",
-            "pipeName": "AIDebuggerRider_42",
-            "processId": 42,
-            "processStartTimeUtcTicks": 638000000000000000,
-            "serverInstanceId": "a" * 32,
-            "protocolCatalogHash": "b" * 64,
-            "authToken": "c" * 64,
-            "capabilities": ["server.control", "debug.read"],
-            "debugSessionGeneration": 7,
-            "breakSequence": 8,
-            "contextEpoch": 9,
-            "identityKnown": True,
-        }
-        bridge = ide_bridge.IDEBridge()
-        bridge._preferred_ide = None
-        with mock.patch.object(ide_bridge.rider_bridge, "select_instance") as select:
-            bridge.select_instance(
-                ide="rider",
-                pipe_name=registration["pipeName"],
-                target_identity={key: registration[key] for key in (
-                    "pipeName", "processId", "processStartTimeUtcTicks", "serverInstanceId",
-                )},
-                registration_snapshot=registration,
-            )
-        select.assert_called_once_with(
-            pipe_name=registration["pipeName"],
-            process_id=None,
-            registration_snapshot=registration,
-            target_identity={key: registration[key] for key in (
-                "pipeName", "processId", "processStartTimeUtcTicks", "serverInstanceId",
-            )},
-        )
-        self.assertEqual(9, bridge._selected_target["contextEpoch"])
-
     def test_detect_preserves_explicit_target_over_paused_candidate(self) -> None:
-        from mcp_server import ide_bridge
-        from mcp_server.tool_modules import instance_tools
+        from mcp_server import vs_bridge
+        from mcp_server.tool_modules import vs_instance_tools
 
-        bridge = ide_bridge.IDEBridge()
-        bridge._preferred_ide = None
+        bridge = vs_bridge.VSBridge()
         first = self._ide_instance(101)
         paused = self._ide_instance(202, paused=True)
-        bridge._selected_ide = "vs"
         bridge._selected_pipe = first.pipe_name
         bridge._selected_target = first.target_identity()
-        with mock.patch.object(instance_tools.ide_bridge, "get_bridge", return_value=bridge), \
-             mock.patch.object(instance_tools.ide_bridge, "discover_instances", mock.AsyncMock(return_value=[first, paused])):
-            payload = asyncio.run(instance_tools.detect_debug_sessions())["result"]
+        with mock.patch.object(vs_instance_tools.backend, "get_bridge", return_value=bridge), \
+             mock.patch.object(vs_instance_tools.backend, "discover_instances", mock.AsyncMock(return_value=[first, paused])):
+            payload = asyncio.run(vs_instance_tools.detect_debug_sessions())["result"]
 
         self.assertTrue(payload["selected"])
         self.assertIsNone(payload["autoSelected"])
         self.assertEqual(first.pipe_name, payload["selectedInstance"]["pipeName"])
         self.assertTrue(next(item for item in payload["instances"] if item["processId"] == 101)["isSelected"])
         self.assertFalse(next(item for item in payload["instances"] if item["processId"] == 202)["isSelected"])
-        self.assertEqual(("vs", first.pipe_name), asyncio.run(bridge.get_selected_target()))
+        selected_ide, selected_pipe, _, _ = asyncio.run(bridge.get_selection_snapshot())
+        self.assertEqual(("vs", first.pipe_name), (selected_ide, selected_pipe))
 
     def test_detect_reports_stale_pin_without_switching_target(self) -> None:
-        from mcp_server import ide_bridge
-        from mcp_server.tool_modules import instance_tools
+        from mcp_server import vs_bridge
+        from mcp_server.tool_modules import vs_instance_tools
 
-        bridge = ide_bridge.IDEBridge()
-        bridge._preferred_ide = None
+        bridge = vs_bridge.VSBridge()
         stale_pipe = "AIDebuggerVS_101"
         available = self._ide_instance(202, paused=True)
-        bridge._selected_ide = "vs"
         bridge._selected_pipe = stale_pipe
         bridge._selected_target = {
             "pipeName": stale_pipe,
@@ -1667,81 +1738,92 @@ asyncio.run(check())
             "processStartTimeUtcTicks": 101000,
             "serverInstanceId": "server-101",
         }
-        with mock.patch.object(instance_tools.ide_bridge, "get_bridge", return_value=bridge), \
-             mock.patch.object(instance_tools.ide_bridge, "discover_instances", mock.AsyncMock(return_value=[available])):
-            payload = asyncio.run(instance_tools.detect_debug_sessions())["result"]
+        with mock.patch.object(vs_instance_tools.backend, "get_bridge", return_value=bridge), \
+             mock.patch.object(vs_instance_tools.backend, "discover_instances", mock.AsyncMock(return_value=[available])):
+            payload = asyncio.run(vs_instance_tools.detect_debug_sessions())["result"]
 
-        self.assertTrue(payload["selected"])
+        # The stale pin is reported as an unreachable pinned selection rather
+        # than a live selected instance, and the underlying pin is left intact.
+        self.assertFalse(payload["selected"])
+        self.assertFalse(payload["selectedReachable"])
+        self.assertTrue(payload["hasPinnedSelection"])
         self.assertIsNone(payload["autoSelected"])
-        self.assertEqual(stale_pipe, payload["selectedInstance"]["pipeName"])
-        self.assertEqual("not_found_in_current_discovery", payload["selectedInstance"]["connectionStatus"])
+        self.assertIsNone(payload["selectedInstance"])
+        self.assertEqual(stale_pipe, payload["staleSelectedTarget"]["pipeName"])
+        self.assertEqual("not_found_in_current_discovery", payload["staleSelectedTarget"]["connectionStatus"])
+        self.assertEqual("stale_selection", payload["selectionStatus"])
         self.assertFalse(payload["instances"][0]["isSelected"])
-        self.assertNotIn("wouldAutoSelectInstance", payload)
-        self.assertEqual(("vs", stale_pipe), asyncio.run(bridge.get_selected_target()))
+        # The structured output emits an explicit null rather than omitting the
+        # key; no would-be auto-selection was computed for the stale pin.
+        self.assertIsNone(payload["wouldAutoSelectInstance"])
+        selected_ide, selected_pipe, _, _ = asyncio.run(bridge.get_selection_snapshot())
+        self.assertEqual(("vs", stale_pipe), (selected_ide, selected_pipe))
 
     def test_detect_treats_same_pipe_with_new_instance_identity_as_stale(self) -> None:
-        from mcp_server import ide_bridge
-        from mcp_server.tool_modules import instance_tools
+        from mcp_server import vs_bridge
+        from mcp_server.tool_modules import vs_instance_tools
 
-        bridge = ide_bridge.IDEBridge()
-        bridge._preferred_ide = None
+        bridge = vs_bridge.VSBridge()
         original = self._ide_instance(101)
         replacement = self._ide_instance(101, paused=True)
         replacement.process_start_time_utc_ticks += 1
         replacement.server_instance_id = "replacement-server"
-        bridge._selected_ide = "vs"
         bridge._selected_pipe = original.pipe_name
         bridge._selected_target = original.target_identity()
-        with mock.patch.object(instance_tools.ide_bridge, "get_bridge", return_value=bridge), \
-             mock.patch.object(instance_tools.ide_bridge, "discover_instances", mock.AsyncMock(return_value=[replacement])):
-            payload = asyncio.run(instance_tools.detect_debug_sessions())["result"]
+        with mock.patch.object(vs_instance_tools.backend, "get_bridge", return_value=bridge), \
+             mock.patch.object(vs_instance_tools.backend, "discover_instances", mock.AsyncMock(return_value=[replacement])):
+            payload = asyncio.run(vs_instance_tools.detect_debug_sessions())["result"]
 
-        self.assertTrue(payload["selected"])
+        # A same-pipe replacement with a new immutable identity is a stale pin,
+        # not a re-selection: the original authenticated target is preserved.
+        self.assertFalse(payload["selected"])
+        self.assertFalse(payload["selectedReachable"])
+        self.assertTrue(payload["hasPinnedSelection"])
         self.assertIsNone(payload["autoSelected"])
-        self.assertEqual(original.server_instance_id, payload["selectedInstance"]["serverInstanceId"])
-        self.assertEqual("not_found_in_current_discovery", payload["selectedInstance"]["connectionStatus"])
+        self.assertEqual(original.server_instance_id, payload["staleSelectedTarget"]["serverInstanceId"])
+        self.assertEqual("not_found_in_current_discovery", payload["staleSelectedTarget"]["connectionStatus"])
+        self.assertEqual("stale_selection", payload["selectionStatus"])
         self.assertFalse(payload["instances"][0]["isSelected"])
-        self.assertEqual(original.target_identity(), asyncio.run(bridge.get_selected_target_identity()))
+        _, _, selected_target, _ = asyncio.run(bridge.get_selection_snapshot())
+        self.assertEqual(original.target_identity(), selected_target)
 
     def test_detect_without_selection_only_reports_would_select(self) -> None:
-        from mcp_server import ide_bridge
-        from mcp_server.tool_modules import instance_tools
+        from mcp_server import vs_bridge
+        from mcp_server.tool_modules import vs_instance_tools
 
-        bridge = ide_bridge.IDEBridge()
-        bridge._preferred_ide = None
+        bridge = vs_bridge.VSBridge()
         available = self._ide_instance(202, paused=True)
-        with mock.patch.object(instance_tools.ide_bridge, "get_bridge", return_value=bridge), \
-             mock.patch.object(instance_tools.ide_bridge, "discover_instances", mock.AsyncMock(return_value=[available])):
-            payload = asyncio.run(instance_tools.detect_debug_sessions(select=False))["result"]
+        with mock.patch.object(vs_instance_tools.backend, "get_bridge", return_value=bridge), \
+             mock.patch.object(vs_instance_tools.backend, "discover_instances", mock.AsyncMock(return_value=[available])):
+            payload = asyncio.run(vs_instance_tools.detect_debug_sessions(select=False))["result"]
 
         self.assertFalse(payload["selected"])
         self.assertIsNone(payload["autoSelected"])
         self.assertEqual(available.pipe_name, payload["wouldAutoSelectInstance"]["pipeName"])
-        self.assertEqual((None, None), asyncio.run(bridge.get_selected_target()))
+        selected_ide, selected_pipe, _, _ = asyncio.run(bridge.get_selection_snapshot())
+        self.assertEqual((None, None), (selected_ide, selected_pipe))
 
     def test_list_instances_marks_only_the_pinned_target(self) -> None:
-        from mcp_server import ide_bridge
-        from mcp_server.tool_modules import instance_tools
+        from mcp_server import vs_bridge
+        from mcp_server.tool_modules import vs_instance_tools
 
-        bridge = ide_bridge.IDEBridge()
-        bridge._preferred_ide = None
+        bridge = vs_bridge.VSBridge()
         first = self._ide_instance(101)
         second = self._ide_instance(202, paused=True)
-        bridge._selected_ide = "vs"
         bridge._selected_pipe = first.pipe_name
         bridge._selected_target = first.target_identity()
-        with mock.patch.object(instance_tools.ide_bridge, "get_bridge", return_value=bridge), \
-             mock.patch.object(instance_tools.ide_bridge, "discover_instances", mock.AsyncMock(return_value=[first, second])):
-            payload = asyncio.run(instance_tools.list_vs_instances())["result"]
+        with mock.patch.object(vs_instance_tools.backend, "get_bridge", return_value=bridge), \
+             mock.patch.object(vs_instance_tools.backend, "discover_instances", mock.AsyncMock(return_value=[first, second])):
+            payload = asyncio.run(vs_instance_tools.list_vs_instances())["result"]
 
         self.assertTrue(payload["selected"])
         self.assertEqual(first.pipe_name, payload["selectedInstance"]["pipeName"])
         selected = [item["pipeName"] for item in payload["instances"] if item["isSelected"]]
         self.assertEqual([first.pipe_name], selected)
 
-    def test_instance_selection_tools_forward_authenticated_registration_snapshot(self) -> None:
-        from mcp_server import ide_bridge
-        from mcp_server.tool_modules import instance_tools
+    def test_vs_selection_tools_forward_authenticated_registration_snapshot(self) -> None:
+        from mcp_server import vs_bridge
+        from mcp_server.tool_modules import vs_instance_tools
 
         target = self._ide_instance(101, paused=True)
         registration = {
@@ -1754,28 +1836,153 @@ asyncio.run(check())
             "capabilities": ["server.control", "debug.read"],
         }
         target._registration_snapshot = dict(registration)
+        expected_snapshot = target.registration_snapshot()
 
         calls = (
-            lambda: instance_tools.detect_debug_sessions(select=True, prefer_ide="vs"),
-            lambda: instance_tools.select_ide_instance("vs", 101),
-            lambda: instance_tools.select_vs_instance(101),
+            lambda: vs_instance_tools.detect_debug_sessions(select=True),
+            lambda: vs_instance_tools.select_vs_instance(101),
         )
         for call in calls:
-            bridge = ide_bridge.IDEBridge()
-            select = mock.Mock()
+            bridge = vs_bridge.VSBridge()
+            select = mock.AsyncMock(return_value=(True, target.target_identity(), 1))
+            bridge.try_select_instance = select
             with self.subTest(call=call), \
-                 mock.patch.object(instance_tools.ide_bridge, "get_bridge", return_value=bridge), \
+                 mock.patch.object(vs_instance_tools.backend, "get_bridge", return_value=bridge), \
                  mock.patch.object(
-                     instance_tools.ide_bridge,
+                     vs_instance_tools.backend,
                      "discover_instances",
                      mock.AsyncMock(return_value=[target]),
-                 ), \
-                 mock.patch.object(instance_tools.ide_bridge, "select_instance", select):
+                 ):
                 asyncio.run(call())
             self.assertEqual(
-                registration,
-                select.call_args.kwargs["registration_snapshot"],
+                expected_snapshot,
+                select.await_args.kwargs["registration_snapshot"],
             )
+            self.assertEqual(
+                "private-token",
+                select.await_args.kwargs["registration_snapshot"]["authToken"],
+            )
+
+    def test_multi_vs_dispatches_exact_targets_concurrently_without_selection_mutation(self) -> None:
+        from mcp_server.tool_modules import multi_vs_tools
+        from mcp_server.output_models import output_model_for
+
+        first = self._ide_instance(101, paused=True)
+        second = self._ide_instance(202, paused=True)
+        for instance in (first, second):
+            instance._registration_snapshot = {
+                "protocol": "aidb/2",
+                "pipeName": instance.pipe_name,
+                "processId": instance.process_id,
+                "processStartTimeUtcTicks": instance.process_start_time_utc_ticks,
+                "serverInstanceId": instance.server_instance_id,
+                "authToken": f"private-{instance.process_id}",
+                "capabilities": ["server.control", "debug.read"],
+            }
+
+        active = 0
+        maximum_active = 0
+        both_started = asyncio.Event()
+
+        async def exact_call(target, method, params, timeout, **kwargs):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            try:
+                if active == 2:
+                    both_started.set()
+                else:
+                    await asyncio.wait_for(both_started.wait(), timeout=0.25)
+                self.assertEqual("get_debug_status", method)
+                self.assertEqual({"includeDetails": True}, params)
+                # timeout_seconds budgets the whole dispatch, so the per-target
+                # call gets whatever remains of the 20s default budget.
+                self.assertAlmostEqual(20.0, timeout, delta=0.5)
+                self.assertTrue(kwargs["include_target"])
+                self.assertIs(False, kwargs["advance_selection"])
+                self.assertEqual(target["processId"], kwargs["registration_snapshot"]["processId"])
+                return {"reportedPid": target["processId"]}, dict(target)
+            finally:
+                active -= 1
+
+        with mock.patch.object(
+            multi_vs_tools.ide_bridge,
+            "discover_instances",
+            mock.AsyncMock(return_value=[first, second]),
+        ), mock.patch.object(
+            multi_vs_tools.vs_bridge,
+            "call_pipe_exact",
+            side_effect=exact_call,
+        ) as exact, mock.patch.object(
+            multi_vs_tools.ide_bridge,
+            "select_instance",
+        ) as select, mock.patch.object(
+            multi_vs_tools.ide_bridge,
+            "clear_selection",
+        ) as clear:
+            payload = asyncio.run(multi_vs_tools.dispatch_vs_instances(
+                "get_debug_status",
+                [101, 202],
+                params={"includeDetails": True},
+                max_concurrency=2,
+            ))["result"]
+
+        self.assertEqual(2, maximum_active)
+        self.assertEqual(2, exact.await_count)
+        self.assertEqual([101, 202], [item["processId"] for item in payload["results"]])
+        self.assertEqual(["ok", "ok"], [item["status"] for item in payload["results"]])
+        self.assertTrue(payload["success"])
+        self.assertFalse(payload["partial"])
+        self.assertEqual("does_not_change_selected_vs", payload["selectionBehavior"])
+        select.assert_not_called()
+        clear.assert_not_called()
+        output_model_for("dispatch_vs_instances").model_validate({"result": payload})
+
+    def test_multi_vs_dispatch_keeps_other_targets_running_after_preflight_failure(self) -> None:
+        from mcp_server.tool_modules import multi_vs_tools
+
+        available = self._ide_instance(101, paused=True)
+        available._registration_snapshot = {
+            "protocol": "aidb/2",
+            "pipeName": available.pipe_name,
+            "processId": available.process_id,
+            "processStartTimeUtcTicks": available.process_start_time_utc_ticks,
+            "serverInstanceId": available.server_instance_id,
+            "authToken": "private-101",
+            "capabilities": ["server.control", "debug.read"],
+        }
+
+        async def exact_call(target, method, params, timeout, **kwargs):
+            return {"reportedPid": target["processId"]}, dict(target)
+
+        with mock.patch.object(
+            multi_vs_tools.ide_bridge,
+            "discover_instances",
+            mock.AsyncMock(return_value=[available]),
+        ), mock.patch.object(
+            multi_vs_tools.vs_bridge,
+            "call_pipe_exact",
+            side_effect=exact_call,
+        ) as exact:
+            payload = asyncio.run(multi_vs_tools.dispatch_vs_instances(
+                "get_debug_status", [101, 202]
+            ))["result"]
+
+        self.assertEqual(1, exact.await_count)
+        self.assertFalse(payload["success"])
+        self.assertTrue(payload["partial"])
+        self.assertEqual(["ok", "error"], [item["status"] for item in payload["results"]])
+        self.assertEqual("TARGET_NOT_FOUND", payload["results"][1]["error"]["code"])
+
+    def test_multi_vs_dispatch_requires_explicit_command_opt_in(self) -> None:
+        from mcp.server.fastmcp.exceptions import ToolError
+        from mcp_server.tool_modules import multi_vs_tools
+
+        with self.assertRaises(ToolError) as raised:
+            asyncio.run(multi_vs_tools.dispatch_vs_instances("continue", [101]))
+        payload = json.loads(str(raised.exception))
+        self.assertEqual("INVALID_ARGUMENT", payload["code"])
+        self.assertIn("allow_commands=True", payload["message"])
 
     def test_wheel_extraction_rejects_traversal_links_and_conflicts(self) -> None:
         from mcp_server import bootstrap

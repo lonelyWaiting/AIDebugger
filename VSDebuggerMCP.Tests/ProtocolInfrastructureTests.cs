@@ -77,6 +77,20 @@ namespace VSDebuggerMCP.Tests
             }
         }
 
+        [TestMethod]
+        public void HiddenAutomationCommandUsesOleMenuCommandToReceiveTheDteNonce()
+        {
+            string packageSource = File.ReadAllText(Path.Combine(
+                FindRepositoryRoot(),
+                "VSDebuggerMCP",
+                "VSDebuggerMCPPackage.cs"))
+                .Replace("\r\n", "\n");
+
+            StringAssert.Contains(
+                packageSource,
+                "commandService.AddCommand(new OleMenuCommand(\n                StartAutomationTestServer,");
+        }
+
         private static string FindRepositoryRoot()
         {
             string[] starts =
@@ -383,6 +397,24 @@ namespace VSDebuggerMCP.Tests
                 await serverCodec.WriteFrameAsync("response", 1024, CancellationToken.None);
                 Assert.AreEqual("response", await clientCodec.ReadFrameAsync(1024, CancellationToken.None));
             }
+        }
+
+        [TestMethod]
+        public void LocalPipeComputerNameCheckUsesByteLengthAndFailsClosedOnShortBuffer()
+        {
+            string source = File.ReadAllText(Path.Combine(
+                FindRepositoryRoot(),
+                "VSDebuggerMCP",
+                "NamedPipeServer.cs"));
+
+            StringAssert.Contains(source, "private const int ErrorPipeLocal = 229;");
+            StringAssert.Contains(source, "private const int ErrorMoreData = 234;");
+            StringAssert.Contains(source, "private const int MaxClientComputerNameChars = 1024;");
+            // The Unicode entry point takes a byte count, not a character count.
+            StringAssert.Contains(source, "(uint)(computerName.Capacity * sizeof(char))");
+            StringAssert.Contains(source, "if (error == ErrorPipeLocal)");
+            StringAssert.Contains(
+                source, "if (error != ErrorMoreData || capacity >= MaxClientComputerNameChars)");
         }
 
         [TestMethod]
@@ -2028,6 +2060,7 @@ namespace VSDebuggerMCP.Tests
         {
             Assert.IsTrue(BundlePathPolicy.IsVsBundleRelativePath("tool_modules/capability_tools.py"));
             Assert.IsTrue(BundlePathPolicy.IsVsBundleRelativePath("tool_modules/vs_instance_tools.py"));
+            Assert.IsTrue(BundlePathPolicy.IsVsBundleRelativePath("tool_modules/multi_vs_tools.py"));
             Assert.IsFalse(BundlePathPolicy.IsVsBundleRelativePath("tool_modules/instance_tools.py"));
             Assert.IsFalse(BundlePathPolicy.IsVsBundleRelativePath("tool_modules/rider_tools.py"));
             Assert.IsFalse(BundlePathPolicy.IsVsBundleRelativePath("tool_modules/unexpected.py"));

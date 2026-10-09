@@ -627,7 +627,8 @@ function Test-IsAllowedVsPayloadPath {
         "tool_modules/__init__.py", "tool_modules/capability_tools.py",
         "tool_modules/vs_instance_tools.py", "tool_modules/snapshot_tools.py",
         "tool_modules/native_managed_tools.py", "tool_modules/control_tools.py",
-        "tool_modules/breakpoint_tools.py", "tool_modules/memory_tools.py"
+        "tool_modules/breakpoint_tools.py", "tool_modules/memory_tools.py",
+        "tool_modules/multi_vs_tools.py"
     )
     if ($toolModules -contains $normalized) { return $true }
     if ($normalized -match '^vendor/wheels/[^/]+\.whl$' -or $normalized -eq 'vendor/wheels/manifest.json') { return $true }

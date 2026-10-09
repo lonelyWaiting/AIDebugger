@@ -34,6 +34,13 @@ namespace VSDebuggerMCP
         private const int MaxMethodNameLength = 128;
         private const int FrameIoTimeoutMs = 10000;
         private const int InitialFrameIoTimeoutMs = 2000;
+        // GetNamedPipeClientComputerName reports ERROR_PIPE_LOCAL instead of
+        // filling the caller's buffer when the connected client is local.
+        private const int ErrorPipeLocal = 229;
+        // The same call reports ERROR_MORE_DATA when the length it was given
+        // (a byte count) did not cover the client computer name.
+        private const int ErrorMoreData = 234;
+        private const int MaxClientComputerNameChars = 1024;
         private const int MaxExpressionCount = 100;
         private const int MaxExpressionLength = 16 * 1024;
         private const int MaxCachedCommandResults = 512;
@@ -565,18 +572,34 @@ namespace VSDebuggerMCP
             {
                 throw new IOException("Named-pipe client is not connected");
             }
-            var computerName = new StringBuilder(256);
-            if (!GetNamedPipeClientComputerName(
-                pipeServer.SafePipeHandle,
-                computerName,
-                (uint)computerName.Capacity))
+            // ClientComputerNameLength is a byte count for this Unicode entry
+            // point, so advertise the buffer's real size; a fully-qualified
+            // client name can still exceed it, which surfaces as
+            // ERROR_MORE_DATA. Grow once and then fail closed.
+            for (int capacity = 256; ; capacity *= 4)
             {
-                throw new UnauthorizedAccessException("Unable to verify that the named-pipe client is local");
-            }
-            string actual = computerName.ToString().Trim().TrimStart('\\');
-            if (!string.Equals(actual, Environment.MachineName, StringComparison.OrdinalIgnoreCase))
-            {
-                throw new UnauthorizedAccessException("Remote named-pipe clients are not permitted");
+                var computerName = new StringBuilder(capacity);
+                if (GetNamedPipeClientComputerName(
+                    pipeServer.SafePipeHandle,
+                    computerName,
+                    (uint)(computerName.Capacity * sizeof(char))))
+                {
+                    string actual = computerName.ToString().Trim().TrimStart('\\');
+                    if (!string.Equals(actual, Environment.MachineName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new UnauthorizedAccessException("Remote named-pipe clients are not permitted");
+                    }
+                    return;
+                }
+                int error = Marshal.GetLastWin32Error();
+                if (error == ErrorPipeLocal)
+                {
+                    return;
+                }
+                if (error != ErrorMoreData || capacity >= MaxClientComputerNameChars)
+                {
+                    throw new UnauthorizedAccessException("Unable to verify that the named-pipe client is local");
+                }
             }
         }
 

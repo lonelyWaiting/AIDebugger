@@ -62,11 +62,6 @@ env/
 .Spotlight-V100
 .Trashes
 
-# Rider/Gradle build outputs
-RiderDebuggerMCP/build/
-RiderDebuggerMCP/build-*/
-RiderDebuggerMCP/.kotlin/
-
 # Build logs
 *.log
 build*.log
