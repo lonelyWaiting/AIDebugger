@@ -22,7 +22,9 @@ def debug_guide() -> str:
 Use detect_debug_sessions() or list_vs_instances() first. If several Visual Studio
 instances are reachable, pin one with select_vs_instance(process_id=...), or use
 dispatch_vs_instances(method="capture_debug_bundle_safe", process_ids=[...]) to
-query explicit VS targets concurrently without changing that pinned selection. Use
+query explicit VS targets concurrently without changing that pinned selection; use
+dispatch_vs_commands(...) only when you deliberately need to run the same command
+against several confirmed targets. Use
 capture_debug_bundle() for a bounded first snapshot, then request locals,
 expressions, memory, or execution control only when the selected instance declares
 the required capability.
@@ -81,7 +83,7 @@ question depends on the new stop location.
 如果有多个 Visual Studio 实例运行：
 1. 调用 list_vs_instances() 查看所有实例
 2. 调用 select_vs_instance(process_id=12345) 选择特定实例
-3. 需要同时采集多个 Visual Studio 时，调用 dispatch_vs_instances(method="capture_debug_bundle_safe", process_ids=[12345, 23456])；它不会覆盖当前选择。命令型 method 必须显式传 allow_commands=True。
+3. 需要同时采集多个 Visual Studio 时，调用 dispatch_vs_instances(method="capture_debug_bundle_safe", process_ids=[12345, 23456])；它不会覆盖当前选择。需要对多个已确认目标执行同一条命令时，用独立的 dispatch_vs_commands(...)。
 """
 
 def _categories_with_registry_coverage(registry: Dict[str, Any]) -> Dict[str, List[str]]:
@@ -91,6 +93,7 @@ def _categories_with_registry_coverage(registry: Dict[str, Any]) -> Dict[str, Li
             "list_vs_instances",
             "select_vs_instance",
             "dispatch_vs_instances",
+            "dispatch_vs_commands",
             "attach_process",
             "start_debugging",
             "get_debug_status",
@@ -215,7 +218,7 @@ def _recommended_workflow_for_access(effective_instance: Optional[Dict[str, Any]
     if access_mode == "full_access":
         return [
             "detect_debug_sessions(prefer_ide='vs') or list_vs_instances()",
-            "For concurrent Visual Studio-only inspection, dispatch_vs_instances(method='capture_debug_bundle_safe', process_ids=[...]) keeps the pinned single target unchanged; command methods require allow_commands=True.",
+            "For concurrent Visual Studio-only inspection, dispatch_vs_instances(method='capture_debug_bundle_safe', process_ids=[...]) keeps the pinned single target unchanged; for commands against several confirmed targets use dispatch_vs_commands(...).",
             "attach_process(...) or start_debugging(...) if no debug session is active",
             "Visual Studio multi-process session: get_debug_processes(), then switch_process(process_handle=...) while paused",
             "set_breakpoint(...) / set_function_breakpoint(...) / set_data_breakpoint(...)",
@@ -332,7 +335,7 @@ async def debug_capabilities() -> str:
             "stop": "Supported. Use debug_stop, stop_debugging, or debug_control(action='stop') to stop debugging / terminate the current debug session.",
             "detach": "Visual Studio detach is supported for the current debugged process via detach_process or debug_control(action='detach').",
             "same_session_process_selection": "Call get_debug_processes, then switch_process(process_handle=...). The opaque handle binds session generation, PID, and OS creation time; switching never attaches a new local process.",
-            "multi_vs_dispatch": "Visual Studio only: dispatch_vs_instances routes one explicit AIDB/2 backend method to several authenticated VS process IDs concurrently. It never redirects or resets the pinned single-instance selection; commands require allow_commands=True and each target's declared capability.",
+            "multi_vs_dispatch": "Visual Studio only: dispatch_vs_instances routes one AIDB/2 query method to several authenticated VS process IDs concurrently and is annotated read-only. dispatch_vs_commands is the destructive counterpart for command methods and is annotated accordingly. Neither redirects or resets the pinned single-instance selection, and each target must declare the method's capability.",
             "set_data_breakpoint": "Uses Visual Studio native data breakpoints/watchpoints where supported by the active debug engine.",
             "search_memory": "One source-neutral memory search: a numeric start_address searches a bounded live or dump range; omitting it on an active VS dump scans mapped dump memory and returns an opaque continuation.",
             "breakpoint_binding_verification": "Breakpoint results include bindingVerificationStatus, isRelocated, nearbyProbeAttempted, optimizedCodeSuspected, and verificationStatus so optimized-away or unbound source locations are explicit instead of treated as successful hits.",

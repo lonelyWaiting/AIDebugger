@@ -32,7 +32,7 @@ VS_TOOL_DOMAINS: Dict[str, List[str]] = {
     "capability": ["debug_capabilities"],
     "instance": [
         "list_vs_instances", "detect_debug_sessions", "select_vs_instance", "clear_vs_selection",
-        "dispatch_vs_instances",
+        "dispatch_vs_instances", "dispatch_vs_commands",
     ],
     "snapshot": [
         "get_debug_status", "get_callstack", "get_call_stack", "get_locals",
@@ -92,6 +92,15 @@ _COMPOSITE_METHODS = {
     "select_vs_instance": ["ping", "get_instance_info"],
     "crash_triage": ["capture_debug_bundle", "get_disassembly", "resolve_address", "read_memory"],
     "debug_control": ["continue", "step_over", "step_into", "step_out", "break", "stop", "detach"],
+}
+
+# The multi-target dispatch tools take the backend method as a parameter, so the
+# catalog cannot know it statically. Splitting them by method kind is what keeps
+# the published annotations and requiredCapabilities honest: the query tool
+# really is read-only, and only the command tool carries the destructive set.
+_KIND_FILTERED_TOOLS = {
+    "dispatch_vs_instances": "query",
+    "dispatch_vs_commands": "command",
 }
 
 _PARAMETER_CONDITIONAL_ROUTES = {
@@ -203,10 +212,13 @@ def interrupt_pipe_methods() -> frozenset[str]:
 
 def _backend_methods(tool: str, methods: Dict[str, object]) -> List[str]:
     canonical = LEGACY_ALIASES.get(tool, tool)
-    if canonical == "dispatch_vs_instances":
-        # The selected backend method is an explicit tool parameter. The MCP
-        # annotation and catalog must therefore conservatively cover all methods.
-        return list(methods)
+    kind_filter = _KIND_FILTERED_TOOLS.get(canonical)
+    if kind_filter is not None:
+        return [
+            name
+            for name, entry in methods.items()
+            if entry.get("kind", "query") == kind_filter
+        ]
     conditional_route = _PARAMETER_CONDITIONAL_ROUTES.get(canonical)
     if conditional_route:
         return list(dict.fromkeys(

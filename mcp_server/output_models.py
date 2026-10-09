@@ -1159,6 +1159,7 @@ _MODEL_BY_TOOL: Dict[str, Type[StrictPayload]] = {
         "select_vs_instance", "clear_vs_selection",
     )},
     "dispatch_vs_instances": MultiVSDispatchPayload,
+    "dispatch_vs_commands": MultiVSDispatchPayload,
     "get_debug_status": DebugStatusPayload,
     "get_callstack": CallStackPayload,
     "get_call_stack": CallStackPayload,

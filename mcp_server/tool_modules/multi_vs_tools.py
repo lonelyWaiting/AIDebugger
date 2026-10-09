@@ -126,11 +126,21 @@ def _validate_process_ids(process_ids: List[int]) -> List[int]:
     return validated
 
 
-def _validate_backend_method(method: str) -> str:
+def _validate_backend_method(method: str, allowed_kind: str) -> str:
     value = validate_nonempty_string("method", method, maximum=128)
     if value not in DEBUG_METHOD_MANIFEST:
         raise invalid_argument(
             "method must be a known AIDB/2 backend method, not an MCP tool name"
+        )
+    actual_kind = backend_method_kind(value)
+    if actual_kind != allowed_kind:
+        other = (
+            "dispatch_vs_commands" if actual_kind == "command"
+            else "dispatch_vs_instances"
+        )
+        raise invalid_argument(
+            f"{value} is a {actual_kind} method; use {other} for multi-target "
+            f"{actual_kind} dispatch."
         )
     return value
 
@@ -309,46 +319,24 @@ async def _dispatch_one(
             )
 
 
-@mcp.tool()
-async def dispatch_vs_instances(
+async def _dispatch_multi_target(
+    *,
+    tool_name: str,
+    allowed_kind: str,
     method: str,
     process_ids: List[int],
-    params: Optional[Dict[str, Any]] = None,
-    timeout_seconds: Optional[float] = None,
-    max_concurrency: int = 4,
-    allow_commands: bool = False,
-) -> str:
-    """Run one AIDB/2 backend method against explicit Visual Studio PIDs concurrently.
-
-    This is the multi-instance path: it discovers each requested process, captures
-    its authenticated immutable target snapshot, and uses exact pipe routing. It
-    does not select, clear, or redirect the normal single-instance target — a
-    dispatched call never rewrites the pinned single-instance target. `method` is
-    an AIDB/2 backend method (for example `get_debug_status` or
-    `capture_debug_bundle_safe`), not an MCP tool name. Command methods are rejected
-    unless `allow_commands=True`; a target whose registration does not grant the
-    method's capability reports `PERMISSION_DENIED` instead of being called.
-    `timeout_seconds` budgets the whole call — discovery included — not each
-    target, so targets that cannot start within it report
-    `DEADLINE_EXCEEDED_NOT_STARTED`. Results remain in `process_ids` order and
-    one target's transport or protocol failure does not prevent calls to the
-    other authenticated targets.
-    """
-    method = _validate_backend_method(method)
+    params: Optional[Dict[str, Any]],
+    timeout_seconds: Optional[float],
+    max_concurrency: int,
+) -> Any:
+    method = _validate_backend_method(method, allowed_kind)
     process_ids = _validate_process_ids(process_ids)
     params = _validate_params(params)
     timeout = clamp_tool_timeout(timeout_seconds, SAFE_DEBUG_BUNDLE_TIMEOUT_SECONDS)
     max_concurrency = validate_int_range(
         "max_concurrency", max_concurrency, 1, MAX_MULTI_VS_CONCURRENCY
     )
-    if not isinstance(allow_commands, bool):
-        raise invalid_argument("allow_commands must be a boolean")
-
     method_kind = backend_method_kind(method)
-    if method_kind == "command" and not allow_commands:
-        raise invalid_argument(
-            f"{method} is a command; set allow_commands=True after confirming every target."
-        )
 
     # The budget covers the whole call, discovery included.
     deadline = asyncio.get_running_loop().time() + timeout
@@ -358,9 +346,9 @@ async def dispatch_vs_instances(
             process_ids, method, params, discover_budget
         )
     except ide_bridge.IDEBridgeError as error:
-        return handle_ide_error(error, "dispatch_vs_instances", method=method)
+        return handle_ide_error(error, tool_name, method=method)
     except vs_bridge.VSBridgeError as error:
-        return handle_ide_error(error, "dispatch_vs_instances", method=method)
+        return handle_ide_error(error, tool_name, method=method)
 
     semaphore = asyncio.Semaphore(min(max_concurrency, len(jobs)))
     dispatched = await asyncio.gather(*(
@@ -396,3 +384,70 @@ async def dispatch_vs_instances(
         "failureCount": failure_count,
         "results": results,
     })
+
+
+@mcp.tool()
+async def dispatch_vs_instances(
+    method: str,
+    process_ids: List[int],
+    params: Optional[Dict[str, Any]] = None,
+    timeout_seconds: Optional[float] = None,
+    max_concurrency: int = 4,
+) -> str:
+    """Run one read-only AIDB/2 query against explicit Visual Studio PIDs concurrently.
+
+    This is the multi-instance path for queries: it discovers each requested
+    process, captures its authenticated immutable target snapshot, and uses exact
+    pipe routing. It does not select, clear, or redirect the normal single-instance
+    target — a dispatched call never rewrites the pinned single-instance target.
+    `method` must be an AIDB/2 *query* method (for example `get_debug_status` or
+    `capture_debug_bundle_safe`), not an MCP tool name; command methods are
+    rejected and belong to `dispatch_vs_commands`. A target whose registration
+    does not grant the method's capability reports `PERMISSION_DENIED` instead of
+    being called. `timeout_seconds` budgets the whole call — discovery included —
+    not each target, so targets that cannot start within it report
+    `DEADLINE_EXCEEDED_NOT_STARTED`. Results remain in `process_ids` order and one
+    target's transport or protocol failure does not prevent calls to the other
+    authenticated targets.
+    """
+    return await _dispatch_multi_target(
+        tool_name="dispatch_vs_instances",
+        allowed_kind="query",
+        method=method,
+        process_ids=process_ids,
+        params=params,
+        timeout_seconds=timeout_seconds,
+        max_concurrency=max_concurrency,
+    )
+
+
+@mcp.tool()
+async def dispatch_vs_commands(
+    method: str,
+    process_ids: List[int],
+    params: Optional[Dict[str, Any]] = None,
+    timeout_seconds: Optional[float] = None,
+    max_concurrency: int = 4,
+) -> str:
+    """Run one mutating AIDB/2 command against explicit Visual Studio PIDs concurrently.
+
+    Destructive multi-target counterpart of `dispatch_vs_instances`. Calling this
+    tool is itself the explicit opt-in, so there is no separate confirmation flag.
+    `method` must be an AIDB/2 *command* method (for example `continue` or
+    `set_breakpoint`); query methods are rejected and belong to
+    `dispatch_vs_instances`. The same exact-target routing, per-target capability
+    preflight, whole-call `timeout_seconds` budget and
+    `does_not_change_selected_vs` guarantee apply. Confirm every target before
+    issuing a command that advances or stops a debuggee: a target that fails on
+    the transport reports `outcomeUnknown: true`, meaning it may already have been
+    applied.
+    """
+    return await _dispatch_multi_target(
+        tool_name="dispatch_vs_commands",
+        allowed_kind="command",
+        method=method,
+        process_ids=process_ids,
+        params=params,
+        timeout_seconds=timeout_seconds,
+        max_concurrency=max_concurrency,
+    )

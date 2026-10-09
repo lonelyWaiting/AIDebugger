@@ -293,10 +293,32 @@ class VSBridgeResponseTests(unittest.TestCase):
         self.assertFalse(cancel_annotations["readOnlyHint"])
         self.assertTrue(cancel_annotations["destructiveHint"])
         self.assertTrue(cancel_annotations["idempotentHint"])
-        multi_annotations = vs_tool_registry.tool_annotation_values("dispatch_vs_instances")
-        self.assertFalse(multi_annotations["readOnlyHint"])
-        self.assertTrue(multi_annotations["destructiveHint"])
-        self.assertFalse(multi_annotations["idempotentHint"])
+        # The dispatch tools are split by method kind precisely so their
+        # published annotations are accurate rather than a conservative union
+        # over every method either one could route.
+        query_annotations = vs_tool_registry.tool_annotation_values("dispatch_vs_instances")
+        self.assertTrue(query_annotations["readOnlyHint"])
+        self.assertFalse(query_annotations["destructiveHint"])
+        self.assertTrue(query_annotations["idempotentHint"])
+        command_annotations = vs_tool_registry.tool_annotation_values("dispatch_vs_commands")
+        self.assertFalse(command_annotations["readOnlyHint"])
+        self.assertTrue(command_annotations["destructiveHint"])
+        self.assertFalse(command_annotations["idempotentHint"])
+
+        queries = vs_tool_registry.backend_methods_for_tool("dispatch_vs_instances")
+        commands = vs_tool_registry.backend_methods_for_tool("dispatch_vs_commands")
+        self.assertTrue(queries and commands)
+        self.assertEqual(set(), set(queries) & set(commands))
+        self.assertEqual(
+            set(vs_tool_registry.DEBUG_METHOD_MANIFEST),
+            set(queries) | set(commands),
+        )
+        self.assertTrue(all(
+            vs_tool_registry.backend_method_kind(name) == "query" for name in queries
+        ))
+        self.assertTrue(all(
+            vs_tool_registry.backend_method_kind(name) == "command" for name in commands
+        ))
         self.assertEqual(
             ("debug.execution.control", "debug.memory.read", "debug.read"),
             vs_tool_registry.backend_method_capabilities("continue_and_capture_breakpoint"),

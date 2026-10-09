@@ -2012,8 +2012,8 @@ asyncio.run(check())
             # A command that dies on the transport may already have been
             # accepted by Visual Studio, so it must not be reported as
             # definitely-not-applied (that would invite a blind re-invoke).
-            command = asyncio.run(multi_vs_tools.dispatch_vs_instances(
-                "continue", [101], allow_commands=True,
+            command = asyncio.run(multi_vs_tools.dispatch_vs_commands(
+                "continue", [101],
             ))["result"]
             self.assertIs(True, command["results"][0]["error"]["outcomeUnknown"])
 
@@ -2022,15 +2022,24 @@ asyncio.run(check())
             ))["result"]
             self.assertIs(False, query["results"][0]["error"]["outcomeUnknown"])
 
-    def test_multi_vs_dispatch_requires_explicit_command_opt_in(self) -> None:
+    def test_multi_vs_dispatch_tools_are_split_by_method_kind(self) -> None:
         from mcp.server.fastmcp.exceptions import ToolError
         from mcp_server.tool_modules import multi_vs_tools
 
+        # A command must not be reachable through the read-only query tool; the
+        # error has to name the tool that can actually run it.
         with self.assertRaises(ToolError) as raised:
             asyncio.run(multi_vs_tools.dispatch_vs_instances("continue", [101]))
         payload = json.loads(str(raised.exception))
         self.assertEqual("INVALID_ARGUMENT", payload["code"])
-        self.assertIn("allow_commands=True", payload["message"])
+        self.assertIn("dispatch_vs_commands", payload["message"])
+
+        # ...and the reverse: the destructive tool rejects query methods.
+        with self.assertRaises(ToolError) as raised:
+            asyncio.run(multi_vs_tools.dispatch_vs_commands("get_debug_status", [101]))
+        payload = json.loads(str(raised.exception))
+        self.assertEqual("INVALID_ARGUMENT", payload["code"])
+        self.assertIn("dispatch_vs_instances", payload["message"])
 
     def test_wheel_extraction_rejects_traversal_links_and_conflicts(self) -> None:
         from mcp_server import bootstrap

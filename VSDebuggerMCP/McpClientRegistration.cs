@@ -55,7 +55,7 @@ namespace VSDebuggerMCP
 ### 主动检测调试现场（推荐）
 - 在调用任何调试工具前，先调用 detect_debug_sessions() 检测是否有 Visual Studio 调试现场
 - 若自动选择失败，使用 list_vs_instances + select_vs_instance 手动选择
-- 若需同时查询多个已认证 VS，使用 dispatch_vs_instances(method=""capture_debug_bundle_safe"", process_ids=[...])；它不会改变当前选择。命令型 method 必须显式传 allow_commands=true
+- 若需同时查询多个已认证 VS，使用 dispatch_vs_instances(method=""capture_debug_bundle_safe"", process_ids=[...])；它不会改变当前选择。需要对多个已确认目标执行同一条命令时，改用 dispatch_vs_commands
 
 ### 主动断点式定位
 - 关键词：attach、附加进程、启动调试、start debugging、设置断点、清除断点、watchpoint、数据断点
@@ -97,7 +97,7 @@ namespace VSDebuggerMCP
 
 - 支持多个 Visual Studio 实例，会自动选择处于断点暂停状态的实例
 - 如果有多个实例且无法自动选择，使用 list_vs_instances 查看，然后 select_vs_instance 选择
-- 同时采集多个 VS 时使用 dispatch_vs_instances；显式 PID 列表采用精确目标路由，不会覆盖单实例选择
+- 同时采集多个 VS 时使用 dispatch_vs_instances（只读查询）或 dispatch_vs_commands（命令）；显式 PID 列表采用精确目标路由，不会覆盖单实例选择
 - 调试控制工具（如 debug_step_over）会改变程序状态，需谨慎使用
 - 首选 capture_debug_bundle 的低阻塞默认模式作为分析起点；不要默认使用 get_full_context 或完整 include_* 快照";
 

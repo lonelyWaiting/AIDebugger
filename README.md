@@ -99,7 +99,7 @@ assuming a fixed flat tool list.
 
 ## Tool Domains
 
-The server exposes 69 canonical MCP tools by default; deprecated compatibility
+The server exposes 70 canonical MCP tools by default; deprecated compatibility
 aliases are omitted. Set `AIDB_ENABLE_LEGACY_ALIASES=1` only for migration.
 The registry in `mcp_server/vs_tool_registry.py` is the source of truth for tool
 names, aliases, backend support, and timeout classes. Backend method kind and
@@ -111,11 +111,14 @@ embedded into the VSIX assembly and shipped with the Python runtime.
 - `debug_capabilities`
 - `detect_debug_sessions`
 - `list_vs_instances`, `select_vs_instance`, `clear_vs_selection`
-- Multi-target dispatch: `dispatch_vs_instances(method, process_ids, ...)`
-  uses independently authenticated immutable VS targets concurrently and leaves
-  the normal pinned single-instance target unchanged. It accepts AIDB/2 backend
-  method names rather than MCP tool names; command methods require
-  `allow_commands=True`.
+- Multi-target dispatch: `dispatch_vs_instances(method, process_ids, ...)` runs a
+  read-only AIDB/2 query against independently authenticated immutable VS targets
+  concurrently, and `dispatch_vs_commands(method, process_ids, ...)` is the
+  destructive counterpart for command methods. Both accept AIDB/2 backend method
+  names rather than MCP tool names and leave the normal pinned single-instance
+  target unchanged. The two tools are split by method kind so their published
+  annotations are accurate: the query tool is annotated read-only, the command
+  tool destructive.
 
 ### Snapshot and Inspection
 
@@ -351,9 +354,10 @@ When multiple Visual Studio instances are running, use `list_vs_instances` and
 `select_vs_instance` to pin the target. Without a manual selection, the bridge
 prefers a uniquely paused or uniquely debugging instance.
 For one concurrent operation across several VS instances, use
-`dispatch_vs_instances(method="capture_debug_bundle_safe", process_ids=[...])`;
-each result reports its exact target identity and an unavailable target does not
-prevent the other authenticated targets from running.
+`dispatch_vs_instances(method="capture_debug_bundle_safe", process_ids=[...])`, or
+`dispatch_vs_commands(...)` when the same command must run against several
+confirmed targets; each result reports its exact target identity and an
+unavailable target does not prevent the other authenticated targets from running.
 
 ## Development
 
