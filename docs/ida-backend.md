@@ -1,9 +1,10 @@
 # IDA integration
 
-AIDebugger now has independent Visual Studio and IDA MCP entrypoints. The VSIX
+AIDebugger has independent Visual Studio, IDA and kernel MCP entrypoints. The VSIX
 remains responsible for Visual Studio and its authenticated AIDB/2 transport.
 IDA analysis, patching, process ownership and IDB lifetime belong to `ida_backend/`.
-Neither backend imports the other's debugger implementation.
+These backends do not import each other's debugger implementation. The kernel
+backend owns DbgEng and kernel targets; see [kernel integration](kernel-backend.md).
 
 ```text
 MCP client ── AIDebuggerVS stdio ── AIDB/2 pipe ── VSIX / Visual Studio
@@ -39,7 +40,8 @@ Install-AIDebugger.cmd
 # Or: python tools/install_aidebugger.py --client codex
 ```
 
-The project installer deploys IDA runtime sources to `~/.ai-debugger/ida/`,
+The project installer defaults to deploying IDA and kernel in one transaction.
+Use `--backend ida` for an IDA-only update. It deploys IDA runtime sources to `~/.ai-debugger/ida/`,
 registers the `ida` stdio MCP in Claude Code, Claude Desktop and Codex, and
 installs the project-owned `skills/ida-evidence-analysis/` into the selected
 clients' skill directories. Codex configuration and Skills use `CODEX_HOME`

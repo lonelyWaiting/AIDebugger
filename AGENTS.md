@@ -71,6 +71,28 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 
 ## Architecture
 
+### Independent kernel backend
+
+- `kernel_backend/` owns Windows DbgEng workers and explicit kernel target/job IDs;
+  `mcp_server/kernel_server.py` is its independent stdio entrypoint.
+- Keep VS, IDA and kernel debugger/session state independent. Share only generic
+  MCP/stdio and installer infrastructure. Kernel workers use inherited pipes,
+  not a listening service. The VSIX installer stays VS-only.
+- Restricted queries cannot accept raw command fragments. Full commands and
+  memory writes require an explicitly full-access session; execution control and
+  breakpoints additionally require remote mode. Local kernel is inspection-only.
+- All ordinary DbgEng calls run on the owning thread. Cross-thread interruption
+  uses only `SetInterrupt`. Live `WaitForEvent` must use INFINITE in the helper;
+  MCP operations remain asynchronous and pollable. Never retry mutations.
+- Only the owned worker may be force-closed. Never terminate/reboot a target or
+  implicitly resume a paused kernel. Preserve unknown target-state receipts.
+- Native debugger dependencies remain separately installed. `tools/prepare_dbgeng.py`
+  prepares unchanged local Store WinDbg copies with original hashes; no native
+  debugger DLLs are checked in or redistributed.
+- Run `tests/test_kernel_backend.py` and opt-in `tests/kernel_integration/` probes.
+  Preserve contract, dump/PDB and live-kernel evidence boundaries. See
+  `docs/kernel-backend.md` and `docs/kernel-validation.md`.
+
 ### Independent IDA backend
 
 - `ida_backend/` owns IDA process/session management and private authenticated
@@ -79,7 +101,7 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
   IDA session IDs bind each binary/IDB. VS live debugging and IDA static analysis
   can coexist; only one user-mode debugger may attach to a given PID.
 - Project installer: `Install-AIDebugger.cmd` / `tools/install_aidebugger.py` deploys
-  IDA MCP and `skills/ida-evidence-analysis/` to Claude/Codex, preserving VS config.
+  IDA/kernel MCP and `skills/ida-evidence-analysis/` to Claude/Codex, preserving VS config.
   VSIX install/setup stays VS-only. See `docs/ida-backend.md` for workflow/tests.
 - Maintain the IDA Skill in this repository, then redeploy with the installer.
   Do not modify only an installed Skill copy or vendor upstream without recording

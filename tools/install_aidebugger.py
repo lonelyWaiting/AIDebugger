@@ -1,4 +1,4 @@
-"""Install independent IDA MCP and project-owned skills, preserving VS registration.
+"""Install independent IDA/kernel MCP backends, preserving VS registration.
 
 Python 3.11+. No pip, IDA plugin replacement, administrator rights or VS required.
 Use --dry-run to review destinations. Existing configuration is backed up.
@@ -25,8 +25,10 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def replace_ida_toml(text, command, server):
-    """Replace only ida's own table (and children); parse before and after."""
+def replace_backend_toml(text, command, server, backend):
+    """Replace only the selected backend's table; compare unrelated parsed data."""
+    if backend not in {"ida", "kernel"}:
+        raise ValueError("Unknown backend")
     original = tomllib.loads(text)
     lines = text.splitlines(keepends=True)
     result = []
@@ -36,35 +38,49 @@ def replace_ida_toml(text, command, server):
             # Refuse exotic quoted ownership rather than editing another table.
             match = re.match(r"\s*\[([^\]]+)\]\s*(?:#.*)?$", line.strip())
             table = match.group(1).strip() if match else ""
-            skipping = table == "mcp_servers.ida" or table.startswith("mcp_servers.ida.")
+            skipping = table == "mcp_servers." + backend or table.startswith("mcp_servers." + backend + ".")
         if not skipping:
             result.append(line)
-    section = ("\n[mcp_servers.ida]\ncommand = " + json.dumps(command) +
+    section = ("\n[mcp_servers." + backend + "]\ncommand = " + json.dumps(command) +
                "\nargs = [" + json.dumps(str(server)) + "]\nenabled = true\n" +
                "startup_timeout_sec = 20\ntool_timeout_sec = 120\n")
     updated = "".join(result).rstrip() + "\n" + section
     parsed = tomllib.loads(updated)
-    if parsed.get("mcp_servers", {}).get("ida", {}).get("command") != command:
-        raise ValueError("Could not safely replace ida MCP table")
+    if parsed.get("mcp_servers", {}).get(backend, {}).get("command") != command:
+        raise ValueError("Could not safely replace " + backend + " MCP table")
     # Header-like text inside multiline TOML values must never change unrelated
     # settings. Refuse edits the small table replacer cannot safely represent.
     for config in (original, parsed):
-        config.get("mcp_servers", {}).pop("ida", None)
+        config.get("mcp_servers", {}).pop(backend, None)
         if config.get("mcp_servers") == {}:
             config.pop("mcp_servers")
     if parsed != original:
-        raise ValueError("IDA registration would change unrelated TOML settings")
+        raise ValueError(backend + " registration would change unrelated TOML settings")
     return updated
 
 
-def payload_files():
-    paths = [* (SOURCE / "ida_backend").rglob("*"), * (SOURCE / "skills" / SKILL).rglob("*")]
+def replace_ida_toml(text, command, server):
+    return replace_backend_toml(text, command, server, "ida")
+
+
+def payload_files(backend="ida"):
+    paths = [* (SOURCE / "ida_backend").rglob("*")]
+    if backend == "ida":
+        paths.extend((SOURCE / "skills" / SKILL).rglob("*"))
+    else:
+        # Share the vendored generic MCP library, without IDA sessions/worker.
+        paths = list((SOURCE / "ida_backend/vendor/ida_pro_mcp/ida_mcp/zeromcp").rglob("*"))
+        paths.extend(SOURCE / "ida_backend/vendor" / name for name in
+                     ("LICENSE.ida-pro-mcp", "LOCAL_CHANGES.md", "UPSTREAM.json"))
+        paths.extend((SOURCE / "kernel_backend").rglob("*"))
     files = {}
     for path in paths:
         if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".pyc":
             continue
         files[path.relative_to(SOURCE).as_posix()] = path.read_bytes()
-    files["mcp_server/ida_server.py"] = (SOURCE / "mcp_server/ida_server.py").read_bytes()
+    entrypoint = "mcp_server/" + backend + "_server.py"
+    files[entrypoint] = (SOURCE / entrypoint).read_bytes()
+    files["mcp_server/stdio_dispatch.py"] = (SOURCE / "mcp_server/stdio_dispatch.py").read_bytes()
     return files
 
 
@@ -89,14 +105,16 @@ def atomic_write(path, data):
         Path(name).unlink(missing_ok=True)
 
 
-def install(home, clients=("claude", "codex"), python=None, dry_run=False):
+def install(home, clients=("claude", "codex"), python=None, dry_run=False, backends=("ida", "kernel")):
+    if not backends or len(set(backends)) != len(backends) or any(b not in {"ida", "kernel"} for b in backends):
+        raise ValueError("Choose ida, kernel, or both backends")
     home = checked_path(Path(home).absolute())
     codex_home = (checked_path(Path(os.environ.get("CODEX_HOME") or home / ".codex").expanduser().absolute())
                   if "codex" in clients else None)
     python = str(Path(python or sys.executable).resolve(strict=True))
-    deploy = home / ".ai-debugger" / "ida"
-    server = deploy / "mcp_server" / "ida_server.py"
-    files = payload_files()
+    deploy = home / ".ai-debugger" / backends[0]
+    servers = {backend: home / ".ai-debugger" / backend / "mcp_server" / (backend + "_server.py") for backend in backends}
+    server = servers[backends[0]]
     snapshots = {}
     def read_original(path):
         if path not in snapshots:
@@ -106,33 +124,43 @@ def install(home, clients=("claude", "codex"), python=None, dry_run=False):
             except FileNotFoundError:
                 snapshots[path] = None
         return snapshots[path]
-    destinations = {deploy / key: data for key, data in files.items() if not key.startswith("skills/")}
-    for key, data in files.items():
-        if key.startswith("skills/"):
-            relative = Path(key).relative_to("skills")
-            if "codex" in clients:
-                destinations[codex_home / "skills" / relative] = data
-            if "claude" in clients:
-                destinations[home / ".claude" / "skills" / relative] = data
+    destinations, backend_destinations = {}, {}
+    for backend in backends:
+        files = payload_files(backend)
+        selected = {home / ".ai-debugger" / backend / key: data for key, data in files.items() if not key.startswith("skills/")}
+        for key, data in files.items():
+            if key.startswith("skills/"):
+                relative = Path(key).relative_to("skills")
+                if "codex" in clients:
+                    selected[codex_home / "skills" / relative] = data
+                if "claude" in clients:
+                    selected[home / ".claude" / "skills" / relative] = data
+        backend_destinations[backend] = selected
+        destinations.update(selected)
     configs = []
-    registration = {"type": "stdio", "command": python, "args": [str(server)]}
+    registrations = {backend: {"type": "stdio", "command": python, "args": [str(path)]} for backend, path in servers.items()}
     if "claude" in clients:
         for path in (home / ".claude.json", home / "AppData/Roaming/Claude/claude_desktop_config.json"):
             original = read_original(path)
             data = json.loads(original.decode("utf-8-sig")) if original is not None else {}
-            data.setdefault("mcpServers", {})["ida"] = registration
+            data.setdefault("mcpServers", {}).update(registrations)
             destinations[path] = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
             configs.append(path)
     if "codex" in clients:
         path = codex_home / "config.toml"
         original = read_original(path)
         text = original.decode("utf-8-sig") if original is not None else ""
-        destinations[path] = replace_ida_toml(text, python, server).encode("utf-8")
+        for backend, entrypoint in servers.items():
+            text = replace_backend_toml(text, python, entrypoint, backend)
+        destinations[path] = text.encode("utf-8")
         configs.append(path)
-    manifest_path = deploy / "install-manifest.json"
-    original = read_original(manifest_path)
-    previous = json.loads(original.decode("utf-8")) if original is not None else {}
-    owned = previous.get("files", {})
+    owned, previous_manifests = {}, {}
+    for backend in backends:
+        manifest_path = home / ".ai-debugger" / backend / "install-manifest.json"
+        original = read_original(manifest_path)
+        previous = json.loads(original.decode("utf-8")) if original is not None else {}
+        previous_manifests[backend] = previous
+        owned.update(previous.get("files", {}))
     # Existing skill came from this user's skill. Record its initial snapshot so
     # first migration can accept it; future edits require ownership/hash match.
     adopted = json.loads((SOURCE / "skills" / "ORIGIN.json").read_text(encoding="utf-8"))
@@ -147,12 +175,15 @@ def install(home, clients=("claude", "codex"), python=None, dry_run=False):
         if adopted.get(relative) == actual:
             continue
         raise ValueError("Destination has unowned/local edits; preserved: " + str(path))
-    receipt = {"backend": "ida", "server": str(server),
-               "clients": sorted(set(previous.get("clients", [])) | set(clients)),
-               "files": {**owned, **{str(path): digest(content) for path, content in destinations.items() if path not in configs}}}
-    destinations[manifest_path] = (json.dumps(receipt, indent=2) + "\n").encode("utf-8")
+    for backend, selected in backend_destinations.items():
+        previous = previous_manifests[backend]
+        receipt = {"backend": backend, "server": str(servers[backend]),
+                   "clients": sorted(set(previous.get("clients", [])) | set(clients)),
+                   "files": {**previous.get("files", {}), **{str(path): digest(content) for path, content in selected.items()}}}
+        manifest_path = home / ".ai-debugger" / backend / "install-manifest.json"
+        destinations[manifest_path] = (json.dumps(receipt, indent=2) + "\n").encode("utf-8")
     if dry_run:
-        return {"dryRun": True, "server": str(server), "destinations": [str(p) for p in destinations]}
+        return {"dryRun": True, "server": str(server), "servers": {b: str(p) for b, p in servers.items()}, "destinations": [str(p) for p in destinations]}
     backup = deploy / "backups" / str(time.time_ns())
     for index, path in enumerate(configs):
         if snapshots[path] is not None:
@@ -179,7 +210,7 @@ def install(home, clients=("claude", "codex"), python=None, dry_run=False):
                 atomic_write(path, old)
         raise
     return {"installed": True, "server": str(server), "clients": list(clients),
-            "configBackups": str(backup), "fileCount": len(destinations)}
+            "servers": {b: str(p) for b, p in servers.items()}, "configBackups": str(backup), "fileCount": len(destinations)}
 
 
 def main():
@@ -188,8 +219,10 @@ def main():
     parser.add_argument("--client", choices=["claude", "codex", "all"], default="all")
     parser.add_argument("--python", type=Path)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--backend", choices=["ida", "kernel", "all"], default="all")
     args = parser.parse_args()
-    result = install(args.home, ("claude", "codex") if args.client == "all" else (args.client,), args.python, args.dry_run)
+    backends = ("ida", "kernel") if args.backend == "all" else (args.backend,)
+    result = install(args.home, ("claude", "codex") if args.client == "all" else (args.client,), args.python, args.dry_run, backends)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
