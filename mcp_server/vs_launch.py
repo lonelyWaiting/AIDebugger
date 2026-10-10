@@ -89,6 +89,7 @@ _LAUNCH_ID_PATTERN = re.compile(r"\A[0-9a-f]{32}\z")
 _ROOT_SUFFIX_PATTERN = re.compile(r"\A[A-Za-z0-9]{1,48}\z")
 _CAPABILITY_PATTERN = re.compile(r"\A[a-z][a-z0-9.]{0,63}\z")
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_NT_STILL_ACTIVE = 259
 _DOTNET_EPOCH_TICKS = 504911232000000000
 
 
@@ -517,8 +518,14 @@ def build_launch_arguments(
 # ---------------------------------------------------------------------------
 
 
-def _process_start_time_utc_ticks(process_id: int) -> Optional[int]:
-    """.NET-style creation ticks for a live process, or None when it is gone."""
+def _process_state(process_id: int) -> Optional[Tuple[int, bool]]:
+    """Creation ticks plus a running flag for a process, or None when it is gone.
+
+    Opening a process is not evidence of life: Windows keeps the process object, with its
+    recorded creation time, queryable for as long as any handle to it remains open, so a
+    Visual Studio that has already terminated can still be opened by its PID.
+    GetExitCodeProcess is what decides.
+    """
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.restype = wintypes.HANDLE
     kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -530,6 +537,8 @@ def _process_start_time_utc_ticks(process_id: int) -> Optional[int]:
         ctypes.POINTER(wintypes.FILETIME),
         ctypes.POINTER(wintypes.FILETIME),
     ]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(process_id))
     if not handle:
         return None
@@ -546,10 +555,27 @@ def _process_start_time_utc_ticks(process_id: int) -> Optional[int]:
             ctypes.byref(user),
         ):
             return None
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return None
         filetime = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
-        return filetime + _DOTNET_EPOCH_TICKS
+        return filetime + _DOTNET_EPOCH_TICKS, exit_code.value == _NT_STILL_ACTIVE
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _process_start_time_utc_ticks(process_id: int) -> Optional[int]:
+    """.NET-style creation ticks, but only for a process that is still running.
+
+    Callers compare these ticks to decide whether a PID still belongs to the process they
+    started, so a terminated process must not answer here even though its object may still
+    be openable.
+    """
+    state = _process_state(process_id)
+    if state is None:
+        return None
+    ticks, running = state
+    return ticks if running else None
 
 
 def _process_image_name(process_id: int) -> Optional[str]:
@@ -577,9 +603,25 @@ def _process_image_name(process_id: int) -> Optional[str]:
 
 
 def _record_alive(record: LaunchRecord) -> bool:
+    """Whether the Visual Studio this record launched is still running.
+
+    A record restored from disk carries no process handle, so the PID alone is not the
+    instance: Windows reuses PIDs, and a terminated process stays queryable while any
+    handle to it is open. The recorded creation time is the identity and the exit code is
+    the liveness, so neither a stranger that inherited the PID nor a process that has
+    already exited counts as alive - reporting either as alive is what made a close that
+    had actually completed look like a timeout.
+    """
     if record.process is not None:
         return record.process.poll() is None
-    return _process_start_time_utc_ticks(record.process_id) is not None
+    if record.start_time_utc_ticks is None:
+        # Nothing was recorded to compare against; existence is all that is left.
+        return _process_start_time_utc_ticks(record.process_id) is not None
+    state = _process_state(record.process_id)
+    if state is None:
+        return False
+    ticks, running = state
+    return running and ticks == record.start_time_utc_ticks
 
 
 def launch_devenv(
@@ -1056,7 +1098,10 @@ async def close_owned_instance(
             "closed": False,
             "errorCode": "NOT_LAUNCHED_BY_MCP",
         }
-    if not _record_alive(record):
+
+    def _report_already_closed() -> Dict[str, Any]:
+        # The launched instance is gone, so the record is pruned here too: leaving it behind
+        # would keep a dead PID in the owned set (and in the on-disk record) forever.
         _LAUNCHES.pop(record.process_id, None)
         _delete_launch_record(record.process_id)
         return {
@@ -1067,6 +1112,9 @@ async def close_owned_instance(
             "forced": False,
             "graceful": True,
         }
+
+    if not _record_alive(record):
+        return _report_already_closed()
     current_ticks = _process_start_time_utc_ticks(record.process_id)
     if (
         record.start_time_utc_ticks is not None
@@ -1084,7 +1132,11 @@ async def close_owned_instance(
             "errorCode": "STALE_TARGET",
         }
     image_name = _process_image_name(record.process_id)
-    if image_name is None or image_name.lower() != "devenv.exe":
+    if image_name is None:
+        # It exited between the liveness check and this one; there is nothing left to close,
+        # and the PID may already belong to something else.
+        return _report_already_closed()
+    if image_name.lower() != "devenv.exe":
         return {
             "success": False,
             "message": f"PID {process_id} is not a running devenv.exe process, so it will not be closed.",
@@ -1104,17 +1156,42 @@ async def close_owned_instance(
             "errorCode": "DEBUG_SESSION_ACTIVE",
         }
 
+    kill_attempts: List[str] = []
+
     def _taskkill(extra: Sequence[str]) -> None:
+        """Ask Windows to close the process, keeping what the call actually reported.
+
+        taskkill fails for real reasons (a process still winding up, an access boundary),
+        and discarding its exit code and message made a close that never had a chance look
+        exactly like one that timed out, with nothing left to diagnose it from.
+        """
+        label = f"taskkill /PID {record.process_id}" + (" " + " ".join(extra) if extra else "")
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 ["taskkill", "/PID", str(record.process_id), *extra],
                 capture_output=True,
+                text=True,
+                errors="replace",
                 timeout=15,
                 check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            logger.warning("taskkill for PID %s failed: %s", record.process_id, exc)
+            detail = f"{label}: could not run ({type(exc).__name__}: {exc})"
+        else:
+            first_line = next(
+                (
+                    line.strip()
+                    for line in (completed.stdout or completed.stderr or "").splitlines()
+                    if line.strip()
+                ),
+                "",
+            )
+            detail = f"{label}: exit {completed.returncode}" + (
+                f" ({first_line})" if first_line else ""
+            )
+        kill_attempts.append(detail)
+        logger.info("Visual Studio PID %s close: %s", record.process_id, detail)
 
     _taskkill(())
     # A forced close must not sit through the whole graceful timeout first: the caller asked
@@ -1126,16 +1203,20 @@ async def close_owned_instance(
         await asyncio.sleep(0.25)
 
     forced = False
-    graceful = not _record_alive(record)
-    if not graceful and force:
+    # Checked immediately before the one destructive step, and deliberately _record_alive
+    # rather than a plain existence test: it also matches the recorded creation time, so a PID
+    # that changed hands during the grace window is never force-terminated.
+    if force and _record_alive(record):
         _taskkill(("/F",))
         forced = True
         force_deadline = time.monotonic() + FORCE_KILL_SECONDS
         while time.monotonic() < force_deadline and _record_alive(record):
             await asyncio.sleep(0.25)
-        graceful = not _record_alive(record)
 
     closed = not _record_alive(record)
+    # "Graceful" means the process left on its own; recomputing it after the escalation made a
+    # forced close report both forced and graceful.
+    graceful = closed and not forced
     if closed:
         _LAUNCHES.pop(record.process_id, None)
         _delete_launch_record(record.process_id)
@@ -1144,7 +1225,10 @@ async def close_owned_instance(
         "message": (
             f"Closed the Visual Studio instance launched by this MCP server (PID {record.process_id})."
             if closed
-            else f"Visual Studio PID {record.process_id} did not close within the timeout."
+            else (
+                f"Visual Studio PID {record.process_id} did not close within the timeout: "
+                + "; ".join(kill_attempts)
+            )
         ),
         "processId": record.process_id,
         "closed": closed,

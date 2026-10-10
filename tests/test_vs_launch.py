@@ -4,6 +4,7 @@ import asyncio
 import json
 import pathlib
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -482,6 +483,51 @@ class EnsureInstanceTests(unittest.TestCase):
         )
 
 
+class RecordLivenessTests(unittest.TestCase):
+    """A record restored from disk has no process handle, so liveness needs care."""
+
+    def _restored(self, **overrides):
+        return record_for(pid=4242, process=None, **overrides)
+
+    def test_a_live_handle_decides_for_itself(self):
+        self.assertTrue(vs_launch._record_alive(record_for(pid=4242, alive=True)))
+        self.assertFalse(vs_launch._record_alive(record_for(pid=4242, alive=False)))
+
+    def test_a_matching_running_process_is_alive(self):
+        with patch.object(vs_launch, "_process_state", return_value=(123456789, True)):
+            self.assertTrue(vs_launch._record_alive(self._restored()))
+
+    def test_a_terminated_process_object_is_not_alive(self):
+        # Windows keeps a terminated process queryable while any handle to it is open, so
+        # a successful OpenProcess must not be read as "still running".
+        with patch.object(vs_launch, "_process_state", return_value=(123456789, False)):
+            self.assertFalse(vs_launch._record_alive(self._restored()))
+
+    def test_a_reused_pid_is_not_alive(self):
+        with patch.object(vs_launch, "_process_state", return_value=(999999999, True)):
+            self.assertFalse(vs_launch._record_alive(self._restored()))
+
+    def test_a_missing_process_object_is_not_alive(self):
+        with patch.object(vs_launch, "_process_state", return_value=None):
+            self.assertFalse(vs_launch._record_alive(self._restored()))
+
+    def test_a_record_without_creation_ticks_falls_back_to_existence(self):
+        # Only the existence check is left when nothing was recorded to compare against.
+        record = self._restored(start_time_utc_ticks=None)
+        with patch.object(vs_launch, "_process_start_time_utc_ticks", return_value=123456789):
+            self.assertTrue(vs_launch._record_alive(record))
+        with patch.object(vs_launch, "_process_start_time_utc_ticks", return_value=None):
+            self.assertFalse(vs_launch._record_alive(record))
+
+    def test_ticks_are_only_reported_for_a_running_process(self):
+        with patch.object(vs_launch, "_process_state", return_value=(123456789, True)):
+            self.assertEqual(vs_launch._process_start_time_utc_ticks(4242), 123456789)
+        with patch.object(vs_launch, "_process_state", return_value=(123456789, False)):
+            self.assertIsNone(vs_launch._process_start_time_utc_ticks(4242))
+        with patch.object(vs_launch, "_process_state", return_value=None):
+            self.assertIsNone(vs_launch._process_start_time_utc_ticks(4242))
+
+
 class CloseInstanceTests(unittest.TestCase):
     def setUp(self):
         self._launches = dict(vs_launch._LAUNCHES)
@@ -517,8 +563,6 @@ class CloseInstanceTests(unittest.TestCase):
     def test_forced_close_escalates_without_waiting_the_whole_timeout(self):
         # A forced close must escalate within the short grace window instead of blocking for
         # the caller's full timeout while Visual Studio tears a session down.
-        import subprocess
-
         vs_launch._LAUNCHES[4242] = record_for(pid=4242)
         alive = {"value": True}
         killed = []
@@ -545,8 +589,34 @@ class CloseInstanceTests(unittest.TestCase):
             elapsed = time.monotonic() - started
         self.assertTrue(result["success"], result)
         self.assertTrue(result["forced"], result)
+        # A close that needed the forced termination is not a graceful one.
+        self.assertFalse(result["graceful"], result)
         self.assertTrue(any("/F" in args for args in killed), killed)
         self.assertLess(elapsed, 5.0, "a forced close must not wait out the full timeout")
+
+    def test_a_process_that_exits_during_the_grace_window_is_not_force_killed(self):
+        vs_launch._LAUNCHES[4242] = record_for(pid=4242, process=None)
+        state = {"value": (123456789, True)}
+
+        def graceful_exit(args, **kwargs):
+            state["value"] = None  # this taskkill closed it; nothing left to escalate to
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with patch.object(vs_launch, "_process_image_name", return_value="devenv.exe"), patch.object(
+            vs_launch, "_process_state", side_effect=lambda process_id: state["value"]
+        ), patch.object(vs_launch.subprocess, "run", side_effect=graceful_exit) as run, patch.object(
+            vs_launch, "FORCE_GRACE_SECONDS", 5.0
+        ):
+            result = asyncio.run(
+                vs_launch.close_owned_instance(4242, force=True, timeout_seconds=30.0)
+            )
+        self.assertTrue(result["closed"], result)
+        self.assertFalse(result["forced"], result)
+        self.assertTrue(result["graceful"], result)
+        self.assertFalse(
+            [args for (args, _) in run.call_args_list if "/F" in args],
+            "an already exited instance must not be escalated to a forced kill",
+        )
 
     def test_already_closed_instance_is_reported_without_killing_anything(self):
         vs_launch._LAUNCHES[4242] = record_for(pid=4242, alive=False)
@@ -555,6 +625,78 @@ class CloseInstanceTests(unittest.TestCase):
         run.assert_not_called()
         self.assertTrue(result["success"])
         self.assertTrue(result["closed"])
+
+    def test_an_exited_process_object_is_reported_as_closed(self):
+        # The regression that made a completed close look like a timeout: Windows keeps the
+        # process object of an exited Visual Studio queryable, so its PID opened fine.
+        vs_launch._LAUNCHES[4242] = record_for(pid=4242, process=None)
+        with patch.object(vs_launch, "_process_state", return_value=(123456789, False)), patch.object(
+            vs_launch.subprocess, "run"
+        ) as run:
+            result = asyncio.run(vs_launch.close_owned_instance(4242, force=True))
+        run.assert_not_called()
+        self.assertTrue(result["closed"], result)
+        self.assertNotIn(4242, vs_launch._LAUNCHES)
+
+    def test_a_reused_pid_is_reported_as_closed_and_pruned(self):
+        vs_launch._LAUNCHES[4242] = record_for(pid=4242, process=None)
+        with patch.object(vs_launch, "_process_state", return_value=(999999999, True)), patch.object(
+            vs_launch.subprocess, "run"
+        ) as run:
+            result = asyncio.run(vs_launch.close_owned_instance(4242, force=True))
+        # A stranger that inherited the PID is never terminated; the instance we launched is
+        # gone either way, so the record is pruned rather than left dangling.
+        run.assert_not_called()
+        self.assertTrue(result["closed"], result)
+        self.assertNotIn(4242, vs_launch._LAUNCHES)
+
+    def test_a_restored_record_with_matching_identity_is_closed(self):
+        vs_launch._LAUNCHES[4242] = record_for(pid=4242, process=None)
+        alive = {"value": True}
+
+        def fake_run(args, **kwargs):
+            if "/F" in args:
+                alive["value"] = False
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        def fake_state(process_id):
+            return (123456789, True) if alive["value"] else None
+
+        with patch.object(vs_launch, "_process_image_name", return_value="devenv.exe"), patch.object(
+            vs_launch, "_process_state", side_effect=fake_state
+        ), patch.object(vs_launch.subprocess, "run", side_effect=fake_run), patch.object(
+            vs_launch, "FORCE_GRACE_SECONDS", 0.05
+        ):
+            result = asyncio.run(
+                vs_launch.close_owned_instance(4242, force=True, timeout_seconds=30.0)
+            )
+        self.assertTrue(result["closed"], result)
+        self.assertTrue(result["forced"], result)
+
+    def test_a_failed_taskkill_is_reported_with_what_it_said(self):
+        vs_launch._LAUNCHES[4242] = record_for(pid=4242, process=None)
+
+        def failing_run(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args, 1, "", "ERROR: The process with PID 4242 could not be terminated."
+            )
+
+        with patch.object(vs_launch, "_process_image_name", return_value="devenv.exe"), patch.object(
+            vs_launch, "_process_state", return_value=(123456789, True)
+        ), patch.object(vs_launch.subprocess, "run", side_effect=failing_run), patch.object(
+            vs_launch, "FORCE_GRACE_SECONDS", 0.05
+        ), patch.object(
+            vs_launch, "FORCE_KILL_SECONDS", 0.05
+        ):
+            result = asyncio.run(
+                vs_launch.close_owned_instance(4242, force=True, timeout_seconds=0.1)
+            )
+        self.assertFalse(result["closed"], result)
+        self.assertEqual(result["errorCode"], "CLOSE_TIMEOUT")
+        # Without this the caller only ever saw "did not close within the timeout" and the
+        # reason taskkill gave was thrown away.
+        self.assertIn("exit 1", result["message"])
+        self.assertIn("could not be terminated", result["message"])
 
 
 class ToolContractTests(unittest.TestCase):
