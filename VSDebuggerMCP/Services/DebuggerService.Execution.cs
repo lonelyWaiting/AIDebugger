@@ -21,6 +21,18 @@ namespace VSDebuggerMCP
 {
     public partial class DebuggerService
     {
+        // Process lookup resolves the debugger automation handles once per snapshot and
+        // caches the result briefly: reading debugger.LocalProcesses again for every process
+        // costs about 200 ms, which turned a ~600 process scan into minutes and made every
+        // attach look like a hang.
+        // Items captured per bounded UI-thread slice; see CaptureLocalProcessSnapshot.
+        private const int LocalProcessCaptureBatchSize = 32;
+        private const int LocalProcessSnapshotCacheMs = 10000;
+        private const int LocalProcessSnapshotTimeoutMs = 30000;
+        private readonly object _localProcessSnapshotLock = new object();
+        private LocalProcessSnapshot _cachedLocalProcessSnapshot;
+        private int _cachedLocalProcessCount = -1;
+        private DateTime _cachedLocalProcessSnapshotUtc = DateTime.MinValue;
         #region Debug Control
 
         /// <summary>
@@ -58,12 +70,7 @@ namespace VSDebuggerMCP
 
                 try
                 {
-                    IntPtr identityHandle = OpenVerifiedLocalProcessAtIndex(
-                        debugger,
-                        target.Index,
-                        target.ProcessId,
-                        target.ProcessStartTimeUtcTicks,
-                        out EnvDTE.Process targetProcess);
+                    IntPtr identityHandle = OpenVerifiedLocalProcess(debugger, target, out EnvDTE.Process targetProcess);
                     if (identityHandle == IntPtr.Zero || targetProcess == null)
                     {
                         throw new StaleDebugSessionException(
@@ -686,19 +693,43 @@ namespace VSDebuggerMCP
                 return new LocalProcessLookup { Message = "Either process_id or process_name is required" };
             }
 
+            // A PID (with its process name derived from it) is the common case and resolves
+            // with a single automation lookup; only a miss walks every local process.
+            if (processId > 0)
+            {
+                string candidateName = TryGetProcessImageFileName(processId);
+                if (!string.IsNullOrWhiteSpace(candidateName))
+                {
+                    LocalProcessLookup fast = ExecuteOnMainThread(() =>
+                    {
+                        ThreadHelper.ThrowIfNotOnUIThread();
+                        try
+                        {
+                            EnvDTE.Process process = Debugger?.LocalProcesses?.Item(candidateName);
+                            if (process == null || process.ProcessID != processId) return null;
+                            return new LocalProcessLookup
+                            {
+                                Found = true,
+                                Index = 0,
+                                ProcessId = processId,
+                                ProcessName = process.Name,
+                                ProcessStartTimeUtcTicks = TryGetProcessStartTimeUtcTicks(processId),
+                                Process = process,
+                            };
+                        }
+                        catch
+                        {
+                            return null;
+                        }
+                    }, DefaultMainThreadTimeoutMs);
+                    if (fast != null) return fast;
+                }
+            }
+
             LocalProcessSnapshot snapshot = CaptureLocalProcessSnapshot();
             if (processId > 0)
             {
                 LocalProcessIdentity match = snapshot.Items.FirstOrDefault(item => item.ProcessId == processId);
-                if (match == null)
-                {
-                    LocalProcessSnapshot pidConfirmation = CaptureLocalProcessSnapshot();
-                    if (!LocalProcessSnapshotsEqual(snapshot, pidConfirmation))
-                    {
-                        throw new StaleDebugSessionException(
-                            "Visual Studio local processes changed while resolving the requested PID.");
-                    }
-                }
                 return match == null
                     ? new LocalProcessLookup
                     {
@@ -714,16 +745,9 @@ namespace VSDebuggerMCP
                     };
             }
 
-            // A second complete identity snapshot prevents a same-sized collection
-            // replacement from being reported as a unique/stable name match.
-            LocalProcessSnapshot confirmation = CaptureLocalProcessSnapshot();
-            if (!LocalProcessSnapshotsEqual(snapshot, confirmation))
-            {
-                throw new StaleDebugSessionException(
-                    "Visual Studio local processes changed while resolving the requested process name.");
-            }
-
-            List<LocalProcessIdentity> matches = confirmation.Items
+            // The attach step re-verifies the chosen process through its OS handle, so one
+            // snapshot is enough to pick a candidate here.
+            List<LocalProcessIdentity> matches = snapshot.Items
                 .Where(item => ProcessNameMatches(item.Name, processName))
                 .ToList();
             if (matches.Count == 1)
@@ -758,46 +782,84 @@ namespace VSDebuggerMCP
 
         private LocalProcessSnapshot CaptureLocalProcessSnapshot()
         {
+            // The collection object is resolved once per snapshot and reused by every slice.
+            // Resolving it per item costs ~200 ms through the automation layer, which turned a
+            // ~600 process snapshot into minutes and made every attach look like a hang. The
+            // capture stays sliced (bounded items per UI-thread hop) so the UI thread is never
+            // monopolised and cancellation/deadline checks still run between slices.
+            EnvDTE.Processes localProcesses = null;
             int initialCount = ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
-                return Debugger?.LocalProcesses?.Count ?? 0;
+                localProcesses = Debugger?.LocalProcesses;
+                return localProcesses?.Count ?? 0;
             });
+            if (localProcesses == null)
+            {
+                throw new StaleDebugSessionException("Visual Studio local processes are unavailable.");
+            }
+
+            _log($"local process snapshot: count={initialCount}; enumerating");
+            LocalProcessSnapshot cached = GetCachedLocalProcessSnapshot(initialCount);
+            if (cached != null)
+            {
+                return cached;
+            }
+
             var snapshot = new LocalProcessSnapshot();
-            for (int index = 1; index <= initialCount; index++)
+            for (int first = 1; first <= initialCount; first += LocalProcessCaptureBatchSize)
             {
                 DebuggerRequestContext.ThrowIfCancellationOrDeadlineExceeded();
-                int capturedIndex = index;
-                LocalProcessIdentity item = ExecuteOnMainThread(
-                    () => CaptureLocalProcessIdentity(capturedIndex),
-                    DefaultMainThreadTimeoutMs);
-                if (item == null)
+                int batchFirst = first;
+                int batchLast = Math.Min(initialCount, first + LocalProcessCaptureBatchSize - 1);
+                List<LocalProcessIdentity> batch = ExecuteOnMainThread(
+                    () => CaptureLocalProcessIdentityRange(localProcesses, batchFirst, batchLast),
+                    LocalProcessSnapshotTimeoutMs);
+                if (batch == null || batch.Count != batchLast - batchFirst + 1)
                 {
                     throw new StaleDebugSessionException(
                         "Visual Studio local processes changed while being enumerated.");
                 }
-                snapshot.Items.Add(item);
+                snapshot.Items.AddRange(batch);
             }
 
             int finalCount = ExecuteOnMainThread(() =>
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
-                return Debugger?.LocalProcesses?.Count ?? 0;
+                return localProcesses.Count;
             });
             if (finalCount != initialCount)
             {
                 throw new StaleDebugSessionException(
                     "Visual Studio local process count changed while being enumerated.");
             }
+            _log($"local process snapshot: complete ({initialCount} processes)");
+            CacheLocalProcessSnapshot(snapshot, initialCount);
             return snapshot;
         }
 
-        private LocalProcessIdentity CaptureLocalProcessIdentity(int index)
+        [SuppressMessage("Usage", "VSTHRD010", Justification = "Reads bounded LocalProcesses entries inside one UI slice.")]
+        private static List<LocalProcessIdentity> CaptureLocalProcessIdentityRange(
+            EnvDTE.Processes localProcesses,
+            int firstIndex,
+            int lastIndex)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var items = new List<LocalProcessIdentity>(Math.Max(0, lastIndex - firstIndex + 1));
+            for (int index = firstIndex; index <= lastIndex; index++)
+            {
+                items.Add(CaptureLocalProcessIdentity(localProcesses, index));
+            }
+            return items;
+        }
+
+        [SuppressMessage("Usage", "VSTHRD010", Justification = "Reads one LocalProcesses entry inside a bounded UI slice.")]
+        private static LocalProcessIdentity CaptureLocalProcessIdentity(EnvDTE.Processes localProcesses, int index)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             try
             {
-                EnvDTE.Process process = Debugger?.LocalProcesses?.Item(index);
+                EnvDTE.Process process = localProcesses?.Item(index);
                 int processId = process?.ProcessID ?? 0;
                 long processStartTimeUtcTicks = TryGetProcessStartTimeUtcTicks(processId);
                 return process == null
@@ -813,6 +875,73 @@ namespace VSDebuggerMCP
             catch
             {
                 return null;
+            }
+        }
+
+        private LocalProcessSnapshot GetCachedLocalProcessSnapshot(int currentCount)
+        {
+            lock (_localProcessSnapshotLock)
+            {
+                if (_cachedLocalProcessSnapshot == null || _cachedLocalProcessCount != currentCount ||
+                    (DateTime.UtcNow - _cachedLocalProcessSnapshotUtc).TotalMilliseconds > LocalProcessSnapshotCacheMs)
+                {
+                    return null;
+                }
+                return _cachedLocalProcessSnapshot;
+            }
+        }
+
+        private void CacheLocalProcessSnapshot(LocalProcessSnapshot snapshot, int count)
+        {
+            lock (_localProcessSnapshotLock)
+            {
+                _cachedLocalProcessSnapshot = snapshot;
+                _cachedLocalProcessCount = count;
+                _cachedLocalProcessSnapshotUtc = DateTime.UtcNow;
+            }
+        }
+
+        private static string TryGetProcessImageFileName(int processId)
+        {
+            try
+            {
+                using (System.Diagnostics.Process process = System.Diagnostics.Process.GetProcessById(processId))
+                {
+                    string name = process.ProcessName;
+                    return string.IsNullOrWhiteSpace(name) ? null : name + ".exe";
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private IntPtr OpenVerifiedLocalProcess(
+            Debugger5 debugger,
+            LocalProcessLookup lookup,
+            out EnvDTE.Process verifiedProcess)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            verifiedProcess = null;
+            if (lookup == null) return IntPtr.Zero;
+            try
+            {
+                EnvDTE.Process process = lookup.Process ?? debugger?.LocalProcesses?.Item(lookup.Index);
+                if (process == null || process.ProcessID != lookup.ProcessId)
+                {
+                    return IntPtr.Zero;
+                }
+                IntPtr handle = OpenVerifiedProcessHandle(lookup.ProcessId, lookup.ProcessStartTimeUtcTicks);
+                if (handle != IntPtr.Zero)
+                {
+                    verifiedProcess = process;
+                }
+                return handle;
+            }
+            catch
+            {
+                return IntPtr.Zero;
             }
         }
 
@@ -912,26 +1041,6 @@ namespace VSDebuggerMCP
             }
         }
 
-        private static bool LocalProcessSnapshotsEqual(LocalProcessSnapshot left, LocalProcessSnapshot right)
-        {
-            if (left?.Items == null || right?.Items == null || left.Items.Count != right.Items.Count)
-            {
-                return false;
-            }
-            for (int index = 0; index < left.Items.Count; index++)
-            {
-                LocalProcessIdentity a = left.Items[index];
-                LocalProcessIdentity b = right.Items[index];
-                if (a.ProcessId != b.ProcessId ||
-                    a.ProcessStartTimeUtcTicks != b.ProcessStartTimeUtcTicks ||
-                    !string.Equals(a.Name, b.Name, StringComparison.OrdinalIgnoreCase))
-                {
-                    return false;
-                }
-            }
-            return true;
-        }
-
         [SuppressMessage("Usage", "VSTHRD010", Justification = "Local process lookup self-marshals one collection item per UI slice.")]
         private LocalProcessLookup WaitForLocalProcessOffUiThread(
             int processId,
@@ -985,6 +1094,9 @@ namespace VSDebuggerMCP
         {
             internal bool Found { get; set; }
             internal int Index { get; set; }
+            // Set when the process came straight from the automation collection by name; the
+            // attach step then reuses this object instead of indexing into the list.
+            internal EnvDTE.Process Process { get; set; }
             internal int ProcessId { get; set; }
             internal string ProcessName { get; set; }
             internal long ProcessStartTimeUtcTicks { get; set; }

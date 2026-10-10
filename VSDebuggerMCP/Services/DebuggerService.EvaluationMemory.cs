@@ -895,8 +895,38 @@ namespace VSDebuggerMCP
                 return false;
             }
 
+            // Resolve the collection once. Reading debugger.LocalProcesses again per probe
+            // costs ~200 ms through the automation layer, which made this gate take minutes
+            // on a machine with hundreds of processes.
+            EnvDTE.Processes localProcesses = debugger.LocalProcesses;
+            if (localProcesses == null)
+            {
+                return false;
+            }
+
+            // The DTE current process names its local entry, so a single lookup confirms the
+            // common case; it only ever confirms, never rejects, and the bounded walk below
+            // still covers entries the name lookup cannot resolve.
+            string currentName = expectedCurrent.Name;
+            if (!string.IsNullOrWhiteSpace(currentName))
+            {
+                try
+                {
+                    EnvDTE.Process byName = localProcesses.Item(currentName);
+                    if (byName != null && byName.ProcessID == processId &&
+                        HasSameComIdentity(expectedCurrent, byName))
+                    {
+                        return true;
+                    }
+                }
+                catch
+                {
+                    // Fall through to the bounded walk.
+                }
+            }
+
             const int MaxLocalProcessIdentityProbeCount = 256;
-            int count = debugger.LocalProcesses?.Count ?? 0;
+            int count = localProcesses.Count;
             if (count <= 0 || count > MaxLocalProcessIdentityProbeCount)
             {
                 return false;
@@ -909,7 +939,7 @@ namespace VSDebuggerMCP
                     DebuggerRequestContext.ThrowIfCancellationOrDeadlineExceeded();
                 }
 
-                EnvDTE.Process candidate = debugger.LocalProcesses?.Item(index);
+                EnvDTE.Process candidate = localProcesses.Item(index);
                 if (candidate != null && candidate.ProcessID == processId &&
                     HasSameComIdentity(expectedCurrent, candidate))
                 {
