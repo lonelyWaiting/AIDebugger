@@ -1616,6 +1616,14 @@ print(json.dumps({
         ):
             self.assertIn(marker, vs_service)
 
+        # The attach target must be re-found by PID. A position in LocalProcesses does not
+        # survive the startup churn that follows a snapshot, and a name is not unique either
+        # (dozens of cmd.exe/conhost.exe share one), which made valid attaches fail as
+        # STALE_DEBUG_SESSION.
+        self.assertIn("FindLocalProcessByPid(", vs_service)
+        self.assertIn("FindLocalProcessInRange(", vs_service)
+        self.assertNotIn("LocalProcesses?.Item(lookup.Index)", vs_service)
+
         for field in (
             'DataMember(Name = "startIndex")',
             'DataMember(Name = "nextIndex")',

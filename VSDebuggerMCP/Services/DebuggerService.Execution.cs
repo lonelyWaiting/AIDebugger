@@ -711,7 +711,6 @@ namespace VSDebuggerMCP
                             return new LocalProcessLookup
                             {
                                 Found = true,
-                                Index = 0,
                                 ProcessId = processId,
                                 ProcessName = process.Name,
                                 ProcessStartTimeUtcTicks = TryGetProcessStartTimeUtcTicks(processId),
@@ -727,40 +726,35 @@ namespace VSDebuggerMCP
                 }
             }
 
-            LocalProcessSnapshot snapshot = CaptureLocalProcessSnapshot();
             if (processId > 0)
             {
-                LocalProcessIdentity match = snapshot.Items.FirstOrDefault(item => item.ProcessId == processId);
-                return match == null
-                    ? new LocalProcessLookup
-                    {
-                        Message = $"Process with PID {processId} was not found in Visual Studio local processes",
-                    }
-                    : new LocalProcessLookup
-                    {
-                        Found = true,
-                        Index = match.Index,
-                        ProcessId = match.ProcessId,
-                        ProcessName = match.Name,
-                        ProcessStartTimeUtcTicks = match.ProcessStartTimeUtcTicks,
-                    };
+                LocalProcessLookup match = FindLocalProcessByPid(processId);
+                return match ?? new LocalProcessLookup
+                {
+                    Message = $"Process with PID {processId} was not found in Visual Studio local processes",
+                };
             }
 
+            // Only a name needs the whole collection, to tell a single match from a duplicate.
             // The attach step re-verifies the chosen process through its OS handle, so one
             // snapshot is enough to pick a candidate here.
+            LocalProcessSnapshot snapshot = CaptureLocalProcessSnapshot();
             List<LocalProcessIdentity> matches = snapshot.Items
                 .Where(item => ProcessNameMatches(item.Name, processName))
                 .ToList();
             if (matches.Count == 1)
             {
-                LocalProcessIdentity match = matches[0];
+                // The snapshot only decides which process is meant; the attach target is then
+                // resolved by PID, because a position in this collection does not survive the
+                // Visual Studio startup churn that follows the capture.
+                LocalProcessLookup match = FindLocalProcessByPid(matches[0].ProcessId);
+                if (match != null)
+                {
+                    return match;
+                }
                 return new LocalProcessLookup
                 {
-                    Found = true,
-                    Index = match.Index,
-                    ProcessId = match.ProcessId,
-                    ProcessName = match.Name,
-                    ProcessStartTimeUtcTicks = match.ProcessStartTimeUtcTicks,
+                    Message = $"Process '{matches[0].Name}' ({matches[0].ProcessId}) exited before it could be attached",
                 };
             }
 
@@ -779,6 +773,87 @@ namespace VSDebuggerMCP
             {
                 Message = $"Process named '{processName}' was not found in Visual Studio local processes",
             };
+        }
+
+        /// <summary>
+        /// Resolve one local process by PID, in the same bounded slices the snapshot uses.
+        ///
+        /// The collection is a live view: Visual Studio starts and stops processes while it is
+        /// enumerated, so a position captured by an earlier walk can point at a different
+        /// process by the time the debugger attaches, and a name is not unique either (dozens
+        /// of cmd.exe or conhost.exe share one). A PID is neither, and the caller still
+        /// re-verifies the OS identity of the process it finally opens.
+        /// </summary>
+        private LocalProcessLookup FindLocalProcessByPid(int processId)
+        {
+            if (processId <= 0)
+            {
+                return null;
+            }
+
+            EnvDTE.Processes localProcesses = null;
+            int count = ExecuteOnMainThread(() =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                localProcesses = Debugger?.LocalProcesses;
+                return localProcesses?.Count ?? 0;
+            });
+            if (localProcesses == null)
+            {
+                return null;
+            }
+
+            for (int first = 1; first <= count; first += LocalProcessCaptureBatchSize)
+            {
+                DebuggerRequestContext.ThrowIfCancellationOrDeadlineExceeded();
+                int batchFirst = first;
+                int batchLast = Math.Min(count, first + LocalProcessCaptureBatchSize - 1);
+                LocalProcessLookup found = ExecuteOnMainThread(
+                    () => FindLocalProcessInRange(localProcesses, processId, batchFirst, batchLast),
+                    LocalProcessSnapshotTimeoutMs);
+                if (found != null)
+                {
+                    return found;
+                }
+            }
+            return null;
+        }
+
+        [SuppressMessage("Usage", "VSTHRD010", Justification = "Reads bounded LocalProcesses entries inside one UI slice.")]
+        private static LocalProcessLookup FindLocalProcessInRange(
+            EnvDTE.Processes localProcesses,
+            int processId,
+            int firstIndex,
+            int lastIndex)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (localProcesses == null)
+            {
+                return null;
+            }
+            for (int index = firstIndex; index <= lastIndex; index++)
+            {
+                try
+                {
+                    EnvDTE.Process process = localProcesses.Item(index);
+                    if (process != null && process.ProcessID == processId)
+                    {
+                        return new LocalProcessLookup
+                        {
+                            Found = true,
+                            ProcessId = processId,
+                            ProcessName = process.Name,
+                            ProcessStartTimeUtcTicks = TryGetProcessStartTimeUtcTicks(processId),
+                            Process = process,
+                        };
+                    }
+                }
+                catch
+                {
+                    // An entry whose process exited mid-scan is not addressable; keep scanning.
+                }
+            }
+            return null;
         }
 
         private LocalProcessSnapshot CaptureLocalProcessSnapshot()
@@ -867,7 +942,6 @@ namespace VSDebuggerMCP
                     ? null
                     : new LocalProcessIdentity
                     {
-                        Index = index,
                         ProcessId = processId,
                         Name = process.Name,
                         ProcessStartTimeUtcTicks = processStartTimeUtcTicks,
@@ -928,7 +1002,10 @@ namespace VSDebuggerMCP
             if (lookup == null) return IntPtr.Zero;
             try
             {
-                EnvDTE.Process process = lookup.Process ?? debugger?.LocalProcesses?.Item(lookup.Index);
+                // Every discovery path resolves the automation object for the PID off the UI
+                // thread. A position in the collection is not reusable here: the collection is
+                // live, and re-adding it as a fallback only reintroduced the reordering bug.
+                EnvDTE.Process process = lookup.Process;
                 if (process == null || process.ProcessID != lookup.ProcessId)
                 {
                     return IntPtr.Zero;
@@ -1056,7 +1133,6 @@ namespace VSDebuggerMCP
 
         private sealed class LocalProcessIdentity
         {
-            internal int Index { get; set; }
             internal int ProcessId { get; set; }
             internal string Name { get; set; }
             internal long ProcessStartTimeUtcTicks { get; set; }
@@ -1065,9 +1141,8 @@ namespace VSDebuggerMCP
         private sealed class LocalProcessLookup
         {
             internal bool Found { get; set; }
-            internal int Index { get; set; }
-            // Set when the process came straight from the automation collection by name; the
-            // attach step then reuses this object instead of indexing into the list.
+            // The automation object for the PID, resolved on the UI thread by the discovery
+            // step and reused by the attach step.
             internal EnvDTE.Process Process { get; set; }
             internal int ProcessId { get; set; }
             internal string ProcessName { get; set; }
