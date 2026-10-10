@@ -421,6 +421,40 @@ class InstanceSelectionPayload(StrictPayload):
     errorCode: Optional[Literal["SELECTION_CHANGED"]] = None
 
 
+class EnsureVSInstancePayload(StrictPayload):
+    success: bool
+    status: Literal[
+        "reused", "launched", "ambiguous", "ready_timeout", "launch_failed", "attach_failed",
+    ]
+    message: str
+    launched: bool
+    attached: Optional[bool] = None
+    partial: Optional[bool] = None
+    processId: Optional[int] = None
+    pipeName: Optional[str] = None
+    installPath: Optional[str] = None
+    installationVersion: Optional[str] = None
+    launchId: Optional[str] = None
+    requestedCapabilities: Optional[List[str]] = None
+    grantedCapabilities: Optional[List[str]] = None
+    accessMode: Optional[str] = None
+    instance: Optional[IDEInstancePayload] = None
+    attachResult: Optional[ProcessDebugPayload] = None
+    diagnostics: Optional[List[str]] = None
+    hint: Optional[str] = None
+    errorCode: Optional[str] = None
+
+
+class CloseVSInstancePayload(StrictPayload):
+    success: bool
+    message: str
+    processId: Optional[int] = None
+    closed: Optional[bool] = None
+    forced: Optional[bool] = None
+    graceful: Optional[bool] = None
+    errorCode: Optional[str] = None
+
+
 class MultiVSTargetPayload(StrictPayload):
     pipeName: str
     processId: int
@@ -1158,6 +1192,8 @@ _MODEL_BY_TOOL: Dict[str, Type[StrictPayload]] = {
     **{name: InstanceSelectionPayload for name in (
         "select_vs_instance", "clear_vs_selection",
     )},
+    "ensure_vs_instance": EnsureVSInstancePayload,
+    "close_vs_instance": CloseVSInstancePayload,
     "dispatch_vs_instances": MultiVSDispatchPayload,
     "dispatch_vs_commands": MultiVSDispatchPayload,
     "get_debug_status": DebugStatusPayload,

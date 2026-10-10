@@ -1,11 +1,32 @@
 """Visual Studio-only discovery and selection tools."""
 
+from typing import Any, Dict, Optional
+
+import asyncio
+
 try:
+    from .. import vs_bridge, vs_launch
     from ..tool_runtime import backend, mcp
-    from ..tool_context import format_result, handle_ide_error, validate_int_range
+    from ..tool_context import (
+        clamp_tool_timeout,
+        format_result,
+        handle_ide_error,
+        validate_int_range,
+        validate_nonempty_string,
+        wait_for_debugging_to_start,
+    )
 except ImportError:
-    from tool_runtime import backend, mcp
-    from tool_context import format_result, handle_ide_error, validate_int_range
+    import vs_bridge  # type: ignore
+    import vs_launch  # type: ignore
+    from tool_runtime import backend, mcp  # type: ignore
+    from tool_context import (  # type: ignore
+        clamp_tool_timeout,
+        format_result,
+        handle_ide_error,
+        validate_int_range,
+        validate_nonempty_string,
+        wait_for_debugging_to_start,
+    )
 
 
 async def _snapshot(instances):
@@ -206,3 +227,203 @@ async def clear_vs_selection() -> str:
         "message": "Cleared the pinned Visual Studio selection.",
         "selected": False,
     })
+
+
+def _launch_hint(outcome) -> Optional[str]:
+    if outcome.status == vs_launch.AMBIGUOUS_STATUS:
+        return (
+            "Call select_vs_instance(process_id=...) to pin one of the reachable instances, or call "
+            "ensure_vs_instance again with reuse_existing=False to launch a dedicated instance."
+        )
+    if outcome.status in {vs_launch.READY_TIMEOUT_STATUS, vs_launch.LAUNCH_FAILED_STATUS}:
+        return (
+            "Check the AIDebugger output pane in Visual Studio and confirm the AIDebuggerVS extension is "
+            "installed and enabled for the installation that was launched "
+            "(list candidates with list_vs_instances, or pass install_path/instance_id explicitly)."
+        )
+    return None
+
+
+def _instance_result(outcome, requested_capabilities) -> Dict[str, Any]:
+    instance = outcome.instance
+    record = outcome.record
+    result: Dict[str, Any] = {
+        "success": instance is not None,
+        "status": outcome.status,
+        "message": outcome.message,
+        "launched": record is not None,
+        "attached": False if instance is not None else None,
+        "partial": True if outcome.status == vs_launch.READY_TIMEOUT_STATUS else None,
+        "processId": instance.process_id if instance is not None else (
+            record.process_id if record is not None else None
+        ),
+        "pipeName": instance.pipe_name if instance is not None else None,
+        "installPath": record.installation.install_path if record is not None else None,
+        "installationVersion": record.installation.installation_version if record is not None else None,
+        "launchId": record.launch_id if record is not None else None,
+        "requestedCapabilities": list(requested_capabilities),
+        "grantedCapabilities": list(instance.allowed_capabilities) if instance is not None else None,
+        "accessMode": instance.access_mode if instance is not None else None,
+        "instance": instance.to_dict() if instance is not None else None,
+        "attachResult": None,
+        "diagnostics": list(outcome.diagnostics) or None,
+        "hint": _launch_hint(outcome),
+        "errorCode": None if instance is not None else (
+            "TARGET_NOT_FOUND" if outcome.status == vs_launch.AMBIGUOUS_STATUS else None
+        ),
+    }
+    return result
+
+
+@mcp.tool()
+async def ensure_vs_instance(
+    process_id: Optional[int] = None,
+    process_name: Optional[str] = None,
+    solution_path: Optional[str] = None,
+    capabilities: Optional[str] = None,
+    install_path: Optional[str] = None,
+    instance_id: Optional[str] = None,
+    root_suffix: Optional[str] = None,
+    reuse_existing: bool = True,
+    attach: bool = True,
+    wait_for_debugger: bool = True,
+    timeout_seconds: Optional[float] = None,
+) -> str:
+    """
+    Make an authenticated Visual Studio instance usable, launching one when none is running.
+
+    Call this whenever another tool reports that no Visual Studio instance is available:
+    it reuses a reachable instance, otherwise it starts devenv.exe with a short-lived
+    launcher request that lets the extension bring its MCP server up without a menu click,
+    waits for the authenticated registration, pins the instance, and then optionally
+    attaches the debugger to process_id/process_name.
+
+    capabilities defaults to the full debugger set; narrow it (comma-separated capability
+    names) only when a read-only or partial server is intended.
+    """
+    try:
+        total_timeout = clamp_tool_timeout(timeout_seconds, vs_launch.DEFAULT_LAUNCH_TIMEOUT_SECONDS)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + total_timeout
+        if process_id is not None and process_name is not None:
+            raise vs_bridge.VSBridgeError(
+                "Provide at most one of process_id or process_name.",
+                code="INVALID_ARGUMENT",
+            )
+        target_params: Dict[str, Any] = {}
+        if process_id is not None:
+            target_params["processId"] = validate_int_range("process_id", process_id, 1, 0x7FFFFFFF)
+        if process_name is not None:
+            target_params["processName"] = validate_nonempty_string("process_name", process_name, 1024)
+
+        requested = vs_launch.parse_requested_capabilities(capabilities)
+        outcome = await vs_launch.ensure_instance(
+            requested,
+            install_path=install_path,
+            instance_id=instance_id,
+            solution_path=solution_path,
+            root_suffix=root_suffix,
+            reuse_existing=reuse_existing,
+            timeout_seconds=total_timeout,
+        )
+        result = _instance_result(outcome, requested)
+        if outcome.instance is None:
+            return format_result(result)
+
+        # Pin the instance so every later tool reaches the same Visual Studio process.
+        manager = backend.get_bridge()
+        _, _, _, expected_generation = await manager.get_selection_snapshot()
+        selected, _, _ = await manager.try_select_instance(
+            expected_generation,
+            pipe_name=outcome.instance.pipe_name,
+            target_identity=outcome.instance.target_identity(),
+            registration_snapshot=outcome.instance.registration_snapshot(),
+        )
+        instance_payload = outcome.instance.to_dict()
+        instance_payload["isSelected"] = bool(selected)
+        result["instance"] = instance_payload
+        if not selected:
+            result["message"] += (
+                " Another selection replaced this instance while it was being pinned; the newer "
+                "selection was preserved."
+            )
+        if not target_params or not attach:
+            return format_result(result)
+
+        target = vs_bridge.instance_target(outcome.instance.target_identity())
+        remaining = max(1.0, deadline - loop.time())
+        try:
+            attach_result = await backend.call(
+                "attach_process", target_params, preferred_ide="vs", timeout=remaining
+            )
+        except backend.IDEBridgeError as error:
+            result["status"] = "attach_failed"
+            result["success"] = False
+            result["errorCode"] = getattr(error, "code", "BRIDGE_ERROR")
+            result["message"] = (
+                f"Visual Studio PID {outcome.instance.process_id} is ready, but attaching failed: {error}"
+            )
+            return format_result(result)
+
+        if wait_for_debugger and isinstance(attach_result, dict):
+            remaining = max(1.0, deadline - loop.time())
+            attach_result = await wait_for_debugging_to_start(
+                attach_result, remaining, True, target=target
+            )
+        result["attachResult"] = attach_result
+        activation = (
+            attach_result.get("debuggerActivationStatus") if isinstance(attach_result, dict) else None
+        )
+        result["attached"] = bool(
+            activation == "active"
+            or (isinstance(attach_result, dict) and attach_result.get("attachCompleted"))
+        )
+        if activation == "timed_out":
+            result["partial"] = True
+            result["message"] += (
+                " The attach command was issued, but Visual Studio had not entered debugging mode "
+                "before the timeout; check get_debug_status before repeating anything."
+            )
+        return format_result(result)
+    except (backend.IDEBridgeError, vs_bridge.VSBridgeError) as error:
+        return handle_ide_error(error, "ensure_vs_instance")
+
+
+@mcp.tool()
+async def close_vs_instance(
+    process_id: int,
+    force: bool = False,
+    timeout_seconds: Optional[float] = None,
+) -> str:
+    """
+    Close a Visual Studio instance this MCP server launched.
+
+    Instances started by the user are refused: only PIDs recorded by ensure_vs_instance in
+    this MCP server process can be closed. A running debug session is refused unless
+    force=True.
+    """
+    try:
+        process_id = validate_int_range("process_id", process_id, 1, 0x7FFFFFFF)
+        total_timeout = clamp_tool_timeout(timeout_seconds, 30.0)
+        debug_state = None
+        record = vs_launch.get_owned_launch(process_id)
+        if record is not None and record.ready_instance is not None:
+            try:
+                debug_state = await vs_bridge.call_pipe_exact(
+                    vs_bridge.instance_target(record.ready_instance.target_identity()),
+                    "get_debug_status",
+                    {},
+                    timeout=min(10.0, total_timeout),
+                )
+            except vs_bridge.VSBridgeError:
+                # An unreachable instance has no debug session worth protecting here.
+                debug_state = None
+        result = await vs_launch.close_owned_instance(
+            process_id,
+            force=force,
+            timeout_seconds=total_timeout,
+            debug_state=debug_state,
+        )
+        return format_result(result)
+    except (backend.IDEBridgeError, vs_bridge.VSBridgeError) as error:
+        return handle_ide_error(error, "close_vs_instance")

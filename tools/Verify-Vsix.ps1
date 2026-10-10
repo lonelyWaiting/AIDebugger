@@ -55,7 +55,8 @@ function Test-IsAllowedVsPayloadPath([string]$relativeName) {
     $rootFiles = @(
         "bootstrap.py", "debug_method_manifest.json", "output_models.py", "requirements.txt",
         "tool_context.py", "tool_runtime.py", "vs_bridge.py", "vs_errors.py", "vs_session.py",
-        "vs_mcp_app.py", "vs_tool_registry.py", "vs_trust.py", "vs_launcher.py", "vs_server.py"
+        "vs_mcp_app.py", "vs_tool_registry.py", "vs_trust.py", "vs_launch.py", "vs_launcher.py",
+        "vs_server.py"
     )
     if ($rootFiles -contains $normalized) { return $true }
     $toolModules = @(
@@ -146,6 +147,7 @@ foreach ($package in $packages) {
             "mcp_server/vs_bridge.py",
             "mcp_server/vs_errors.py",
             "mcp_server/vs_trust.py",
+            "mcp_server/vs_launch.py",
             "mcp_server/debug_method_manifest.json",
             "mcp_server/vendor/wheels/manifest.json"
         )) {

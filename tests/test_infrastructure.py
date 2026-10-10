@@ -306,7 +306,8 @@ class InfrastructureBehaviorTests(unittest.TestCase):
         root_files = (
             "bootstrap.py", "debug_method_manifest.json", "output_models.py", "requirements.txt",
             "tool_context.py", "tool_runtime.py", "vs_bridge.py", "vs_errors.py", "vs_session.py",
-            "vs_mcp_app.py", "vs_tool_registry.py", "vs_trust.py", "vs_launcher.py", "vs_server.py",
+            "vs_mcp_app.py", "vs_tool_registry.py", "vs_trust.py", "vs_launch.py", "vs_launcher.py",
+            "vs_server.py",
         )
         tool_files = (
             "__init__.py", "capability_tools.py", "vs_instance_tools.py", "snapshot_tools.py",

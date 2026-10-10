@@ -257,6 +257,7 @@ namespace VSDebuggerMCP
                 case "vs_mcp_app.py":
                 case "vs_tool_registry.py":
                 case "vs_trust.py":
+                case "vs_launch.py":
                     return true;
                 default:
                     return false;

@@ -72,7 +72,10 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 ### Key Files
 
 **VS Extension:**
-- `VSDebuggerMCPPackage.cs` - Package entry point, auto-loads on VS startup
+- `VSDebuggerMCPPackage.cs` - Package entry point; explicit Tools-menu activation, plus a
+  launcher branch of `AIDebugger.StartFullAccessServer` that the MCP launcher dispatches
+  through DTE with a one-shot `AIDB_LAUNCH_*` launch id (no dialogs). The debugger service
+  and its debugger-event hooks are created lazily, only when a server actually starts.
 - `DebuggerService.cs` - All debugger operations (callstack, locals, memory, disassembly)
 - `NamedPipeServer.cs` - JSON-RPC over Named Pipe (`\\.\pipe\AIDebuggerVS_<PID>`)
 - `McpClientRegistration.cs` - Auto-registers MCP server with Cursor/Claude Desktop/OpenCode
@@ -86,6 +89,9 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 - `tool_modules/` - Domain tool modules registered through `register_vs()`
 - `vs_session.py` - `VSSessionManager` target selection and dispatch
 - `vs_bridge.py` - Named Pipe client with overlapped I/O and timeout handling
+- `vs_launch.py` - Locates trusted `devenv.exe` installs (vswhere, Build Tools excluded),
+  launches Visual Studio with the one-shot `AIDB_LAUNCH_*` request, waits for its
+  authenticated registration, and closes only MCP-launched instances
 - `bootstrap.py` - Extracts bundled wheels to `~/.ai-debugger/pydeps` on first run
 
 ### Communication Protocol

@@ -54,6 +54,7 @@ namespace VSDebuggerMCP
 
 ### 主动检测调试现场（推荐）
 - 在调用任何调试工具前，先调用 detect_debug_sessions() 检测是否有 Visual Studio 调试现场
+- 若一个 Visual Studio 实例都没有（任何工具报 No Visual Studio instance is available），直接调用 ensure_vs_instance()：它会自己启动一个受信任的 Visual Studio、等到认证管道可用，并可在同一次调用里 attach 到目标进程；用完可用 close_vs_instance(process_id=...) 关闭由 MCP 启动的实例（用户自己开的实例会被拒绝）
 - 若自动选择失败，使用 list_vs_instances + select_vs_instance 手动选择
 - 若需同时查询多个已认证 VS，使用 dispatch_vs_instances(method=""capture_debug_bundle_safe"", process_ids=[...])；它不会改变当前选择。需要对多个已确认目标执行同一条命令时，改用 dispatch_vs_commands
 
@@ -86,7 +87,7 @@ namespace VSDebuggerMCP
 4. 如需更多信息，按需开启 include_locals/include_output 或使用 evaluate_expressions_batch；需要完整线程帧时提升 thread_* 预算；仅单条场景再用 evaluate_expression
 
 ### 断点调试流程：
-1. detect_debug_sessions() 或 list_vs_instances/select_vs_instance 确认 VS 实例
+1. detect_debug_sessions() 或 list_vs_instances/select_vs_instance 确认 VS 实例；一个都没有时用 ensure_vs_instance(process_name=...) 启动并 attach
 2. 若没有调试会话，attach_process 或 start_debugging
 3. set_breakpoint / set_function_breakpoint / set_data_breakpoint 设置断点或 watchpoint
 4. continue_and_wait_for_break 或 debug_continue 放行复现
@@ -96,6 +97,7 @@ namespace VSDebuggerMCP
 ## 重要注意事项
 
 - 支持多个 Visual Studio 实例，会自动选择处于断点暂停状态的实例
+- 没有 Visual Studio 运行时，ensure_vs_instance 会自己启动一个受信任的安装（排除 Build Tools）并以全量调试能力启动 MCP 服务器；日常手动打开的 VS 行为不变，仍需 Tools 菜单启动
 - 如果有多个实例且无法自动选择，使用 list_vs_instances 查看，然后 select_vs_instance 选择
 - 同时采集多个 VS 时使用 dispatch_vs_instances（只读查询）或 dispatch_vs_commands（命令）；显式 PID 列表采用精确目标路由，不会覆盖单实例选择
 - 调试控制工具（如 debug_step_over）会改变程序状态，需谨慎使用

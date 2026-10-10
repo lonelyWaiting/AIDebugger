@@ -2,6 +2,7 @@ using System;
 using System.ComponentModel.Design;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -37,6 +38,10 @@ namespace VSDebuggerMCP
         private const int StartAutomationTestServerCommandId = 0x0105;
         private const string AutomationTestNonceVariable = "AIDB_LIVE_SMOKE_NONCE";
         private const string AutomationTestRootSuffixVariable = "AIDB_LIVE_SMOKE_ROOT_SUFFIX";
+        private const string LauncherIdVariable = "AIDB_LAUNCH_ID";
+        private const string LauncherCapabilitiesVariable = "AIDB_LAUNCH_CAPABILITIES";
+        private const string LauncherExpiresVariable = "AIDB_LAUNCH_EXPIRES_UNIX_MS";
+        private const long LauncherRequestMaximumLifetimeMs = 10 * 60 * 1000;
 
         private DTE2 _dte;
         private DebuggerService _debuggerService;
@@ -67,10 +72,10 @@ namespace VSDebuggerMCP
                 await CreateOutputPaneAsync();
                 await RegisterCommandsAsync();
 
-                // Initialize debugger service
-                _debuggerService = new DebuggerService(_dte, LogMessage);
-
-                LogMessage("AIDebugger package loaded. The MCP server remains disabled until explicitly started.");
+                // The debugger service, including the debugger-event hooks it installs, is
+                // created lazily when an MCP server actually starts, so loading this package
+                // in an ordinary Visual Studio session stays cheap.
+                LogMessage("AIDebugger package loaded. The MCP server starts only on an explicit request.");
             }
             catch (Exception ex)
             {
@@ -90,8 +95,8 @@ namespace VSDebuggerMCP
             commandService.AddCommand(new MenuCommand(
                 (_, __) => StartServer(configureCapabilities: false),
                 new CommandID(CommandSetGuid, StartServerCommandId)));
-            commandService.AddCommand(new MenuCommand(
-                (_, __) => StartServer(configureCapabilities: true),
+            commandService.AddCommand(new OleMenuCommand(
+                StartFullAccessServerOrLauncher,
                 new CommandID(CommandSetGuid, StartFullAccessServerCommandId)));
             commandService.AddCommand(new MenuCommand(
                 (_, __) => RequestClientSetup(),
@@ -255,10 +260,112 @@ namespace VSDebuggerMCP
             }
         }
 
+        /// <summary>
+        /// <summary>
+        /// Handles the full-access command. A user click keeps the interactive capability
+        /// prompts; the AIDebugger launcher instead passes the one-time launch id this
+        /// instance was started with and gets a non-interactive start.
+        /// The long-standing command name is reused on purpose: a command added to the
+        /// .vsct is not resolvable until Visual Studio refreshes its command table, which
+        /// is keyed per extension version and therefore never happens for a rebuilt VSIX
+        /// that keeps its git-derived version.
+        /// </summary>
+        private void StartFullAccessServerOrLauncher(object sender, EventArgs eventArgs)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            string launchId = Environment.GetEnvironmentVariable(LauncherIdVariable);
+            string requestedCapabilities = Environment.GetEnvironmentVariable(LauncherCapabilitiesVariable);
+            string expiresAt = Environment.GetEnvironmentVariable(LauncherExpiresVariable);
+            // The launcher proves intent with the one-time launch id it put in this
+            // process's environment. A command argument is not used: Visual Studio
+            // rejects arguments for commands that do not carry the AllowParams flag.
+            bool launcherRequested = !string.IsNullOrEmpty(launchId) ||
+                !string.IsNullOrEmpty(requestedCapabilities) ||
+                !string.IsNullOrEmpty(expiresAt);
+            if (!launcherRequested)
+            {
+                // An ordinary menu click: unchanged behaviour.
+                StartServer(configureCapabilities: true);
+                return;
+            }
+            // Consume immediately: the variables must not survive into any process this
+            // Visual Studio starts later, such as a debuggee.
+            Environment.SetEnvironmentVariable(LauncherIdVariable, null);
+            Environment.SetEnvironmentVariable(LauncherCapabilitiesVariable, null);
+            Environment.SetEnvironmentVariable(LauncherExpiresVariable, null);
+
+            long nowUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (!long.TryParse(expiresAt, NumberStyles.Integer, CultureInfo.InvariantCulture, out long expiresUnixMs) ||
+                expiresUnixMs <= nowUnixMs ||
+                expiresUnixMs > nowUnixMs + LauncherRequestMaximumLifetimeMs)
+            {
+                LogError("Rejected the launcher start request because it is expired or outlives its permitted window.");
+                return;
+            }
+            IReadOnlyCollection<string> capabilities;
+            if (!TryParseLauncherCapabilities(requestedCapabilities, out capabilities))
+            {
+                LogError("Rejected the launcher start request because its capability set is missing, unknown, or malformed.");
+                return;
+            }
+            if (_pipeServer != null || (_serverStopTask != null && !_serverStopTask.IsCompleted))
+            {
+                LogMessage("Ignored the launcher start request because an MCP server is already running for this Visual Studio instance.");
+                return;
+            }
+            if (!EnsureNonElevatedSecurityBoundary("start the MCP server", showDialog: false)) return;
+            try
+            {
+                StartServerWithCapabilities(capabilities);
+                LogMessage("Launcher-requested MCP server started.");
+            }
+            catch (Exception ex)
+            {
+                LogError($"Failed to start the launcher-requested MCP server: {ex.GetType().Name}");
+            }
+        }
+
+        private static bool TryParseLauncherCapabilities(
+            string requested,
+            out IReadOnlyCollection<string> capabilities)
+        {
+            capabilities = Array.Empty<string>();
+            if (string.IsNullOrWhiteSpace(requested)) return false;
+
+            var known = new HashSet<string>(DebugMethodCatalog.AllCapabilities, StringComparer.Ordinal);
+            var selected = new HashSet<string>(StringComparer.Ordinal) { "server.control", "debug.read" };
+            bool anyRequested = false;
+            foreach (string entry in requested.Split(','))
+            {
+                string name = entry.Trim();
+                if (name.Length == 0) continue;
+                // An unknown name is rejected outright rather than silently dropped: a
+                // launcher and an extension with mismatched capability vocabularies must
+                // fail loudly instead of granting a narrower server than was requested.
+                if (name.Length > 64 || !known.Contains(name)) return false;
+                anyRequested = true;
+                selected.Add(name);
+            }
+            if (!anyRequested) return false;
+
+            capabilities = new List<string>(selected);
+            return true;
+        }
+
+        private DebuggerService EnsureDebuggerService()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (_debuggerService == null)
+            {
+                _debuggerService = new DebuggerService(_dte, LogMessage);
+            }
+            return _debuggerService;
+        }
+
         private void StartServerWithCapabilities(IReadOnlyCollection<string> capabilities)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            var server = new NamedPipeServer(_debuggerService, LogMessage, capabilities);
+            var server = new NamedPipeServer(EnsureDebuggerService(), LogMessage, capabilities);
             server.Start();
             _pipeServer = server;
             var effective = new HashSet<string>(server.AllowedCapabilities, StringComparer.Ordinal);
@@ -311,7 +418,7 @@ namespace VSDebuggerMCP
             return confirmation == (int)VSConstants.MessageBoxResult.IDYES ? selected : null;
         }
 
-        private bool EnsureNonElevatedSecurityBoundary(string operation)
+        private bool EnsureNonElevatedSecurityBoundary(string operation, bool showDialog = true)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             if (!ProcessIntegrityValidator.IsCurrentProcessElevated()) return true;
@@ -320,6 +427,12 @@ namespace VSDebuggerMCP
                 "Its MCP Python runtime and client configuration are per-user files; crossing the elevation boundary would be unsafe. " +
                 "Restart Visual Studio without elevation.";
             LogError(message);
+            if (!showDialog)
+            {
+                // A launcher-driven start has no user in front of the shell yet, and the
+                // launcher reports the failure back through the missing registration file.
+                return false;
+            }
             VsShellUtilities.ShowMessageBox(
                 this,
                 message,

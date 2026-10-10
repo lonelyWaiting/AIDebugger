@@ -80,6 +80,10 @@ question depends on the new stop location.
 
 ## 多实例场景
 
+如果一个 Visual Studio 实例都没有（任何工具报 “No Visual Studio instance is available”）：
+1. 直接调用 ensure_vs_instance()，让 MCP 自己启动一个 VS（可同时 attach）
+2. 用完可以用 close_vs_instance(process_id=...) 关闭由 MCP 启动的实例（用户自己开的实例会被拒绝）
+
 如果有多个 Visual Studio 实例运行：
 1. 调用 list_vs_instances() 查看所有实例
 2. 调用 select_vs_instance(process_id=12345) 选择特定实例
@@ -92,6 +96,8 @@ def _categories_with_registry_coverage(registry: Dict[str, Any]) -> Dict[str, Li
             "detect_debug_sessions",
             "list_vs_instances",
             "select_vs_instance",
+            "ensure_vs_instance",
+            "close_vs_instance",
             "dispatch_vs_instances",
             "dispatch_vs_commands",
             "attach_process",
@@ -210,6 +216,7 @@ def _recommended_workflow_for_access(effective_instance: Optional[Dict[str, Any]
     if not effective_instance:
         return [
             "No unique effective IDE instance is selected; do not assume any debugger capability.",
+            "If no Visual Studio instance is available at all, call ensure_vs_instance() to launch one.",
             "Use detect_debug_sessions or list_vs_instances, inspect allowedCapabilities/accessMode, then select the intended instance.",
         ]
 

@@ -42,7 +42,9 @@ Location: `VSDebuggerMCP/`
 
 Important files:
 
-- `VSDebuggerMCPPackage.cs` - explicit Tools-menu activation and setup commands.
+- `VSDebuggerMCPPackage.cs` - explicit Tools-menu activation, setup commands, and the
+  launcher branch of `AIDebugger.StartFullAccessServer` that the MCP launcher dispatches
+  with a one-time launch id.
 - `DebuggerService.cs` - shared debugger facade, state, and UI-thread helpers.
 - `Services/DebuggerService.*.cs` - inspection, evaluation/memory, disassembly,
   native, context, execution, breakpoint, navigation, and secondary-inspection
@@ -86,6 +88,9 @@ Important files:
 - `tool_context.py` - shared formatting, error handling, timeout, and request helpers.
 - `vs_session.py` - `VSSessionManager` target selection, pinning, and dispatch.
 - `vs_bridge.py` - named pipe client.
+- `vs_launch.py` - discovers trusted `devenv.exe` installations, launches one with the
+  launcher environment request, waits for its authenticated registration, and closes
+  only instances this MCP server started.
 - `bootstrap.py` - extracts bundled wheels to a content-addressed
   `~/.ai-debugger/pydeps/...` directory and validates the exact plain-file tree
   before adding it to `sys.path`; the wheel directory must exactly match its
@@ -111,6 +116,7 @@ embedded into the VSIX assembly and shipped with the Python runtime.
 - `debug_capabilities`
 - `detect_debug_sessions`
 - `list_vs_instances`, `select_vs_instance`, `clear_vs_selection`
+- `ensure_vs_instance`, `close_vs_instance`
 - Multi-target dispatch: `dispatch_vs_instances(method, process_ids, ...)` runs a
   read-only AIDB/2 query against independently authenticated immutable VS targets
   concurrently, and `dispatch_vs_commands(method, process_ids, ...)` is the
@@ -119,6 +125,20 @@ embedded into the VSIX assembly and shipped with the Python runtime.
   target unchanged. The two tools are split by method kind so their published
   annotations are accurate: the query tool is annotated read-only, the command
   tool destructive.
+
+When no Visual Studio instance is available at all, `ensure_vs_instance` launches one
+instead of asking the user to open Visual Studio by hand. It picks the newest trusted IDE
+installation (`vswhere`, excluding Build Tools) and starts `devenv.exe` with
+`/Command Tools.AIDebugger.StartFullAccessServer`. Using `/Command` keeps the IDE off the
+Start Page, and the command itself runs the same code a Tools-menu click runs — minus the
+capability dialogs, because the launcher's one-time launch id is present in the process
+environment. If no registration appears, the launcher falls back to dispatching that same
+command through the IDE's DTE automation. It then waits for the authenticated registration
+and pipe, pins the instance, and optionally attaches to `process_id`/`process_name` in the
+same call. Launched instances receive the full debug capability set by default
+(`capabilities` can narrow it). Instances the user started are untouched: the extension
+still starts its server only from the Tools menu. `close_vs_instance` refuses instances it
+did not launch.
 
 ### Snapshot and Inspection
 
@@ -336,7 +356,9 @@ It never downloads packages with `pip`.
 
 ## Usage
 
-1. Start Visual Studio with the AIDebugger extension installed.
+1. Start Visual Studio with the AIDebugger extension installed, or let the MCP client do
+   it: `ensure_vs_instance(process_name="app.exe")` launches a trusted installation and
+   attaches in one call when no instance is running.
 2. Invoke **Tools > Start AIDebugger MCP Server** (and run the setup command once).
 3. Start or attach to a debug session.
 4. Ask the MCP client to call `detect_debug_sessions`.
@@ -401,8 +423,10 @@ consuming the repository cache quota.
 
 ### Cannot connect to IDE
 
-1. Confirm Visual Studio is running.
-2. Confirm the AIDebugger extension is installed.
+1. Call `ensure_vs_instance`: with no Visual Studio running it launches a trusted
+   installation, starts the MCP server in it, and returns once the pipe is usable.
+2. If one is already running, confirm the AIDebugger extension is installed and that
+   **Tools > Start AIDebugger MCP Server** has been invoked for that instance.
 3. Check the AIDebugger output/logs in Visual Studio.
 4. Use `list_vs_instances` or `detect_debug_sessions` to discover the target.
 5. Restart Visual Studio if the named pipe is stale.
@@ -414,8 +438,27 @@ a breakpoint, break manually, or use `continue_and_wait_for_break`.
 
 ### Preferred IDE not found
 
-The MCP entry is strict: `AIDebuggerVS` only routes to Visual Studio. Start
-Visual Studio, and confirm the client sets `AIDB_PREFERRED_IDE=vs`.
+The MCP entry is strict: `AIDebuggerVS` only routes to Visual Studio. Call
+`ensure_vs_instance` to launch one, or start Visual Studio yourself, and confirm the
+client sets `AIDB_PREFERRED_IDE=vs`.
+
+### ensure_vs_instance times out waiting for the launched instance
+
+The launch is honoured only by an extension build that carries the launcher command, which
+is passed as `devenv /Command` and falls back to DTE automation. When the instance starts
+but never publishes a registration:
+
+1. Read `diagnostics` in the result: it names the failure directly (an unresolved command
+   name, DTE automation being unavailable, or a rejected launch id). Note that Visual
+   Studio registers the canonical name with the top-level menu prefixed — a bare
+   `AIDebugger.<Command>` is rejected as "not valid".
+2. Rebuild and reinstall the extension for the installation that was launched
+   (`VSDebuggerMCP/Install-VSIX.cmd`); a stale VSIX has no launcher command and the
+   instance will sit there with no server.
+3. Confirm the launched installation is the intended one; pass `install_path` or
+   `instance_id` to force a specific IDE, since Build Tools installations are excluded.
+4. `launch_failed` means the process exited (a solution already open in another instance is
+   handed over and exits), while `ready_timeout` means it stayed up without registering.
 
 ### Check named pipes
 

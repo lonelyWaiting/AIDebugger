@@ -32,6 +32,7 @@ VS_TOOL_DOMAINS: Dict[str, List[str]] = {
     "capability": ["debug_capabilities"],
     "instance": [
         "list_vs_instances", "detect_debug_sessions", "select_vs_instance", "clear_vs_selection",
+        "ensure_vs_instance", "close_vs_instance",
         "dispatch_vs_instances", "dispatch_vs_commands",
     ],
     "snapshot": [
@@ -89,6 +90,10 @@ _COMPOSITE_METHODS = {
     "debug_capabilities": ["ping", "get_instance_info"],
     "list_vs_instances": ["ping", "get_instance_info"],
     "detect_debug_sessions": ["ping", "get_instance_info", "get_debug_status"],
+    # Launches a Visual Studio instance locally and can then attach, so the catalog
+    # keeps the conservative command annotation (attach_process is a session write)
+    # even though the launch itself never reaches the pipe catalog.
+    "ensure_vs_instance": ["ping", "get_instance_info", "attach_process"],
     "select_vs_instance": ["ping", "get_instance_info"],
     "crash_triage": ["capture_debug_bundle", "get_disassembly", "resolve_address", "read_memory"],
     "debug_control": ["continue", "step_over", "step_into", "step_out", "break", "stop", "detach"],
@@ -247,13 +252,22 @@ def tool_annotation_values(tool: str) -> Dict[str, bool]:
     )
     has_command = any(entry.get("kind") == "command" for entry in entries)
     local_selection_write = tool in {"select_vs_instance", "clear_vs_selection"}
-    read_only = not has_command and not may_evaluate and not local_selection_write
+    # Closing an MCP-launched Visual Studio process is a local, destructive write that
+    # reaches no backend method at all, so it needs its own annotation instead of the
+    # read-only default that a method-less tool would otherwise get.
+    local_process_lifecycle = tool == "close_vs_instance"
+    read_only = (
+        not has_command
+        and not may_evaluate
+        and not local_selection_write
+        and not local_process_lifecycle
+    )
     idempotent = read_only or tool in {
         "select_vs_instance", "clear_vs_selection", "cancel_debug_request",
     }
     return {
         "readOnlyHint": read_only,
-        "destructiveHint": has_command or may_evaluate,
+        "destructiveHint": has_command or may_evaluate or local_process_lifecycle,
         "idempotentHint": idempotent,
         "openWorldHint": bool(methods),
     }

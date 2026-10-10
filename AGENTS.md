@@ -81,7 +81,7 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 ### Key Files
 
 **VS Extension:**
-- `VSDebuggerMCPPackage.cs` - Explicit Tools-menu activation/setup entry point
+- `VSDebuggerMCPPackage.cs` - Explicit Tools-menu activation/setup entry points plus the launcher branch of the existing `AIDebugger.StartFullAccessServer` command
 - `DebuggerService.cs` - Shared debugger facade, state, and UI-thread helpers
 - `Services/DebuggerService.*.cs` - Domain partials for inspection, execution, breakpoints, context, memory, disassembly, native, and navigation operations
 - `Services/BuildErrorService.cs` / `Services/OutputWindowService.cs` - Bounded build/output collection services
@@ -100,6 +100,9 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 - `tool_modules/` - Domain tool modules registered through `register_vs()`
 - `vs_session.py` - `VSSessionManager` target selection and dispatch
 - `vs_bridge.py` - Named Pipe client with overlapped I/O and timeout handling
+- `vs_launch.py` - Locates trusted devenv.exe installs, launches Visual Studio with the
+  AIDB_LAUNCH_* request contract, waits for its registration, and closes only
+  MCP-launched instances
 - `bootstrap.py` - Extracts bundled wheels to `~/.ai-debugger/pydeps` on first run
 
 ### Communication Protocol
@@ -122,6 +125,18 @@ Visual Studio uses authenticated AIDB/2 length-prefixed messages. Requests inclu
 
 - Each Visual Studio instance creates a unique pipe: `AIDebuggerVS_<PID>`
 - `AIDB_PREFERRED_IDE` env var is set to `vs` for the Visual Studio server
+- A user-started Visual Studio starts its server only from the Tools menu. An instance
+  launched by `ensure_vs_instance` carries a one-shot `AIDB_LAUNCH_ID` /
+  `AIDB_LAUNCH_CAPABILITIES` / `AIDB_LAUNCH_EXPIRES_UNIX_MS` environment request and is
+  started with `/Command Tools.AIDebugger.StartFullAccessServer`; that command sees the
+  launch id and starts the server without dialogs instead of prompting. `/Command` is also
+  what keeps the IDE off the Start Page. When no registration appears, the launcher falls
+  back to dispatching the same command through DTE automation. Two traps worth knowing:
+  Visual Studio registers canonical names with the top-level menu prefixed (a bare
+  `AIDebugger.<Command>` is rejected as "not valid"), and it rejects arguments for commands
+  without the `AllowParams` flag, which is why the launch id travels in the environment.
+  Do not switch this to `[ProvideAutoLoad]`/background autoload either: starting the server
+  from a background package load left `attach_process` and `start_debugging` hanging.
 - Auto-selection priority: paused at breakpoint > debugging > single instance
 - VS pipe/instance registration default to current-user owner-only ACLs
 - `AIDB_ALLOWED_CAPABILITIES` optionally restricts the VS server capability set
@@ -171,6 +186,22 @@ All responses include capability declarations:
 `get_debug_status` and `capture_debug_bundle` return:
 - `stopReason`: `not_paused`, `breakpoint`, `exception`, `step`, `user_break`, `pause_unknown`
 - `stopReasonRaw`: IDE-specific raw value
+
+### Process Lookup Performance
+
+`attach_process`/`start_debugging` resolve their target through
+`DebuggerService.Execution.cs`. Two rules keep that path usable on busy machines
+(637+ processes were measured):
+
+- Resolve `Debugger.LocalProcesses` **once per snapshot** and pass the collection down.
+  Re-reading `debugger.LocalProcesses` per process costs ~200 ms through the automation
+  layer, which made one snapshot take minutes and every attach look like a hang.
+- A PID is resolved with a single by-name automation lookup
+  (`LocalProcesses.Item(name)`), verified against the process id and creation time, and
+  only falls back to the full walk when that misses. Snapshots are cached for
+  `LocalProcessSnapshotCacheMs` and invalidated when the process count changes.
+  Correctness comes from verifying the chosen process through its OS handle, not from
+  re-walking the whole list.
 
 ### Python Dependencies
 

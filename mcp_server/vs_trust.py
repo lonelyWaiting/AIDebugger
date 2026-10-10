@@ -98,13 +98,13 @@ def _registration_value(payload: Dict[str, Any], name: str) -> Any:
     return payload.get(name, payload.get(pascal_name))
 
 
-def _validate_registration_security(path: pathlib.Path) -> None:
+def _validate_registration_security(path: pathlib.Path, subdirectory: str = "instances") -> None:
     local_app_data = os.environ.get("LOCALAPPDATA")
     if not local_app_data:
         raise VSBridgeError("LOCALAPPDATA is unavailable", code="INSTANCE_REGISTRATION_NOT_FOUND")
     local_root = pathlib.Path(local_app_data)
     aidb_root = local_root / "AIDebugger"
-    instances_root = aidb_root / "instances"
+    instances_root = aidb_root / subdirectory
     expected_path = instances_root / path.name
     if os.path.normcase(os.path.abspath(path)) != os.path.normcase(os.path.abspath(expected_path)):
         raise VSBridgeError("Instance registration is outside the trusted directory", code="INVALID_TARGET")
@@ -170,6 +170,58 @@ def _validate_registration_security(path: pathlib.Path) -> None:
             or win32security.ConvertSidToStringSid(sid) != current_user_text
         ):
             raise VSBridgeError("Instance registration DACL is not owner-only", code="INVALID_TARGET")
+
+
+def apply_owner_only_security(path: pathlib.Path) -> pathlib.Path:
+    """Give a file or directory the protected, single-ACE owner-only DACL the validator requires.
+
+    The extension creates its instance-registration directory *and* the files in it with
+    that contract; anything the MCP server stores beside that data (launch records) has to
+    match it, or the validator rejects the very files the server wrote itself.
+    """
+    try:
+        import ntsecuritycon
+        import win32api
+        import win32security
+    except ImportError as exc:
+        raise VSBridgeError(
+            "pywin32 is required to secure the AIDebugger state path",
+            code="INVALID_TARGET",
+        ) from exc
+
+    candidate = pathlib.Path(os.path.abspath(path))
+    if _path_has_reparse_component(candidate):
+        raise VSBridgeError("AIDebugger state path is a reparse point", code="INVALID_TARGET")
+
+    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32security.TOKEN_QUERY)
+    user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+    descriptor = win32security.SECURITY_DESCRIPTOR()
+    descriptor.SetSecurityDescriptorOwner(user, False)
+    dacl = win32security.ACL()
+    dacl.AddAccessAllowedAce(win32security.ACL_REVISION, ntsecuritycon.FILE_ALL_ACCESS, user)
+    descriptor.SetSecurityDescriptorDacl(True, dacl, False)
+    # PROTECTED_DACL_SECURITY_INFORMATION alone does not make GetFileSecurity report
+    # SE_DACL_PROTECTED here, and the validator requires the flag.
+    descriptor.SetSecurityDescriptorControl(
+        win32security.SE_DACL_PROTECTED, win32security.SE_DACL_PROTECTED
+    )
+    win32security.SetFileSecurity(
+        str(candidate),
+        win32security.OWNER_SECURITY_INFORMATION
+        | win32security.DACL_SECURITY_INFORMATION
+        | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+        descriptor,
+    )
+    return candidate
+
+
+def ensure_owner_only_directory(path: pathlib.Path) -> pathlib.Path:
+    """Create a directory and give it the protected owner-only contract."""
+    candidate = pathlib.Path(os.path.abspath(path))
+    candidate.mkdir(parents=True, exist_ok=True)
+    if _path_has_reparse_component(candidate):
+        raise VSBridgeError("AIDebugger state directory is a reparse point", code="INVALID_TARGET")
+    return apply_owner_only_security(candidate)
 
 
 def _load_instance_registration(pipe_name: str) -> Dict[str, Any]:

@@ -2166,10 +2166,13 @@ class VSBridge:
 
             if not instances:
                 raise VSBridgeError(
-                    "No Visual Studio instances found. Please ensure:\n"
-                    "1. Visual Studio is running\n"
-                    "2. AIDebuggerVS extension is installed and enabled\n"
-                    "3. The extension has loaded (may need to restart VS)"
+                    "No Visual Studio instance is available. Call ensure_vs_instance() to let the "
+                    "MCP server launch one (and optionally attach to a process) in a single step. "
+                    "To use a Visual Studio you started yourself instead:\n"
+                    "1. Start Visual Studio\n"
+                    "2. Run Tools > Start AIDebugger MCP Server (or 'Choose Capabilities' for full access)\n"
+                    "3. Confirm the AIDebuggerVS extension is installed and enabled",
+                    code="NO_VS_INSTANCE",
                 )
 
             selected_instance = self._find_best_instance(instances)

@@ -27,6 +27,7 @@ _ROOT_FILES = {
     "vs_mcp_app.py",
     "vs_tool_registry.py",
     "vs_trust.py",
+    "vs_launch.py",
     "vs_launcher.py",
     "vs_server.py",
 }

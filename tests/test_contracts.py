@@ -1899,7 +1899,7 @@ print(json.dumps({
         vs_root_files = {
             "vs_server.py", "vs_launcher.py", "vs_bridge.py", "vs_errors.py", "vs_session.py", "vs_mcp_app.py",
             "output_models.py", "tool_context.py", "tool_runtime.py", "vs_tool_registry.py", "vs_trust.py", "bootstrap.py",
-            "debug_method_manifest.json", "requirements.txt",
+            "debug_method_manifest.json", "requirements.txt", "vs_launch.py",
         }
         vs_tool_modules = {
             "tool_modules/__init__.py", "tool_modules/capability_tools.py",
