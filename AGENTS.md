@@ -71,6 +71,23 @@ python -c "import asyncio; import vs_bridge; print(asyncio.run(vs_bridge.is_vs_a
 
 ## Architecture
 
+### Independent IDA backend
+
+- `ida_backend/` owns IDA process/session management and private authenticated
+  loopback transport; `mcp_server/ida_server.py` is its independent stdio entrypoint.
+- Do not import VS debugger/session state into IDA or IDAPython into VS. Explicit
+  IDA session IDs bind each binary/IDB. VS live debugging and IDA static analysis
+  can coexist; only one user-mode debugger may attach to a given PID.
+- Project installer: `Install-AIDebugger.cmd` / `tools/install_aidebugger.py` deploys
+  IDA MCP and `skills/ida-evidence-analysis/` to Claude/Codex, preserving VS config.
+  VSIX install/setup stays VS-only. See `docs/ida-backend.md` for workflow/tests.
+- Maintain the IDA Skill in this repository, then redeploy with the installer.
+  Do not modify only an installed Skill copy or vendor upstream without recording
+  original hashes/license and scoped local changes.
+- Validate IDA changes with `tests/test_ida_backend.py` and relevant opt-in real
+  `tests/ida_integration/` probes; transport, source tests, IDB persistence,
+  file export and dynamic debugger proof are separate evidence boundaries.
+
 ### Component Structure
 
 | Component | Location | Language | Purpose |

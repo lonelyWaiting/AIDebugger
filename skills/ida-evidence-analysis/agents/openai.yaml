@@ -1,0 +1,6 @@
+interface:
+  display_name: "IDA 证据分析"
+  short_description: "通过 IDA MCP 还原二进制实现，核验检测规则与受保护控制流"
+  default_prompt: "使用 $ida-evidence-analysis 分析当前目标，导出伪代码并以汇编验证规则，报告覆盖率与未恢复部分。"
+policy:
+  allow_implicit_invocation: true

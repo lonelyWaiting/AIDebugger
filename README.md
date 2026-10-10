@@ -1,12 +1,18 @@
 # AIDebugger MCP
 
-AIDebugger exposes Visual Studio debugger state through a
-Model Context Protocol (MCP) server. It is intended for MCP clients such as
+AIDebugger exposes Visual Studio debugging and an independent IDA analysis/patch
+backend through Model Context Protocol (MCP) servers. It is intended for clients such as
 Cursor, Codex, Claude Desktop, Claude Code, and OpenCode.
 
 It supports call stacks, locals, threads, modules, exceptions, build errors,
 debug output, expression evaluation, memory reads/search, disassembly, breakpoints,
 execution control, and Visual Studio-only no-source native/managed workflows.
+
+IDA supports automatically managed GUI/headless instances, multiple isolated
+DLL/IDB sessions, Hex-Rays analysis, IDB patching and binary export. VS and IDA
+can run together. See [IDA architecture, installation and validation](docs/ida-backend.md).
+Run `Install-AIDebugger.cmd` to deploy the IDA MCP and project-maintained analysis
+Skill to Claude/Codex; Visual Studio keeps its existing VSIX installer/setup.
 
 ## Architecture
 
