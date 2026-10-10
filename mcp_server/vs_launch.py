@@ -51,6 +51,8 @@ LAUNCH_EXPIRES_VARIABLE = "AIDB_LAUNCH_EXPIRES_UNIX_MS"
 LAUNCH_REQUEST_LIFETIME_SECONDS = 300.0
 
 DEFAULT_LAUNCH_TIMEOUT_SECONDS = 120.0
+FORCE_GRACE_SECONDS = 5.0
+FORCE_KILL_SECONDS = 5.0
 READY_POLL_INTERVAL_SECONDS = 0.5
 VERSION_QUERY_TIMEOUT_SECONDS = 10.0
 
@@ -179,7 +181,9 @@ def _persist_launch_record(record: LaunchRecord) -> None:
         # file, not just the directory, so an inherited DACL makes it unreadable to us.
         vs_trust.apply_owner_only_security(temporary)
         os.replace(temporary, path)
-    except (OSError, ValueError, VSBridgeError) as exc:
+    except Exception as exc:  # noqa: BLE001 - a record failure must never break a launch
+        # Deliberately broad: pywin32 raises pywintypes.error (not OSError) from the ACL
+        # calls, and a failed record must not abort a launch that already started devenv.
         logger.warning("Unable to persist the launch record for PID %s: %s", record.process_id, exc)
 
 
@@ -202,7 +206,8 @@ def _load_persisted_launches() -> None:
         try:
             vs_trust._validate_registration_security(entry, subdirectory="launches")
             payload = json.loads(entry.read_text(encoding="utf-8"))
-        except (VSBridgeError, OSError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001 - one bad record must not abort the load
+            # pywin32's ACL validation raises pywintypes.error, which is not an OSError.
             logger.warning("Ignoring an untrusted launch record %s: %s", entry.name, exc)
             continue
         process_id = payload.get("processId")
@@ -786,6 +791,33 @@ def _reachable(instances: Iterable[Any]) -> List[Any]:
     return [instance for instance in instances if instance.connection_status == "ok"]
 
 
+def _launch_matches_request(
+    candidate: LaunchRecord,
+    requested_capabilities: Sequence[str],
+    install_path: Optional[str],
+    instance_id: Optional[str],
+    solution_path: Optional[str],
+    root_suffix: Optional[str],
+) -> bool:
+    """Whether an in-flight launch already satisfies this caller's selection request."""
+    if root_suffix != candidate.root_suffix or solution_path != candidate.solution_path:
+        return False
+    # Joining a launch that asked for a different access set would hand back an instance
+    # that cannot serve the request, so the capability sets must match exactly.
+    if tuple(sorted(set(candidate.requested_capabilities))) != tuple(sorted(set(requested_capabilities))):
+        return False
+    if instance_id is not None and candidate.installation.instance_id != instance_id:
+        return False
+    if install_path is not None:
+        try:
+            requested_path = os.path.normcase(os.path.abspath(install_path))
+        except (OSError, ValueError):
+            return False
+        if os.path.normcase(os.path.abspath(candidate.installation.install_path)) != requested_path:
+            return False
+    return True
+
+
 def _start_or_join_launch(
     requested_capabilities: Sequence[str],
     install_path: Optional[str] = None,
@@ -804,6 +836,9 @@ def _start_or_join_launch(
             candidate.ready_instance is None
             and candidate.failure is None
             and _record_alive(candidate)
+            and _launch_matches_request(
+                candidate, requested_capabilities, install_path, instance_id, solution_path, root_suffix
+            )
         ):
             return candidate, [
                 f"Joined the Visual Studio launch already in progress (PID {candidate.process_id})."
@@ -1021,7 +1056,11 @@ async def close_owned_instance(
             logger.warning("taskkill for PID %s failed: %s", record.process_id, exc)
 
     _taskkill(())
-    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    # A forced close must not sit through the whole graceful timeout first: the caller asked
+    # for the process to go away, so give Visual Studio a short window to exit cleanly and
+    # escalate instead of blocking for tens of seconds.
+    graceful_seconds = min(timeout_seconds, FORCE_GRACE_SECONDS) if force else timeout_seconds
+    deadline = time.monotonic() + max(0.0, graceful_seconds)
     while time.monotonic() < deadline and _record_alive(record):
         await asyncio.sleep(0.25)
 
@@ -1030,7 +1069,8 @@ async def close_owned_instance(
     if not graceful and force:
         _taskkill(("/F",))
         forced = True
-        while time.monotonic() < deadline + 5.0 and _record_alive(record):
+        force_deadline = time.monotonic() + FORCE_KILL_SECONDS
+        while time.monotonic() < force_deadline and _record_alive(record):
             await asyncio.sleep(0.25)
         graceful = not _record_alive(record)
 

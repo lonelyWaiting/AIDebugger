@@ -6,6 +6,7 @@ import pathlib
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -396,7 +397,7 @@ class EnsureInstanceTests(unittest.TestCase):
         ) as request_start, patch.object(
             vs_launch, "wait_for_ready_instance", AsyncMock(return_value=(instance_payload(777), []))
         ):
-            outcome = asyncio.run(vs_launch.ensure_instance(("debug.read",)))
+            outcome = asyncio.run(vs_launch.ensure_instance(("debug.read", "server.control")))
         launch.assert_not_called()
         # Joining an in-flight launch must not re-dispatch the command; the process that
         # started it owns that.
@@ -436,6 +437,40 @@ class CloseInstanceTests(unittest.TestCase):
             result = asyncio.run(vs_launch.close_owned_instance(4242, force=True))
         self.assertFalse(result["success"])
         self.assertEqual(result["errorCode"], "STALE_TARGET")
+
+    def test_forced_close_escalates_without_waiting_the_whole_timeout(self):
+        # A forced close must escalate within the short grace window instead of blocking for
+        # the caller's full timeout while Visual Studio tears a session down.
+        import subprocess
+
+        vs_launch._LAUNCHES[4242] = record_for(pid=4242)
+        alive = {"value": True}
+        killed = []
+
+        def fake_run(args, **kwargs):
+            killed.append(tuple(args))
+            if "/F" in args:
+                alive["value"] = False
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        with patch.object(vs_launch, "_process_image_name", return_value="devenv.exe"), patch.object(
+            vs_launch, "_process_start_time_utc_ticks", return_value=123456789
+        ), patch.object(
+            vs_launch, "_record_alive", side_effect=lambda record: alive["value"]
+        ), patch.object(
+            vs_launch.subprocess, "run", side_effect=fake_run
+        ), patch.object(
+            vs_launch, "FORCE_GRACE_SECONDS", 0.05
+        ):
+            started = time.monotonic()
+            result = asyncio.run(
+                vs_launch.close_owned_instance(4242, force=True, timeout_seconds=30.0)
+            )
+            elapsed = time.monotonic() - started
+        self.assertTrue(result["success"], result)
+        self.assertTrue(result["forced"], result)
+        self.assertTrue(any("/F" in args for args in killed), killed)
+        self.assertLess(elapsed, 5.0, "a forced close must not wait out the full timeout")
 
     def test_already_closed_instance_is_reported_without_killing_anything(self):
         vs_launch._LAUNCHES[4242] = record_for(pid=4242, alive=False)
@@ -638,10 +673,6 @@ class ToolContractTests(unittest.TestCase):
         self.assertFalse(close_annotations["idempotentHint"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class PersistedLaunchRecordTests(unittest.TestCase):
     """The launch record the server writes must satisfy the same trust contract it validates."""
 
@@ -725,3 +756,16 @@ class PersistedLaunchRecordTests(unittest.TestCase):
             vs_launch._LAUNCHES_LOADED = False
         self.assertIsNone(owned, "a reused or exited PID must not look owned")
         self.assertEqual(still_there, [], "the stale record should be pruned")
+
+    def test_join_requires_a_matching_request(self):
+        record = record_for(pid=4242)
+        record.root_suffix = "ExpA"
+        record.requested_capabilities = ("debug.read", "server.control")
+        # Same request: reusable. Any difference in suffix, solution or access set is not.
+        self.assertTrue(vs_launch._launch_matches_request(record, ("server.control", "debug.read"), None, None, None, "ExpA"))
+        self.assertFalse(vs_launch._launch_matches_request(record, ("debug.read",), None, None, None, "ExpA"))
+        self.assertFalse(vs_launch._launch_matches_request(record, ("debug.read", "server.control"), None, None, None, "ExpB"))
+        self.assertFalse(vs_launch._launch_matches_request(record, ("debug.read", "server.control"), None, None, "C:/x.sln", "ExpA"))
+
+if __name__ == "__main__":
+    unittest.main()

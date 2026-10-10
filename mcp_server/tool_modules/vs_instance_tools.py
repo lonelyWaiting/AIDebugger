@@ -407,17 +407,57 @@ async def close_vs_instance(
         total_timeout = clamp_tool_timeout(timeout_seconds, 30.0)
         debug_state = None
         record = vs_launch.get_owned_launch(process_id)
-        if record is not None and record.ready_instance is not None:
-            try:
-                debug_state = await vs_bridge.call_pipe_exact(
-                    vs_bridge.instance_target(record.ready_instance.target_identity()),
-                    "get_debug_status",
-                    {},
-                    timeout=min(10.0, total_timeout),
+        if record is not None:
+            # A record restored from disk carries no live instance object, so resolve the
+            # current instance for this PID (matching the recorded start time) before the
+            # debug-session guard below; otherwise a restarted MCP server could kill a
+            # Visual Studio that is mid-debug without force=True.
+            instance = record.ready_instance
+            if instance is None:
+                try:
+                    candidates = await vs_bridge.discover_instances()
+                except vs_bridge.VSBridgeError:
+                    candidates = []
+                instance = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate.process_id == process_id
+                        and candidate.connection_status == "ok"
+                        and candidate.process_start_time_utc_ticks == record.start_time_utc_ticks
+                    ),
+                    None,
                 )
-            except vs_bridge.VSBridgeError:
-                # An unreachable instance has no debug session worth protecting here.
-                debug_state = None
+            if instance is not None:
+                instance_target = vs_bridge.instance_target(instance.target_identity())
+                try:
+                    debug_state = await vs_bridge.call_pipe_exact(
+                        instance_target,
+                        "get_debug_status",
+                        {},
+                        timeout=min(10.0, total_timeout),
+                    )
+                except vs_bridge.VSBridgeError:
+                    # An unreachable instance has no debug session worth protecting here.
+                    debug_state = None
+                if (
+                    force
+                    and isinstance(debug_state, dict)
+                    and debug_state.get("isDebugging")
+                ):
+                    # Stop the session explicitly before closing. Otherwise Visual Studio
+                    # tears the session down inside its own shutdown and the close blocks
+                    # for seconds on that teardown.
+                    try:
+                        await vs_bridge.call_pipe_exact(
+                            instance_target,
+                            "stop",
+                            {},
+                            timeout=min(15.0, max(5.0, total_timeout - 5.0)),
+                        )
+                    except vs_bridge.VSBridgeError:
+                        # The close below forces the process anyway.
+                        pass
         result = await vs_launch.close_owned_instance(
             process_id,
             force=force,

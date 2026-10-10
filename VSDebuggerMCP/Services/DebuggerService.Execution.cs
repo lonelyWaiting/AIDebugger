@@ -374,11 +374,12 @@ namespace VSDebuggerMCP
                     return ExecuteOnMainThread(() =>
                     {
                         ThreadHelper.ThrowIfNotOnUIThread();
-                        IntPtr finalIdentityHandle = OpenVerifiedLocalProcessAtIndex(
+                        // Reuse the lookup's resolved automation object when present (the
+                        // by-name fast path leaves Index at 0), otherwise fall back to the
+                        // captured index; both are re-verified through the OS handle.
+                        IntPtr finalIdentityHandle = OpenVerifiedLocalProcess(
                             Debugger,
-                            target.Index,
-                            target.ProcessId,
-                            target.ProcessStartTimeUtcTicks,
+                            target,
                             out EnvDTE.Process targetProcess);
                         if (finalIdentityHandle == IntPtr.Zero || targetProcess == null)
                         {
@@ -933,35 +934,6 @@ namespace VSDebuggerMCP
                     return IntPtr.Zero;
                 }
                 IntPtr handle = OpenVerifiedProcessHandle(lookup.ProcessId, lookup.ProcessStartTimeUtcTicks);
-                if (handle != IntPtr.Zero)
-                {
-                    verifiedProcess = process;
-                }
-                return handle;
-            }
-            catch
-            {
-                return IntPtr.Zero;
-            }
-        }
-
-        private IntPtr OpenVerifiedLocalProcessAtIndex(
-            Debugger5 debugger,
-            int index,
-            int expectedProcessId,
-            long expectedProcessStartTimeUtcTicks,
-            out EnvDTE.Process verifiedProcess)
-        {
-            ThreadHelper.ThrowIfNotOnUIThread();
-            verifiedProcess = null;
-            try
-            {
-                EnvDTE.Process process = debugger?.LocalProcesses?.Item(index);
-                if (process == null || process.ProcessID != expectedProcessId)
-                {
-                    return IntPtr.Zero;
-                }
-                IntPtr handle = OpenVerifiedProcessHandle(expectedProcessId, expectedProcessStartTimeUtcTicks);
                 if (handle != IntPtr.Zero)
                 {
                     verifiedProcess = process;

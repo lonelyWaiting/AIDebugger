@@ -261,7 +261,6 @@ namespace VSDebuggerMCP
         }
 
         /// <summary>
-        /// <summary>
         /// Handles the full-access command. A user click keeps the interactive capability
         /// prompts; the AIDebugger launcher instead passes the one-time launch id this
         /// instance was started with and gets a non-interactive start.
