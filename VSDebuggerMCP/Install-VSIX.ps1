@@ -126,6 +126,27 @@ function Remove-PlainOwnedTree {
     Remove-Item -LiteralPath $path -Recurse -Force
 }
 
+function Set-FileFromTemp {
+    # Windows PowerShell's .NET argument binder rejects a $null backup path for
+    # File.Replace ("The path is not of a legal form") even though the API allows
+    # it, so always pass a real backup file and delete it afterwards. Without this
+    # every upgrade - which is when the target file already exists - failed and
+    # rolled the whole transaction back.
+    param([string]$tempPath, [string]$targetPath)
+    if (-not (Test-Path -LiteralPath $targetPath)) {
+        [System.IO.File]::Move($tempPath, $targetPath)
+        return
+    }
+    $backupPath = $targetPath + ".replaced." + [Guid]::NewGuid().ToString("N") + ".bak"
+    Assert-SafeFinalEntry -path $backupPath
+    try {
+        [System.IO.File]::Replace($tempPath, $targetPath, $backupPath)
+    }
+    finally {
+        if (Test-Path -LiteralPath $backupPath) { Remove-Item -LiteralPath $backupPath -Force }
+    }
+}
+
 function Get-WindowsCanonicalRelativePath {
     param([string]$relativeName)
     if ([string]::IsNullOrWhiteSpace($relativeName) -or $relativeName.Contains("\")) {
@@ -343,7 +364,10 @@ function Get-InstalledVsixInfo {
         } | ForEach-Object { Join-Path $_.FullName "Extensions" })
     }
     $roots += (Join-Path ([string]$instance.installationPath) "Common7\IDE\Extensions")
-    $matches = @()
+    # Named $diskCopies, not $matches: PowerShell variable names are case-insensitive,
+    # so a local $matches would be the same variable as the automatic $Matches that the
+    # "-match" operator below overwrites with a regex result hashtable.
+    $diskCopies = @()
     foreach ($root in $roots) {
         if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
         foreach ($manifestPath in @(Get-ChildItem -LiteralPath $root -Filter "extension.vsixmanifest" -File -Recurse -ErrorAction SilentlyContinue)) {
@@ -353,7 +377,7 @@ function Get-InstalledVsixInfo {
                 $identity = $manifest.PackageManifest.Metadata.Identity
                 if ([string]::Equals([string]$identity.Id, $extensionId, [StringComparison]::OrdinalIgnoreCase)) {
                     $extensionRoot = [System.IO.Path]::GetFullPath($manifestPath.Directory.FullName)
-                    $matches += [PSCustomObject]@{
+                    $diskCopies += [PSCustomObject]@{
                         Version = [Version](Get-NormalizedBundleVersion -versionText ([string]$identity.Version))
                         ExtensionRoot = $extensionRoot
                         ManifestPath = [System.IO.Path]::GetFullPath($manifestPath.FullName)
@@ -383,7 +407,7 @@ function Get-InstalledVsixInfo {
     }
     if ($enabled.Count -eq 1) {
         $registered = $enabled[0]
-        $diskMatches = @($matches | Where-Object {
+        $diskMatches = @($diskCopies | Where-Object {
             $_.Version -eq $registered.Version -and
             [string]::Equals($_.ExtensionRoot, $registered.ExtensionRoot, [StringComparison]::OrdinalIgnoreCase)
         })
@@ -393,12 +417,12 @@ function Get-InstalledVsixInfo {
         $diskMatches[0] | Add-Member -NotePropertyName EnabledState -NotePropertyValue "enabled"
         return $diskMatches[0]
     }
-    if ($matches.Count -eq 0) { return $null }
-    if ($matches.Count -ne 1) {
+    if ($diskCopies.Count -eq 0) { return $null }
+    if ($diskCopies.Count -ne 1) {
         throw "Visual Studio has multiple unregistered/disabled copies of extension '$extensionId'; pre-install state is ambiguous"
     }
-    $matches[0] | Add-Member -NotePropertyName EnabledState -NotePropertyValue "disabled"
-    return $matches[0]
+    $diskCopies[0] | Add-Member -NotePropertyName EnabledState -NotePropertyValue "disabled"
+    return $diskCopies[0]
 }
 
 function Get-InstalledVsixVersion {
@@ -414,10 +438,15 @@ function Protect-InstallerStagingDirectory {
     $security = New-Object System.Security.AccessControl.DirectorySecurity
     $security.SetOwner($identity.User)
     $security.SetAccessRuleProtection($true, $false)
+    # Compute the inheritance flags before the call: a New-Object argument list is
+    # parsed in command mode, where "-bor" is not an operator and the operands
+    # collapse into an Object[] instead of a combined flag value.
+    $inheritanceFlags = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+        [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
     $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
         $identity.User,
         [System.Security.AccessControl.FileSystemRights]::FullControl,
-        [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit,
+        $inheritanceFlags,
         [System.Security.AccessControl.PropagationFlags]::None,
         [System.Security.AccessControl.AccessControlType]::Allow)
     $security.AddAccessRule($rule)
@@ -620,7 +649,8 @@ function Test-IsAllowedVsPayloadPath {
     $rootFiles = @(
         "bootstrap.py", "debug_method_manifest.json", "output_models.py", "requirements.txt",
         "tool_context.py", "tool_runtime.py", "vs_bridge.py", "vs_errors.py", "vs_session.py",
-        "vs_mcp_app.py", "vs_tool_registry.py", "vs_trust.py", "vs_launcher.py", "vs_server.py"
+        "vs_mcp_app.py", "vs_tool_registry.py", "vs_trust.py", "vs_launch.py", "vs_launcher.py",
+        "vs_server.py"
     )
     if ($rootFiles -contains $normalized) { return $true }
     $toolModules = @(
@@ -830,8 +860,7 @@ function Install-StableMcpLauncher {
             throw "Staged VS MCP launcher failed validation"
         }
         Assert-SafeFinalEntry -path $target
-        if (Test-Path -LiteralPath $target) { [System.IO.File]::Replace($temp, $target, $null) }
-        else { [System.IO.File]::Move($temp, $target) }
+        Set-FileFromTemp -tempPath $temp -targetPath $target
     }
     finally {
         if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force }
@@ -906,8 +935,7 @@ function Set-ActiveMcpBundle {
         [System.IO.File]::WriteAllText($temp, $bundleName, (New-Object System.Text.UTF8Encoding($false)))
         Assert-SafeFinalEntry -path $temp -RequireFile
         Assert-SafeFinalEntry -path $marker
-        if (Test-Path -LiteralPath $marker) { [System.IO.File]::Replace($temp, $marker, $null) }
-        else { [System.IO.File]::Move($temp, $marker) }
+        Set-FileFromTemp -tempPath $temp -targetPath $marker
     }
     finally {
         if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force }
@@ -950,10 +978,8 @@ function Activate-McpServerDeployment {
     $bundleRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $userMcpRoot)).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
     $activeMarker = Join-Path $bundleRoot ".active-bundle"
     $stableLauncher = Join-Path $bundleRoot "vs_server.py"
-    Assert-SafeFinalEntry -path $activeMarker
-    Assert-SafeFinalEntry -path $stableLauncher
-    $previousMarker = if (Test-Path -LiteralPath $activeMarker) { [System.IO.File]::ReadAllBytes($activeMarker) } else { $null }
-    $previousLauncher = if (Test-Path -LiteralPath $stableLauncher) { [System.IO.File]::ReadAllBytes($stableLauncher) } else { $null }
+    $previousMarker = $null
+    $previousLauncher = $null
     $activated = $false
     try {
         Assert-PlainOwnedTree -path $stagingRoot
@@ -965,6 +991,14 @@ function Activate-McpServerDeployment {
         }
         Assert-PlainDirectoryTree -path $aidbRoot
         Ensure-PlainDirectoryTree -path $bundleRoot | Out-Null
+        # Snapshot the previous stable state only once the bundle root is known to
+        # exist. Installations that predate the versioned bundle layout have no
+        # mcp_server_vs root yet, and asserting on its marker beforehand aborted the
+        # first install on exactly those machines.
+        Assert-SafeFinalEntry -path $activeMarker
+        Assert-SafeFinalEntry -path $stableLauncher
+        $previousMarker = if (Test-Path -LiteralPath $activeMarker) { [System.IO.File]::ReadAllBytes($activeMarker) } else { $null }
+        $previousLauncher = if (Test-Path -LiteralPath $stableLauncher) { [System.IO.File]::ReadAllBytes($stableLauncher) } else { $null }
         Assert-SafeFinalEntry -path $backupRoot
         if (Test-Path -LiteralPath $userMcpRoot) {
             Assert-PlainOwnedTree -path $userMcpRoot
@@ -996,8 +1030,7 @@ function Activate-McpServerDeployment {
                         Assert-SafeFinalEntry -path $restoreTemp
                         [System.IO.File]::WriteAllBytes($restoreTemp, $restore.Bytes)
                         Assert-SafeFinalEntry -path $restore.Path
-                        if (Test-Path -LiteralPath $restore.Path) { [System.IO.File]::Replace($restoreTemp, $restore.Path, $null) }
-                        else { [System.IO.File]::Move($restoreTemp, $restore.Path) }
+                        Set-FileFromTemp -tempPath $restoreTemp -targetPath $restore.Path
                     }
                     finally {
                         if (Test-Path -LiteralPath $restoreTemp) { Remove-Item -LiteralPath $restoreTemp -Force }
