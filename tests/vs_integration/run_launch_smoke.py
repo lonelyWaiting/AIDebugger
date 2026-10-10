@@ -30,6 +30,10 @@ from mcp_server.tool_modules import vs_instance_tools
 
 LAUNCH_TIMEOUT_SECONDS = 180.0
 
+# The heartbeat sleeps 0.05s, so a healthy loop never gaps much beyond that. Anything
+# near a second means discovery or process creation ran on the event loop again.
+EVENT_LOOP_STALL_LIMIT_SECONDS = 0.5
+
 
 def visible_dialogs(process_id: int) -> list[str]:
     """Visible modal dialogs owned by a process, as 'class: text' strings.
@@ -164,13 +168,35 @@ async def main() -> None:
     )
     try:
         started = time.monotonic()
-        payload = await vs_instance_tools.ensure_vs_instance(
-            process_id=target.pid, timeout_seconds=LAUNCH_TIMEOUT_SECONDS
-        )
+        # Locating the installation shells out to vswhere and starting Visual Studio is a
+        # process creation; both must happen off the event loop, or every other in-flight
+        # tool call stalls behind them. The heartbeat measures that directly.
+        stamps: list[float] = []
+
+        async def heartbeat() -> None:
+            while True:
+                stamps.append(time.monotonic())
+                await asyncio.sleep(0.05)
+
+        beat = asyncio.ensure_future(heartbeat())
+        try:
+            payload = await vs_instance_tools.ensure_vs_instance(
+                process_id=target.pid, timeout_seconds=LAUNCH_TIMEOUT_SECONDS
+            )
+        finally:
+            beat.cancel()
+        gaps = [later - earlier for earlier, later in zip(stamps, stamps[1:])]
+        longest_stall = max(gaps) if gaps else 0.0
         # The FastMCP tool wrapper returns the structured result under "result".
         result = payload.get("result", payload) if isinstance(payload, dict) else payload
         elapsed = time.monotonic() - started
         print(f"ensure_vs_instance returned status={result.get('status')} after {elapsed:.1f}s")
+        print(
+            f"  heartbeat {len(stamps)} ticks, longest event-loop stall {longest_stall * 1000:.0f}ms"
+        )
+        assert longest_stall < EVENT_LOOP_STALL_LIMIT_SECONDS, (
+            f"the event loop was blocked for {longest_stall:.2f}s during the launch"
+        )
         for entry in result.get("diagnostics") or []:
             print(f"  diagnostic: {entry}")
         # A blocked Visual Studio (Start Page, or a modal error dialog) must be reported

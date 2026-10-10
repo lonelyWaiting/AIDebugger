@@ -818,19 +818,33 @@ def _launch_matches_request(
     return True
 
 
-def _start_or_join_launch(
-    requested_capabilities: Sequence[str],
-    install_path: Optional[str] = None,
-    instance_id: Optional[str] = None,
-    solution_path: Optional[str] = None,
-    root_suffix: Optional[str] = None,
-) -> Tuple[LaunchRecord, List[str], bool]:
-    """Join a launch already in flight in this process, otherwise start one.
+_LAUNCH_START_LOCK: Optional[asyncio.Lock] = None
+_LAUNCH_START_LOCK_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
-    Every step is synchronous, so this can never interleave with another tool call
-    on the same event loop and needs no lock. The flag reports whether this call is
-    the one that started the process, and therefore owns asking it to serve MCP.
+
+def _launch_start_lock() -> asyncio.Lock:
+    """Serialise the check-then-start sequence for callers on the running loop.
+
+    The lock is created per event loop rather than at import time: an asyncio
+    primitive binds to the loop that first awaits it, and a server restart (or a
+    test) creates a new loop in the same process.
     """
+    global _LAUNCH_START_LOCK, _LAUNCH_START_LOCK_LOOP
+    loop = asyncio.get_running_loop()
+    if _LAUNCH_START_LOCK is None or _LAUNCH_START_LOCK_LOOP is not loop:
+        _LAUNCH_START_LOCK = asyncio.Lock()
+        _LAUNCH_START_LOCK_LOOP = loop
+    return _LAUNCH_START_LOCK
+
+
+def _find_joinable_launch(
+    requested_capabilities: Sequence[str],
+    install_path: Optional[str],
+    instance_id: Optional[str],
+    solution_path: Optional[str],
+    root_suffix: Optional[str],
+) -> Optional[LaunchRecord]:
+    """The in-flight launch this request can join, if any. Cheap; no blocking I/O."""
     for candidate in _LAUNCHES.values():
         if (
             candidate.ready_instance is None
@@ -840,18 +854,65 @@ def _start_or_join_launch(
                 candidate, requested_capabilities, install_path, instance_id, solution_path, root_suffix
             )
         ):
-            return candidate, [
-                f"Joined the Visual Studio launch already in progress (PID {candidate.process_id})."
-            ], False
+            return candidate
+    return None
+
+
+def _select_and_launch(
+    requested_capabilities: Sequence[str],
+    install_path: Optional[str],
+    instance_id: Optional[str],
+    solution_path: Optional[str],
+    root_suffix: Optional[str],
+) -> LaunchRecord:
+    """Locate a trusted installation and start it. Runs on a worker thread."""
     installations = discover_devenv_installations()
     installation = select_devenv_installation(installations, install_path, instance_id)
-    record = launch_devenv(
+    return launch_devenv(
         installation,
         requested_capabilities,
         solution_path=solution_path,
         root_suffix=root_suffix,
     )
-    return record, [], True
+
+
+async def _start_or_join_launch(
+    requested_capabilities: Sequence[str],
+    install_path: Optional[str] = None,
+    instance_id: Optional[str] = None,
+    solution_path: Optional[str] = None,
+    root_suffix: Optional[str] = None,
+) -> Tuple[LaunchRecord, List[str], bool]:
+    """Join a launch already in flight in this process, otherwise start one.
+
+    Discovery shells out to vswhere and verifies signatures, and creating a process
+    is not instant either, so both run on a worker thread: doing that work on the
+    event loop stalls every other tool call for seconds. The lock keeps the
+    check-then-start sequence atomic instead, so two concurrent callers cannot both
+    launch a Visual Studio. The flag reports whether this call is the one that
+    started the process, and therefore owns asking it to serve MCP.
+
+    The lock is released before waiting for readiness, so a caller that arrives
+    while a launch is still starting joins it instead of queueing behind it.
+    """
+    async with _launch_start_lock():
+        joined = _find_joinable_launch(
+            requested_capabilities, install_path, instance_id, solution_path, root_suffix
+        )
+        if joined is not None:
+            return joined, [
+                f"Joined the Visual Studio launch already in progress (PID {joined.process_id})."
+            ], False
+        record = await asyncio.get_running_loop().run_in_executor(
+            None,
+            _select_and_launch,
+            requested_capabilities,
+            install_path,
+            instance_id,
+            solution_path,
+            root_suffix,
+        )
+        return record, [], True
 
 
 async def ensure_instance(
@@ -904,7 +965,7 @@ async def ensure_instance(
             )
 
     deadline = time.monotonic() + max(0.0, timeout_seconds)
-    record, launch_diagnostics, started_here = _start_or_join_launch(
+    record, launch_diagnostics, started_here = await _start_or_join_launch(
         requested_capabilities,
         install_path=install_path,
         instance_id=instance_id,

@@ -405,6 +405,82 @@ class EnsureInstanceTests(unittest.TestCase):
         self.assertEqual(outcome.record.process_id, 777)
         self.assertTrue(any("already in progress" in entry for entry in outcome.diagnostics))
 
+    def test_discovery_and_process_start_do_not_block_the_event_loop(self):
+        record = record_for(pid=31415)
+        beats = []
+
+        def slow_discovery(*args, **kwargs):
+            time.sleep(0.3)
+            return [installation()]
+
+        def slow_launch(*args, **kwargs):
+            time.sleep(0.2)
+            return record
+
+        async def scenario():
+            async def heartbeat():
+                while True:
+                    beats.append(time.monotonic())
+                    await asyncio.sleep(0.01)
+
+            beat = asyncio.ensure_future(heartbeat())
+            try:
+                return await vs_launch.ensure_instance(("debug.read", "server.control"))
+            finally:
+                beat.cancel()
+
+        with patch.object(
+            vs_launch.vs_bridge, "discover_instances", AsyncMock(return_value=[])
+        ), patch.object(
+            vs_launch, "discover_devenv_installations", side_effect=slow_discovery
+        ), patch.object(vs_launch, "launch_devenv", side_effect=slow_launch), patch.object(
+            vs_launch, "_request_launcher_server_start", AsyncMock(return_value="dispatched")
+        ), patch.object(
+            vs_launch, "wait_for_ready_instance", AsyncMock(return_value=(instance_payload(31415), []))
+        ):
+            outcome = asyncio.run(scenario())
+        self.assertEqual(outcome.status, vs_launch.READY_STATUS)
+        # vswhere and process creation sleep 0.5s in total; a blocked event loop would
+        # starve the heartbeat down to the one tick it gets before the first await.
+        self.assertGreater(len(beats), 10)
+
+    def test_concurrent_callers_start_at_most_one_process(self):
+        record = record_for(pid=31415)
+
+        def launch_once(*args, **kwargs):
+            # Mimic launch_devenv: the record only becomes joinable once it is registered.
+            time.sleep(0.2)
+            vs_launch._LAUNCHES[record.process_id] = record
+            return record
+
+        async def scenario():
+            return await asyncio.gather(
+                vs_launch.ensure_instance(("debug.read", "server.control")),
+                vs_launch.ensure_instance(("debug.read", "server.control")),
+            )
+
+        with patch.object(
+            vs_launch.vs_bridge, "discover_instances", AsyncMock(return_value=[])
+        ), patch.object(
+            vs_launch, "discover_devenv_installations", return_value=[installation()]
+        ), patch.object(vs_launch, "launch_devenv", side_effect=launch_once) as launch, patch.object(
+            vs_launch, "_request_launcher_server_start", AsyncMock(return_value="dispatched")
+        ), patch.object(
+            vs_launch, "wait_for_ready_instance", AsyncMock(return_value=(instance_payload(31415), []))
+        ):
+            outcomes = asyncio.run(scenario())
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual([outcome.record.process_id for outcome in outcomes], [31415, 31415])
+        joined = [outcome for outcome in outcomes if outcome.record is not None]
+        self.assertEqual(len(joined), 2)
+        self.assertTrue(
+            any(
+                "already in progress" in entry
+                for outcome in outcomes
+                for entry in outcome.diagnostics
+            )
+        )
+
 
 class CloseInstanceTests(unittest.TestCase):
     def setUp(self):
