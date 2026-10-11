@@ -21,3 +21,22 @@ the process. Explicit tool errors retain their existing semantics.
 
 Validation: 53 IDA tests and all 368 Python tests passed; syntax and diff checks
 passed. No real debugger process is launched by the audited test runner.
+
+## Round 2: native effects and follow-up failures
+
+Restarted from the committed round-1 code. Reviewed DbgEng native operation
+results and worker/supervisor propagation, VS opaque process handles, mapped
+dump cursor bindings and step/start follow-up behavior, plus IDA identity and
+close receipts. Found that a successfully issued kernel mutation followed by
+failed target/status collection returned an ordinary engine error, losing the
+fact that the effect might already have occurred.
+
+Reproduced failures in both post-step target verification and status collection.
+Post-operation failures now report `OUTCOME_UNKNOWN` for commands, control,
+memory writes and breakpoint changes, with an explicit no-retry message. Read
+and query failures retain their original error codes. No operation is replayed.
+This resets the consecutive-clean count to zero.
+
+Validation: all 43 kernel tests and 370 Python tests passed; syntax and diff
+checks passed. Native execution/status failures were injected through owned
+mock engine interfaces; live kernel stepping remains unverified.

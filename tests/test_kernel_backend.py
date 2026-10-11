@@ -88,6 +88,33 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(result["bytesRead"], 4)
         self.assertEqual(result["dataHex"], "61626364")
 
+    def test_post_control_status_failure_preserves_unknown_outcome(self):
+        from kernel_backend.engine import Engine
+        for failing_probe in ("verify_target", "status"):
+            with self.subTest(probe=failing_probe):
+                engine = object.__new__(Engine)
+                engine.output = Mock()
+                engine.control = Mock()
+                engine.control.call.return_value = 0
+                engine.verify_target = Mock()
+                engine.status = Mock(return_value={"state": "running"})
+                getattr(engine, failing_probe).side_effect = KernelError("DBGENG_ERROR", "Status unavailable")
+                with self.assertRaises(KernelError) as error:
+                    engine.perform("control", {"action": "step_into"})
+                self.assertEqual("OUTCOME_UNKNOWN", error.exception.code)
+                engine.control.call.assert_called_once()
+
+    def test_read_status_failure_is_not_misreported_as_mutation(self):
+        from kernel_backend.engine import Engine
+        engine = object.__new__(Engine)
+        engine.output = Mock()
+        engine.memory = Mock()
+        engine.memory.call.return_value = 0
+        engine.verify_target = Mock(side_effect=KernelError("TARGET_MISMATCH", "Target changed"))
+        with self.assertRaises(KernelError) as error:
+            engine.perform("read_memory", {"address": "10", "size": 8})
+        self.assertEqual("TARGET_MISMATCH", error.exception.code)
+
     def test_removing_native_breakpoint_never_dereferences_deleted_interface(self):
         from kernel_backend.engine import Engine
         engine = object.__new__(Engine)

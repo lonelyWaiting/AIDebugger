@@ -284,8 +284,14 @@ class Engine:
             result = {"requested": True, "action": args["action"]}
         else:
             raise KernelError("INVALID_ARGUMENT", "Unknown engine operation")
-        self.verify_target()
-        result.update(self.status())
+        try:
+            self.verify_target()
+            result.update(self.status())
+        except Exception as error:
+            if operation in {"command", "control", "write_memory", "set_breakpoint", "remove_breakpoint"}:
+                raise KernelError("OUTCOME_UNKNOWN",
+                    f"{operation} was issued, but follow-up target/status failed; do not retry mutations: {error}") from error
+            raise
         return result
 
     def close(self):
