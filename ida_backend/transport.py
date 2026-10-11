@@ -39,12 +39,18 @@ def rpc(port, token, method, params=None, timeout=3):
 
 
 def tool_value(result):
+    if not isinstance(result, dict):
+        raise IdaError("IDA_TRANSPORT_ERROR", "IDA tool response must be an object")
     if result.get("isError"):
         raise IdaError("IDA_TOOL_ERROR", "IDA tool failed", result=result)
     if "structuredContent" in result:
         return result["structuredContent"]
     content = result.get("content", [])
+    if not isinstance(content, list) or any(not isinstance(item, dict) for item in content):
+        raise IdaError("IDA_TRANSPORT_ERROR", "Invalid IDA tool content")
     if len(content) == 1 and content[0].get("type") == "text":
+        if not isinstance(content[0].get("text"), str):
+            raise IdaError("IDA_TRANSPORT_ERROR", "Invalid IDA tool text")
         try:
             return json.loads(content[0]["text"])
         except ValueError:

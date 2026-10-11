@@ -23,6 +23,13 @@ from tools import install_aidebugger as installer
 
 
 class IdaTransportTests(unittest.TestCase):
+    def test_malformed_tool_envelopes_are_transport_errors(self):
+        for result in (None, [], "receipt", {"content": None}, {"content": ["receipt"]},
+                       {"content": [{"type": "text"}]},
+                       {"content": [{"type": "text", "text": None}]}):
+            with self.subTest(result=result), self.assertRaisesRegex(IdaError, "IDA_TRANSPORT_ERROR"):
+                tool_value(result)
+
     def test_valid_result_and_explicit_rpc_error_remain_distinct(self):
         for body in (b'{"id":"request","result":{}}',
                      b'{"id":"request","error":{"code":-32601}}'):
@@ -321,6 +328,16 @@ class IdaLifecycleTests(unittest.TestCase):
             self.assertEqual("busy", self.session.state)
         self.process.terminate.assert_not_called()
 
+    def test_malformed_identity_does_not_dispatch_mutation(self):
+        for identity in (None, [], "identity"):
+            with self.subTest(identity=identity), patch.object(
+                self.manager, "_rpc_tool", return_value=self.result(identity),
+            ) as call:
+                with self.assertRaisesRegex(IdaError, "IDA_NOT_READY"):
+                    self.manager.call("target", "patch", {})
+                self.assertEqual(1, call.call_count)
+        self.process.terminate.assert_not_called()
+
     def test_save_error_keeps_session_and_process(self):
         with patch.object(self.manager, "_rpc_tool", side_effect=[self.result(self.identity), {"isError": True, "content": []}]):
             with self.assertRaisesRegex(IdaError, "IDA_TOOL_ERROR"):
@@ -342,6 +359,15 @@ class IdaLifecycleTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(IdaError, "IDA_OUTCOME_UNKNOWN"):
                     self.manager.close("target")
+        self.assertIsNone(self.session.closing_at)
+        self.process.terminate.assert_not_called()
+
+    def test_malformed_close_envelope_preserves_unknown_outcome(self):
+        with patch.object(self.manager, "_rpc_tool", side_effect=[self.result(self.identity), None]) as call:
+            with self.assertRaisesRegex(IdaError, "IDA_OUTCOME_UNKNOWN") as error:
+                self.manager.close("target")
+            self.assertTrue(error.exception.payload["doNotRetry"])
+            self.assertEqual(2, call.call_count)
         self.assertIsNone(self.session.closing_at)
         self.process.terminate.assert_not_called()
 

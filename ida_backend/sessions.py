@@ -174,6 +174,8 @@ class IdaSessions:
             session.port = data["port"]
             try:
                 identity = tool_value(self._rpc_tool(session, "aidb_identity", {}, timeout=timeout))
+                if not isinstance(identity, dict):
+                    raise IdaError("IDA_TRANSPORT_ERROR", "IDA identity must be an object")
             except (OSError, TimeoutError, IdaError) as error:
                 if isinstance(error, IdaError) and error.payload["code"] != "IDA_TRANSPORT_ERROR":
                     raise
