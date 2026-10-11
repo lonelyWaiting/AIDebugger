@@ -60,3 +60,22 @@ passed. The initial build
 identified a missing UI-thread assertion inside the new getter lambda; that
 assertion was added before the successful rebuild. Real VS COM fault injection
 and deployment have not been performed. Clean-pass count remains zero.
+
+## Round 4: target selection and total deadlines
+
+Restarted review from the round-3 commit, tracing exact target binding, selection
+generations, launch/attach/poll deadlines, cursor validation and request leases.
+Found that `ensure_vs_instance` captured its selection generation after waiting
+for readiness, so it could overwrite a selection made during that wait. Its
+attach then used global selection instead of the instance just returned. It
+also granted attach/poll an extra second after the total deadline expired.
+
+Regressions reproduced overwritten newer selection and dispatch after deadline.
+Selection generation is now captured before the readiness wait, attach uses
+the returned exact instance, and exhausted budgets skip attach. Exact transport
+failure preserves the ready-instance receipt. Three MCP contract regressions
+cover these paths. Clean-pass count resets to zero.
+
+Validation: 66 VS launch/tool tests and all 373 Python tests passed; syntax and
+diff checks passed. These are controlled MCP routing/race/deadline tests; no VS
+launch, attach or user-target intervention was performed.

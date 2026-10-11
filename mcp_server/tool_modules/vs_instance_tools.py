@@ -317,6 +317,8 @@ async def ensure_vs_instance(
             target_params["processName"] = validate_nonempty_string("process_name", process_name, 1024)
 
         requested = vs_launch.parse_requested_capabilities(capabilities)
+        manager = backend.get_bridge()
+        _, _, _, expected_generation = await manager.get_selection_snapshot()
         outcome = await vs_launch.ensure_instance(
             requested,
             install_path=install_path,
@@ -331,8 +333,6 @@ async def ensure_vs_instance(
             return format_result(result)
 
         # Pin the instance so every later tool reaches the same Visual Studio process.
-        manager = backend.get_bridge()
-        _, _, _, expected_generation = await manager.get_selection_snapshot()
         selected, _, _ = await manager.try_select_instance(
             expected_generation,
             pipe_name=outcome.instance.pipe_name,
@@ -351,12 +351,19 @@ async def ensure_vs_instance(
             return format_result(result)
 
         target = vs_bridge.instance_target(outcome.instance.target_identity())
-        remaining = max(1.0, deadline - loop.time())
+        remaining = max(0.0, deadline - loop.time())
+        if remaining <= 0:
+            result["status"] = "attach_failed"
+            result["success"] = False
+            result["partial"] = True
+            result["errorCode"] = "DEADLINE_EXCEEDED_NOT_STARTED"
+            result["message"] += " Attach was not started because the ensure_vs_instance timeout budget was exhausted."
+            return format_result(result)
         try:
-            attach_result = await backend.call(
-                "attach_process", target_params, preferred_ide="vs", timeout=remaining
+            attach_result = await vs_bridge.call_pipe_exact(
+                target, "attach_process", target_params, timeout=remaining
             )
-        except backend.IDEBridgeError as error:
+        except (backend.IDEBridgeError, vs_bridge.VSBridgeError) as error:
             result["status"] = "attach_failed"
             result["success"] = False
             result["errorCode"] = getattr(error, "code", "BRIDGE_ERROR")
@@ -366,7 +373,7 @@ async def ensure_vs_instance(
             return format_result(result)
 
         if wait_for_debugger and isinstance(attach_result, dict):
-            remaining = max(1.0, deadline - loop.time())
+            remaining = max(0.0, deadline - loop.time())
             attach_result = await wait_for_debugging_to_start(
                 attach_result, remaining, True, target=target
             )

@@ -842,6 +842,8 @@ class ToolContractTests(unittest.TestCase):
                 return instances[0] if len(instances) == 1 else None
 
             async def try_select_instance(self, expected_generation, **kwargs):
+                if expected_generation != self.generation:
+                    return (False, self.selected, self.generation)
                 self.selected = dict(kwargs["target_identity"])
                 self.generation += 1
                 return (True, self.selected, self.generation)
@@ -895,6 +897,55 @@ class ToolContractTests(unittest.TestCase):
         self.assertEqual(result["processId"], 5150)
         self.assertIn("extension", result["hint"])
 
+    def test_selection_changed_during_launch_is_preserved_and_attach_is_exact(self):
+        manager = self._fake_session()
+        vs_session._session = manager
+        instance = self._reusable_instance()
+        newer_target = self._reusable_instance(5150).target_identity()
+        outcome = vs_launch.EnsureOutcome(status=vs_launch.REUSED_STATUS, message="Reused.", instance=instance)
+        async def ensure(*args, **kwargs):
+            manager.selected = newer_target
+            manager.generation += 1
+            return outcome
+        async def check():
+            with patch.object(vs_launch, "ensure_instance", side_effect=ensure), patch.object(
+                vs_instance_tools.backend, "call", AsyncMock(return_value={"success": True, "message": "Attached"})
+            ) as selected_call, patch.object(
+                vs_bridge, "call_pipe_exact", AsyncMock(return_value={"success": True, "message": "Attached", "attachCompleted": True})
+            ) as exact_call:
+                response = await vs_server.mcp.call_tool("ensure_vs_instance", {
+                    "process_id": 1234, "wait_for_debugger": False,
+                })
+                return response, selected_call, exact_call
+        (_, payload), selected_call, exact_call = self._call(check)
+        self.assertEqual(newer_target, manager.selected)
+        self.assertFalse(payload["result"]["instance"]["isSelected"])
+        selected_call.assert_not_called()
+        self.assertEqual(instance.pipe_name, exact_call.call_args.args[0]["pipeName"])
+        self.assertEqual("attach_process", exact_call.call_args.args[1])
+
+    def test_expired_launch_budget_does_not_start_attach(self):
+        from types import SimpleNamespace
+        vs_session._session = self._fake_session()
+        outcome = vs_launch.EnsureOutcome(status=vs_launch.REUSED_STATUS, message="Reused.",
+                                         instance=self._reusable_instance())
+        clock = Mock()
+        clock.time.side_effect = [100, 111]
+        async def check():
+            with patch.object(vs_launch, "ensure_instance", AsyncMock(return_value=outcome)), patch.object(
+                vs_instance_tools, "asyncio", SimpleNamespace(get_running_loop=lambda: clock)
+            ), patch.object(vs_instance_tools.backend, "call", AsyncMock(return_value={"success": True, "message": "Attached"})) as selected_call, \
+                    patch.object(vs_bridge, "call_pipe_exact", AsyncMock()) as exact_call:
+                response = await vs_server.mcp.call_tool("ensure_vs_instance", {
+                    "process_id": 1234, "timeout_seconds": 10, "wait_for_debugger": False,
+                })
+                return response, selected_call, exact_call
+        (_, payload), selected_call, exact_call = self._call(check)
+        selected_call.assert_not_called()
+        exact_call.assert_not_called()
+        self.assertEqual("DEADLINE_EXCEEDED_NOT_STARTED", payload["result"]["errorCode"])
+        self.assertTrue(payload["result"]["partial"])
+
     def test_ambiguous_selection_never_launches_and_explains_the_next_step(self):
         vs_session._session = self._fake_session()
         outcome = vs_launch.EnsureOutcome(
@@ -931,7 +982,7 @@ class ToolContractTests(unittest.TestCase):
             with patch.object(
                 vs_instance_tools.vs_launch, "ensure_instance", AsyncMock(return_value=outcome)
             ), patch.object(
-                vs_instance_tools.backend, "call", AsyncMock(return_value=attach_result)
+                vs_instance_tools.vs_bridge, "call_pipe_exact", AsyncMock(return_value=attach_result)
             ) as call, patch.object(
                 vs_instance_tools,
                 "wait_for_debugging_to_start",
@@ -946,8 +997,25 @@ class ToolContractTests(unittest.TestCase):
         result = payload["result"]
         self.assertTrue(result["attached"])
         self.assertEqual(result["attachResult"]["debuggerActivationStatus"], "active")
-        self.assertEqual(call.call_args.args[0], "attach_process")
-        self.assertEqual(call.call_args.args[1], {"processId": 1234})
+        self.assertEqual(call.call_args.args[0]["pipeName"], instance.pipe_name)
+        self.assertEqual(call.call_args.args[1], "attach_process")
+        self.assertEqual(call.call_args.args[2], {"processId": 1234})
+
+    def test_exact_attach_failure_retains_the_ready_instance(self):
+        vs_session._session = self._fake_session()
+        instance = self._reusable_instance()
+        outcome = vs_launch.EnsureOutcome(status=vs_launch.REUSED_STATUS, message="Reused.", instance=instance)
+        async def check():
+            with patch.object(vs_launch, "ensure_instance", AsyncMock(return_value=outcome)), patch.object(
+                vs_bridge, "call_pipe_exact", AsyncMock(side_effect=VSBridgeError("Target changed", code="STALE_TARGET"))
+            ):
+                return await vs_server.mcp.call_tool("ensure_vs_instance", {"process_id": 1234})
+        _, payload = self._call(check)
+        result = payload["result"]
+        self.assertEqual("attach_failed", result["status"])
+        self.assertEqual("STALE_TARGET", result["errorCode"])
+        self.assertEqual(instance.process_id, result["processId"])
+        self.assertFalse(result["attached"])
 
     def test_close_refuses_an_instance_the_mcp_server_did_not_launch(self):
         async def check():
