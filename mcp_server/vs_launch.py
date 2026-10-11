@@ -23,6 +23,7 @@ import asyncio
 import ctypes
 from ctypes import wintypes
 from collections.abc import Iterable, Sequence
+from contextlib import contextmanager
 import json
 import logging
 import os
@@ -537,7 +538,7 @@ def build_launch_arguments(
 # ---------------------------------------------------------------------------
 
 
-def _process_state(process_id: int) -> Optional[Tuple[int, bool]]:
+def _process_state(process_id: int, handle=None) -> Optional[Tuple[int, bool]]:
     """Creation ticks plus liveness; None means the OS query is unavailable.
 
     Opening a process is not evidence of life: Windows keeps the process object, with its
@@ -558,7 +559,11 @@ def _process_state(process_id: int) -> Optional[Tuple[int, bool]]:
     ]
     kernel32.GetExitCodeProcess.restype = wintypes.BOOL
     kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(process_id))
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    owns_handle = handle is None
+    if owns_handle:
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(process_id))
     if not handle:
         if ctypes.get_last_error() == 87 and int(process_id) > 0:
             # ERROR_INVALID_PARAMETER: this PID has no process object. Access
@@ -583,6 +588,29 @@ def _process_state(process_id: int) -> Optional[Tuple[int, bool]]:
             return None
         filetime = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
         return filetime + _DOTNET_EPOCH_TICKS, exit_code.value == _NT_STILL_ACTIVE
+    finally:
+        if owns_handle:
+            kernel32.CloseHandle(handle)
+
+
+@contextmanager
+def _pin_owned_process(record: LaunchRecord):
+    """Keep the validated Windows process object alive while taskkill uses its PID."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, record.process_id)
+    if not handle:
+        raise VSBridgeError("Could not pin the owned process before close", code="PROCESS_STATE_UNAVAILABLE")
+    try:
+        state = _process_state(record.process_id, handle=handle)
+        if state is None or record.start_time_utc_ticks is None:
+            raise VSBridgeError("Could not verify the pinned process identity", code="PROCESS_STATE_UNAVAILABLE")
+        if state != (record.start_time_utc_ticks, True):
+            raise VSBridgeError("The pinned process no longer matches the running owned instance", code="STALE_TARGET")
+        yield handle
     finally:
         kernel32.CloseHandle(handle)
 
@@ -1214,6 +1242,12 @@ async def close_owned_instance(
         and discarding its exit code and message made a close that never had a chance look
         exactly like one that timed out, with nothing left to diagnose it from.
         """
+        # The worker owns the pin through subprocess completion even if its
+        # async caller is cancelled. Never close this handle on the event loop.
+        with _pin_owned_process(record):
+            _run_taskkill(extra)
+
+    def _run_taskkill(extra: Sequence[str]) -> None:
         label = f"taskkill /PID {record.process_id}" + (" " + " ".join(extra) if extra else "")
         try:
             completed = subprocess.run(
@@ -1242,7 +1276,18 @@ async def close_owned_instance(
         kill_attempts.append(detail)
         logger.info("Visual Studio PID %s close: %s", record.process_id, detail)
 
-    _taskkill(())
+    def _report_pin_failure(error: VSBridgeError) -> Dict[str, Any]:
+        if _record_liveness(record) is False:
+            return _report_already_closed()
+        return {
+            "success": False, "message": str(error), "processId": record.process_id,
+            "closed": False, "forced": False, "graceful": False, "errorCode": error.code,
+        }
+
+    try:
+        await asyncio.to_thread(_taskkill, ())
+    except VSBridgeError as error:
+        return _report_pin_failure(error)
     # A forced close must not sit through the whole graceful timeout first: the caller asked
     # for the process to go away, so give Visual Studio a short window to exit cleanly and
     # escalate instead of blocking for tens of seconds.
@@ -1256,7 +1301,10 @@ async def close_owned_instance(
     # rather than a plain existence test: it also matches the recorded creation time, so a PID
     # that changed hands during the grace window is never force-terminated.
     if force and _record_alive(record):
-        _taskkill(("/F",))
+        try:
+            await asyncio.to_thread(_taskkill, ("/F",))
+        except VSBridgeError as error:
+            return _report_pin_failure(error)
         forced = True
         force_deadline = time.monotonic() + FORCE_KILL_SECONDS
         while time.monotonic() < force_deadline and _record_alive(record):

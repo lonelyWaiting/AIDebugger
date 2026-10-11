@@ -79,3 +79,25 @@ cover these paths. Clean-pass count resets to zero.
 Validation: 66 VS launch/tool tests and all 373 Python tests passed; syntax and
 diff checks passed. These are controlled MCP routing/race/deadline tests; no VS
 launch, attach or user-target intervention was performed.
+
+## Round 5: close admission and async responsiveness
+
+Reviewed VS owned-process close against cancellation and PID reuse, debugger
+request identity/leases, IDA unknown outcomes and kernel terminal close states.
+Found synchronous `taskkill` inside the async close path. A 150 ms owned fixture
+blocked every heartbeat before the fix. Restored ownership records also left a
+gap between PID identity checks and taskkill's PID lookup.
+
+Each taskkill now runs in a worker thread holding a process handle whose
+creation ticks and liveness were verified. The handle stays with that worker
+through subprocess completion even if the caller cancels. A changed/unavailable
+identity rejects taskkill. Graceful/forced behavior and ownership cleanup remain
+covered by the existing close tests.
+
+Additional evidence: the heartbeat no longer starves, cancellation does not
+release the pin early, a changed identity never invokes taskkill, and a Windows
+native fixture verifies the calling Python process's exact handle stays open
+inside the pin and closes afterward. No real VS or debuggee was terminated.
+Clean-pass count resets to zero.
+
+Round-5 validation: all 377 Python tests, syntax checks and diff checks passed.

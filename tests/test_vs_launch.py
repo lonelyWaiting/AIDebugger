@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import pathlib
 import stat
 import subprocess
@@ -486,6 +487,22 @@ class EnsureInstanceTests(unittest.TestCase):
 class RecordLivenessTests(unittest.TestCase):
     """A record restored from disk has no process handle, so liveness needs care."""
 
+    @unittest.skipUnless(os.name == "nt", "Windows process-handle fixture")
+    def test_native_pin_keeps_identity_handle_open_until_context_exit(self):
+        pid = os.getpid()
+        ticks = vs_launch._process_start_time_utc_ticks(pid)
+        self.assertIsNotNone(ticks)
+        record = record_for(pid=pid, process=None, start_time_utc_ticks=ticks)
+        with vs_launch._pin_owned_process(record) as handle:
+            self.assertEqual((ticks, True), vs_launch._process_state(pid, handle=handle))
+            self.assertEqual((ticks, True), vs_launch._process_state(pid, handle=handle))
+        self.assertIsNone(vs_launch._process_state(pid, handle=handle))
+        record.start_time_utc_ticks += 1
+        with self.assertRaises(VSBridgeError) as error:
+            with vs_launch._pin_owned_process(record):
+                self.fail("Mismatched identity was pinned")
+        self.assertEqual("STALE_TARGET", error.exception.code)
+
     def test_os_query_failure_distinguishes_absence_from_access_denied(self):
         kernel = Mock()
         kernel.OpenProcess.return_value = 0
@@ -614,6 +631,10 @@ class CloseInstanceTests(unittest.TestCase):
         deletion = patch.object(vs_launch, "_delete_launch_record")
         deletion.start()
         self.addCleanup(deletion.stop)
+        from contextlib import nullcontext
+        pin = patch.object(vs_launch, "_pin_owned_process", side_effect=lambda record: nullcontext())
+        pin.start()
+        self.addCleanup(pin.stop)
 
     def _restore_launches(self):
         vs_launch._LAUNCHES.clear()
@@ -623,6 +644,77 @@ class CloseInstanceTests(unittest.TestCase):
         result = asyncio.run(vs_launch.close_owned_instance(4242))
         self.assertFalse(result["success"])
         self.assertEqual(result["errorCode"], "NOT_LAUNCHED_BY_MCP")
+
+    def test_taskkill_does_not_block_other_async_requests(self):
+        vs_launch._LAUNCHES[4242] = record_for(process=None)
+        state = {"value": (123456789, True)}
+        beats = []
+        def close(args, **kwargs):
+            time.sleep(0.15)
+            state["value"] = (123456789, False)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        async def scenario():
+            deadline = time.monotonic() + 0.1
+            async def heartbeat():
+                while time.monotonic() < deadline:
+                    beats.append(1)
+                    await asyncio.sleep(0.01)
+            return await asyncio.gather(
+                vs_launch.close_owned_instance(4242, timeout_seconds=0.2, debug_state={"isDebugging": False}),
+                heartbeat(),
+            )
+        with patch.object(vs_launch, "_process_state", side_effect=lambda pid: state["value"]), patch.object(
+            vs_launch, "_process_image_name", return_value="devenv.exe"
+        ), patch.object(vs_launch.subprocess, "run", side_effect=close):
+            results = asyncio.run(scenario())
+        self.assertTrue(results[0]["closed"])
+        self.assertGreater(len(beats), 3)
+
+    def test_changed_identity_at_close_boundary_never_calls_taskkill(self):
+        vs_launch._LAUNCHES[4242] = record_for()
+        with patch.object(vs_launch, "_process_start_time_utc_ticks", return_value=123456789), patch.object(
+            vs_launch, "_process_image_name", return_value="devenv.exe"
+        ), patch.object(vs_launch, "_pin_owned_process", side_effect=VSBridgeError("PID changed", code="STALE_TARGET")), \
+                patch.object(vs_launch.subprocess, "run") as run:
+            result = asyncio.run(vs_launch.close_owned_instance(4242, force=True))
+        run.assert_not_called()
+        self.assertFalse(result["closed"])
+        self.assertEqual("STALE_TARGET", result["errorCode"])
+
+    def test_cancelled_close_keeps_pin_until_taskkill_finishes(self):
+        from contextlib import contextmanager
+        import threading
+        vs_launch._LAUNCHES[4242] = record_for()
+        entered, release, unpinned = threading.Event(), threading.Event(), threading.Event()
+        @contextmanager
+        def pin(record):
+            try:
+                yield
+            finally:
+                unpinned.set()
+        def close(args, **kwargs):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("Taskkill fixture did not get released")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        async def scenario():
+            task = asyncio.create_task(vs_launch.close_owned_instance(4242, debug_state={"isDebugging": False}))
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertFalse(unpinned.is_set())
+            finally:
+                release.set()
+            self.assertTrue(await asyncio.to_thread(unpinned.wait, 1))
+        with patch.object(vs_launch, "_process_start_time_utc_ticks", return_value=123456789), patch.object(
+            vs_launch, "_process_image_name", return_value="devenv.exe"
+        ), patch.object(vs_launch, "_pin_owned_process", side_effect=pin), patch.object(
+            vs_launch.subprocess, "run", side_effect=close
+        ) as run:
+            asyncio.run(scenario())
+        self.assertEqual(1, run.call_count)
 
     def test_refuses_an_active_debug_session_unless_forced(self):
         vs_launch._LAUNCHES[4242] = record_for(pid=4242)
