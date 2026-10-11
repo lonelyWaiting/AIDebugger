@@ -117,3 +117,34 @@ incompleteness. Clean-pass count resets to zero.
 
 Validation: 117 C# tests, 377 Python tests, diff checks and Release compilation
 passed; real VS runtime acceptance remains open.
+
+## Round 7: fresh completeness and target-binding review
+
+Reviewed commit `aba317f` without changing production code. Independently traced
+routine step/context receipts, thread and callstack completeness, memory-search
+continuations, exact-instance dispatch, IDA lifecycle admission, and kernel
+worker/session state transitions. No new confirmed correctness defect was found.
+
+Validation: 48 bounded memory-search overlap/completion cases covered chunk
+boundaries, duplicate suppression, complete byte coverage and exact target
+preservation. Another 32 context and kernel-state tests passed. The round-6
+full-suite and Release-build results still apply to the unchanged source.
+Consecutive clean-pass count: one.
+
+## Round 8: independent cancellation and resource-ownership review
+
+Started a separate pass on the same commit, focusing on cancellation during
+close, concurrent selection and session work, post-mutation uncertainty, and
+late replies after terminal close. Traced the worker-owned VS process pin,
+kernel close admission/watchdog and poll-only waits, IDA lifecycle locks, and VS
+step follow-up receipts. No new confirmed correctness defect was found.
+
+Validation: 33 cancellation, busy, interrupt, shutdown, unknown-outcome and
+process-identity tests passed. Test taskkill calls were mocked; the native handle
+fixture inspected only its own Python process. No real VS/debuggee was launched
+or terminated. Consecutive clean-pass count: two; the requested stopping
+criterion is satisfied.
+
+Final evidence: 377 Python tests, 117 C# tests and VS Release compilation passed
+for the final production source. Live VS deployment/COM fault injection, real
+IDA fault injection and live kernel stepping were not performed in these rounds.
