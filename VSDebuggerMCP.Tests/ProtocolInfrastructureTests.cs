@@ -2682,6 +2682,25 @@ namespace VSDebuggerMCP.Tests
         }
 
         [TestMethod]
+        public void CallStackFieldTruncationIsReportedOnTheFrame()
+        {
+            var frame = new StackFrameInfo
+            {
+                FunctionName = new string('x', CallStackCaptureBudget.MaxFrameStringCharacters + 1)
+            };
+            Assert.IsTrue(new CallStackCaptureBudget().TryConsume(frame));
+            Assert.IsTrue(frame.Truncated);
+            Assert.IsTrue(frame.FunctionName.Length <= CallStackCaptureBudget.MaxFrameStringCharacters + 1);
+
+            var complete = new StackFrameInfo { FunctionName = "short" };
+            Assert.IsTrue(new CallStackCaptureBudget().TryConsume(complete));
+            Assert.IsFalse(complete.Truncated);
+            complete.Truncated = true;
+            Assert.IsTrue(new CallStackCaptureBudget().TryConsume(complete));
+            Assert.IsTrue(complete.Truncated);
+        }
+
+        [TestMethod]
         public void ThreadFrameCountFailureIsDistinctFromAnEmptyStack()
         {
             Assert.IsTrue(ThreadCaptureBudget.TryCaptureFrameCount(() => 0, out int count, out string error));

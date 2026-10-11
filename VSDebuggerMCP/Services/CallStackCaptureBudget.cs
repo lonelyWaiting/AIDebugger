@@ -43,19 +43,22 @@ namespace VSDebuggerMCP.Services
 
         private static void BoundFrameStrings(StackFrameInfo frame)
         {
-            frame.FunctionName = Bound(frame.FunctionName);
-            frame.FilePath = Bound(frame.FilePath);
-            frame.SourceLocationStatus = Bound(frame.SourceLocationStatus);
-            frame.Module = Bound(frame.Module);
-            frame.Language = Bound(frame.Language);
-            frame.ReturnType = Bound(frame.ReturnType);
-            frame.Error = Bound(frame.Error);
-            if (frame.Context != null) frame.Context.FrameId = Bound(frame.Context.FrameId);
+            bool truncated = frame.Truncated;
+            frame.FunctionName = Bound(frame.FunctionName, ref truncated);
+            frame.FilePath = Bound(frame.FilePath, ref truncated);
+            frame.SourceLocationStatus = Bound(frame.SourceLocationStatus, ref truncated);
+            frame.Module = Bound(frame.Module, ref truncated);
+            frame.Language = Bound(frame.Language, ref truncated);
+            frame.ReturnType = Bound(frame.ReturnType, ref truncated);
+            frame.Error = Bound(frame.Error, ref truncated);
+            if (frame.Context != null) frame.Context.FrameId = Bound(frame.Context.FrameId, ref truncated);
+            frame.Truncated = truncated;
         }
 
-        private static string Bound(string value)
+        private static string Bound(string value, ref bool truncated)
         {
             if (string.IsNullOrEmpty(value) || value.Length <= MaxFrameStringCharacters) return value;
+            truncated = true;
             int length = MaxFrameStringCharacters;
             if (char.IsLowSurrogate(value[length]) && char.IsHighSurrogate(value[length - 1])) length--;
             return value.Substring(0, length) + "…";

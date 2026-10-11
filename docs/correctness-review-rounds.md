@@ -101,3 +101,19 @@ inside the pin and closes afterward. No real VS or debuggee was terminated.
 Clean-pass count resets to zero.
 
 Round-5 validation: all 377 Python tests, syntax checks and diff checks passed.
+
+## Round 6: complete-result and truncated-result semantics
+
+Traced successful and failed results back through VS request ledgers, step and
+memory continuation wrappers, IDA lifecycle preflight and kernel job receipts.
+Found that callstack field bounding shortened strings without marking the frame
+`Truncated`. The collector consequently could report the shortened frame as a
+complete result. A new C# regression failed on the original implementation.
+
+All bounded frame fields now propagate truncation, preserving any pre-existing
+flag. The existing collector uses that flag to mark its page partial. The
+regression distinguishes short fields, truncated fields and pre-existing
+incompleteness. Clean-pass count resets to zero.
+
+Validation: 117 C# tests, 377 Python tests, diff checks and Release compilation
+passed; real VS runtime acceptance remains open.
