@@ -60,3 +60,30 @@ The installed idle VS instance still showed complete-query medians around
 reported as the complete VS debugger speedup. The built extension has not been
 deployed; the new thread capture behavior has compilation/source and MCP routing
 test evidence, without live VS stepping or many-thread runtime acceptance.
+
+The follow-up host review found four synchronous Output-pane logging calls per
+connection (waiting, connected, received, sent). These routine messages are now
+disabled by default; set `AIDB_TRACE_IPC=1` in the VS launch environment to enable
+them. Startup, shutdown and error logs remain enabled. This removes COM logging
+and redundant UTF-8 counts from ordinary requests. Release compilation passed;
+an installed-host A/B measurement is still required to quantify the complete
+query improvement. The 60--70 ms measurement above predates this host change.
+An isolated experimental-profile attempt verified that the installed DLL hash
+matched the compiled DLL. Its configuration refresh did not complete; another
+HeartGame VS instance appeared during `/Setup`, which can wait on a global VS
+configuration lock. The owned setup process was stopped and the experimental
+profile cleaned; the HeartGame instance was preserved. No A/B timings were
+collected from this attempt.
+
+Launch ownership loading now preserves a receipt if OS process identity cannot
+be queried, and retries verification on a later lookup. An unavailable query
+does not grant ownership; confirmed exit or PID reuse still prunes the receipt.
+`test_unavailable_identity_preserves_receipt_and_retries_loading` covers failure
+followed by successful verification. This fixes a reproducible receipt-loss
+path; it does not establish why the previously observed VS PID 73024 had no
+receipt. That idle, solution-free instance was gracefully closed after checking
+its exact OS creation time, and OS enumeration confirmed it exited.
+Close also retains ownership and returns `PROCESS_STATE_UNAVAILABLE` when
+process/image queries cannot establish exit. It never reports successful close
+or escalates from an unknown state. Access denied remains unknown; a missing
+process object or a matching object's terminated exit code establishes exit.

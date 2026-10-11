@@ -63,6 +63,7 @@ namespace VSDebuggerMCP
 
         private readonly DebuggerService _debuggerService;
         private readonly Action<string> _log;
+        private readonly bool _traceIpc;
         private readonly CancellationTokenSource _cts;
         private readonly JavaScriptSerializer _serializer;
         private readonly List<Task> _connectionTasks;
@@ -94,6 +95,10 @@ namespace VSDebuggerMCP
         {
             _debuggerService = debuggerService ?? throw new ArgumentNullException(nameof(debuggerService));
             _log = log ?? ((s) => { });
+            // OutputStringThreadSafe is a COM call even on a pipe worker. Keep
+            // routine per-connection output out of the query path by default.
+            _traceIpc = string.Equals(
+                Environment.GetEnvironmentVariable("AIDB_TRACE_IPC"), "1", StringComparison.Ordinal);
             _cts = new CancellationTokenSource();
             _serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
             _connectionTasks = new List<Task>();
@@ -288,7 +293,7 @@ namespace VSDebuggerMCP
                         outBufferSize: 4096,
                         pipeSecurity: pipeSecurity);
 
-                    _log("Waiting for client connection...");
+                    if (_traceIpc) _log("Waiting for client connection...");
 
                     // Wait for connection with cancellation support
                     await WaitForConnectionAsync(pipeServer, cancellationToken);
@@ -300,7 +305,7 @@ namespace VSDebuggerMCP
                         break;
                     }
 
-                    _log("Client connected.");
+                    if (_traceIpc) _log("Client connected.");
 
                     // Handle the connection
                     await HandleConnectionAsync(pipeServer, controlOnly, recoveryOnly, cancellationToken);
@@ -414,7 +419,7 @@ namespace VSDebuggerMCP
                 }
                 if (requestLine == null) return;
 
-                _log($"Received request ({Encoding.UTF8.GetByteCount(requestLine)} bytes).");
+                if (_traceIpc) _log($"Received request ({Encoding.UTF8.GetByteCount(requestLine)} bytes).");
 
                 string response = await ProcessRequestAsync(
                     requestLine,
@@ -427,7 +432,7 @@ namespace VSDebuggerMCP
                     frameWriteCts.CancelAfter(FrameIoTimeoutMs);
                     await codec.WriteFrameAsync(response, MaxResponseMessageSize, frameWriteCts.Token);
                 }
-                _log($"Sent response ({Encoding.UTF8.GetByteCount(response)} bytes).");
+                if (_traceIpc) _log($"Sent response ({Encoding.UTF8.GetByteCount(response)} bytes).");
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {

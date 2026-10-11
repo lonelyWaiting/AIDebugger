@@ -218,7 +218,14 @@ def _load_persisted_launches() -> None:
             _delete_launch_record(int(match.group(1)))
             continue
         # A reused PID or an exited process must never look like an owned instance.
-        if _process_start_time_utc_ticks(process_id) != start_ticks:
+        state = _process_state(process_id)
+        if state is None:
+            # Access/query failure is not proof of exit. Preserve the receipt and
+            # retry loading later; do not grant close ownership until verified.
+            _LAUNCHES_LOADED = False
+            continue
+        current_ticks, running = state
+        if not running or current_ticks != start_ticks:
             _delete_launch_record(process_id)
             continue
         capabilities = payload.get("requestedCapabilities")
@@ -519,7 +526,7 @@ def build_launch_arguments(
 
 
 def _process_state(process_id: int) -> Optional[Tuple[int, bool]]:
-    """Creation ticks plus a running flag for a process, or None when it is gone.
+    """Creation ticks plus liveness; None means the OS query is unavailable.
 
     Opening a process is not evidence of life: Windows keeps the process object, with its
     recorded creation time, queryable for as long as any handle to it remains open, so a
@@ -541,6 +548,10 @@ def _process_state(process_id: int) -> Optional[Tuple[int, bool]]:
     kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(process_id))
     if not handle:
+        if ctypes.get_last_error() == 87 and int(process_id) > 0:
+            # ERROR_INVALID_PARAMETER: this PID has no process object. Access
+            # denied and other query failures remain unknown.
+            return 0, False
         return None
     try:
         creation = wintypes.FILETIME()
@@ -602,7 +613,7 @@ def _process_image_name(process_id: int) -> Optional[str]:
         kernel32.CloseHandle(handle)
 
 
-def _record_alive(record: LaunchRecord) -> bool:
+def _record_liveness(record: LaunchRecord) -> Optional[bool]:
     """Whether the Visual Studio this record launched is still running.
 
     A record restored from disk carries no process handle, so the PID alone is not the
@@ -616,12 +627,17 @@ def _record_alive(record: LaunchRecord) -> bool:
         return record.process.poll() is None
     if record.start_time_utc_ticks is None:
         # Nothing was recorded to compare against; existence is all that is left.
-        return _process_start_time_utc_ticks(record.process_id) is not None
+        state = _process_state(record.process_id)
+        return state[1] if state is not None else None
     state = _process_state(record.process_id)
     if state is None:
-        return False
+        return None
     ticks, running = state
     return running and ticks == record.start_time_utc_ticks
+
+
+def _record_alive(record: LaunchRecord) -> bool:
+    return _record_liveness(record) is True
 
 
 def launch_devenv(
@@ -1113,7 +1129,21 @@ async def close_owned_instance(
             "graceful": True,
         }
 
-    if not _record_alive(record):
+    def _report_unavailable() -> Dict[str, Any]:
+        return {
+            "success": False,
+            "message": f"Unable to verify whether Visual Studio PID {process_id} has exited; ownership was preserved.",
+            "processId": int(process_id),
+            "closed": False,
+            "forced": False,
+            "graceful": False,
+            "errorCode": "PROCESS_STATE_UNAVAILABLE",
+        }
+
+    liveness = _record_liveness(record)
+    if liveness is None:
+        return _report_unavailable()
+    if liveness is False:
         return _report_already_closed()
     current_ticks = _process_start_time_utc_ticks(record.process_id)
     if (
@@ -1133,9 +1163,8 @@ async def close_owned_instance(
         }
     image_name = _process_image_name(record.process_id)
     if image_name is None:
-        # It exited between the liveness check and this one; there is nothing left to close,
-        # and the PID may already belong to something else.
-        return _report_already_closed()
+        # A failed image query can also mean access failure, not just exit.
+        return _report_already_closed() if _record_liveness(record) is False else _report_unavailable()
     if image_name.lower() != "devenv.exe":
         return {
             "success": False,
@@ -1213,7 +1242,8 @@ async def close_owned_instance(
         while time.monotonic() < force_deadline and _record_alive(record):
             await asyncio.sleep(0.25)
 
-    closed = not _record_alive(record)
+    final_liveness = _record_liveness(record)
+    closed = final_liveness is False
     # "Graceful" means the process left on its own; recomputing it after the escalation made a
     # forced close report both forced and graceful.
     graceful = closed and not forced
@@ -1225,6 +1255,8 @@ async def close_owned_instance(
         "message": (
             f"Closed the Visual Studio instance launched by this MCP server (PID {record.process_id})."
             if closed
+            else f"Unable to verify exit of Visual Studio PID {record.process_id}; ownership was preserved."
+            if final_liveness is None
             else (
                 f"Visual Studio PID {record.process_id} did not close within the timeout: "
                 + "; ".join(kill_attempts)
@@ -1234,5 +1266,7 @@ async def close_owned_instance(
         "closed": closed,
         "forced": forced,
         "graceful": graceful,
-        "errorCode": None if closed else "CLOSE_TIMEOUT",
+        "errorCode": None if closed else (
+            "PROCESS_STATE_UNAVAILABLE" if final_liveness is None else "CLOSE_TIMEOUT"
+        ),
     }

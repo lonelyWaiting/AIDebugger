@@ -10,7 +10,7 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -486,6 +486,15 @@ class EnsureInstanceTests(unittest.TestCase):
 class RecordLivenessTests(unittest.TestCase):
     """A record restored from disk has no process handle, so liveness needs care."""
 
+    def test_os_query_failure_distinguishes_absence_from_access_denied(self):
+        kernel = Mock()
+        kernel.OpenProcess.return_value = 0
+        with patch.object(vs_launch.ctypes, "WinDLL", return_value=kernel, create=True):
+            with patch.object(vs_launch.ctypes, "get_last_error", return_value=5, create=True):
+                self.assertIsNone(vs_launch._process_state(4242))
+            with patch.object(vs_launch.ctypes, "get_last_error", return_value=87, create=True):
+                self.assertEqual(vs_launch._process_state(4242), (0, False))
+
     def _restored(self, **overrides):
         return record_for(pid=4242, process=None, **overrides)
 
@@ -514,9 +523,9 @@ class RecordLivenessTests(unittest.TestCase):
     def test_a_record_without_creation_ticks_falls_back_to_existence(self):
         # Only the existence check is left when nothing was recorded to compare against.
         record = self._restored(start_time_utc_ticks=None)
-        with patch.object(vs_launch, "_process_start_time_utc_ticks", return_value=123456789):
+        with patch.object(vs_launch, "_process_state", return_value=(123456789, True)):
             self.assertTrue(vs_launch._record_alive(record))
-        with patch.object(vs_launch, "_process_start_time_utc_ticks", return_value=None):
+        with patch.object(vs_launch, "_process_state", return_value=None):
             self.assertFalse(vs_launch._record_alive(record))
 
     def test_ticks_are_only_reported_for_a_running_process(self):
@@ -529,6 +538,44 @@ class RecordLivenessTests(unittest.TestCase):
 
 
 class CloseInstanceTests(unittest.TestCase):
+    def test_unavailable_process_identity_does_not_claim_close_or_discard_ownership(self):
+        vs_launch._LAUNCHES[4242] = record_for(process=None)
+        with patch.object(vs_launch, "_process_state", return_value=None), patch.object(
+            vs_launch.subprocess, "run"
+        ) as run, patch.object(vs_launch, "_delete_launch_record") as delete:
+            result = asyncio.run(vs_launch.close_owned_instance(4242, force=True))
+        self.assertFalse(result["closed"])
+        self.assertEqual(result["errorCode"], "PROCESS_STATE_UNAVAILABLE")
+        self.assertIn(4242, vs_launch._LAUNCHES)
+        run.assert_not_called()
+        delete.assert_not_called()
+
+    def test_image_query_failure_is_not_reported_as_exit(self):
+        vs_launch._LAUNCHES[4242] = record_for(process=None)
+        with patch.object(vs_launch, "_process_state", return_value=(123456789, True)), patch.object(
+            vs_launch, "_process_image_name", return_value=None
+        ), patch.object(vs_launch.subprocess, "run") as run:
+            result = asyncio.run(vs_launch.close_owned_instance(4242, force=True))
+        self.assertFalse(result["closed"])
+        self.assertIn(4242, vs_launch._LAUNCHES)
+        run.assert_not_called()
+
+    def test_unknown_exit_after_close_preserves_receipt_without_escalating(self):
+        vs_launch._LAUNCHES[4242] = record_for(process=None)
+        state = {"value": (123456789, True)}
+        def close(args, **kwargs):
+            state["value"] = None
+            return subprocess.CompletedProcess(args, 0, "", "")
+        with patch.object(vs_launch, "_process_state", side_effect=lambda pid: state["value"]), patch.object(
+            vs_launch, "_process_image_name", return_value="devenv.exe"
+        ), patch.object(vs_launch.subprocess, "run", side_effect=close) as run:
+            result = asyncio.run(vs_launch.close_owned_instance(4242, force=True, timeout_seconds=0))
+        self.assertFalse(result["closed"])
+        self.assertFalse(result["forced"])
+        self.assertEqual(result["errorCode"], "PROCESS_STATE_UNAVAILABLE")
+        self.assertIn(4242, vs_launch._LAUNCHES)
+        self.assertEqual(run.call_count, 1)
+
     def setUp(self):
         self._launches = dict(vs_launch._LAUNCHES)
         self.addCleanup(self._restore_launches)
@@ -576,7 +623,7 @@ class CloseInstanceTests(unittest.TestCase):
         with patch.object(vs_launch, "_process_image_name", return_value="devenv.exe"), patch.object(
             vs_launch, "_process_start_time_utc_ticks", return_value=123456789
         ), patch.object(
-            vs_launch, "_record_alive", side_effect=lambda record: alive["value"]
+            vs_launch, "_record_liveness", side_effect=lambda record: alive["value"]
         ), patch.object(
             vs_launch.subprocess, "run", side_effect=fake_run
         ), patch.object(
@@ -599,7 +646,7 @@ class CloseInstanceTests(unittest.TestCase):
         state = {"value": (123456789, True)}
 
         def graceful_exit(args, **kwargs):
-            state["value"] = None  # this taskkill closed it; nothing left to escalate to
+            state["value"] = (123456789, False)  # confirmed exit; nothing left to escalate to
             return subprocess.CompletedProcess(args, 0, "", "")
 
         with patch.object(vs_launch, "_process_image_name", return_value="devenv.exe"), patch.object(
@@ -660,7 +707,7 @@ class CloseInstanceTests(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, "", "")
 
         def fake_state(process_id):
-            return (123456789, True) if alive["value"] else None
+            return (123456789, alive["value"])
 
         with patch.object(vs_launch, "_process_image_name", return_value="devenv.exe"), patch.object(
             vs_launch, "_process_state", side_effect=fake_state
@@ -893,6 +940,26 @@ class ToolContractTests(unittest.TestCase):
 
 class PersistedLaunchRecordTests(unittest.TestCase):
     """The launch record the server writes must satisfy the same trust contract it validates."""
+
+    def test_unavailable_identity_preserves_receipt_and_retries_loading(self):
+        import shutil
+        root = pathlib.Path(tempfile.mkdtemp()) / "launches"
+        self.addCleanup(shutil.rmtree, root.parent, True)
+        saved, loaded = dict(vs_launch._LAUNCHES), vs_launch._LAUNCHES_LOADED
+        def restore():
+            vs_launch._LAUNCHES.clear()
+            vs_launch._LAUNCHES.update(saved)
+            vs_launch._LAUNCHES_LOADED = loaded
+        self.addCleanup(restore)
+        with patch.object(vs_launch, "_launches_root", return_value=root), patch.object(
+            vs_trust, "_validate_registration_security", lambda *args, **kwargs: None
+        ), patch.object(vs_launch, "_process_state", side_effect=[None, (123456789, True)]):
+            vs_launch._persist_launch_record(record_for())
+            vs_launch._LAUNCHES.clear()
+            vs_launch._LAUNCHES_LOADED = False
+            self.assertIsNone(vs_launch.get_owned_launch(4242))
+            self.assertTrue((root / "4242.json").is_file())
+            self.assertIsNotNone(vs_launch.get_owned_launch(4242))
 
     def test_record_file_gets_a_protected_owner_only_dacl(self):
         import shutil
