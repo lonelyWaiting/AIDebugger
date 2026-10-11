@@ -23,11 +23,17 @@ def rpc(port, token, method, params=None, timeout=3):
         if response.status != 200 or len(body) > 8 * 1024 * 1024:
             raise IdaError("IDA_TRANSPORT_ERROR", "Invalid or oversized IDA response", status=response.status)
         data = json.loads(body)
-        if data.get("id") != request_id:
+        if not isinstance(data, dict) or data.get("id") != request_id:
             raise IdaError("IDA_TRANSPORT_ERROR", "IDA response identity mismatch")
+        if ("error" in data) == ("result" in data):
+            raise IdaError("IDA_TRANSPORT_ERROR", "IDA response must contain exactly one result or error")
         if "error" in data:
             raise IdaError("IDA_RPC_ERROR", str(data["error"]))
         return data["result"]
+    except (http.client.HTTPException, ValueError) as error:
+        # The request may already have executed even when its response cannot
+        # be read or decoded. Lifecycle callers preserve this uncertainty.
+        raise IdaError("IDA_TRANSPORT_ERROR", "Incomplete or invalid IDA response") from error
     finally:
         connection.close()
 

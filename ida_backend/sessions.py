@@ -174,7 +174,9 @@ class IdaSessions:
             session.port = data["port"]
             try:
                 identity = tool_value(self._rpc_tool(session, "aidb_identity", {}, timeout=timeout))
-            except (OSError, TimeoutError):
+            except (OSError, TimeoutError, IdaError) as error:
+                if isinstance(error, IdaError) and error.payload["code"] != "IDA_TRANSPORT_ERROR":
+                    raise
                 session.state = "busy"
                 return session.describe()
             if identity.get("sessionId") != session_id or identity.get("pid") != session.process.pid:
@@ -226,7 +228,9 @@ class IdaSessions:
                 raise IdaError("INVALID_ARGUMENT", "Use the lifecycle tools for this operation")
             try:
                 return self._rpc_tool(session, name, arguments or {}, remaining)
-            except (OSError, TimeoutError) as error:
+            except (OSError, TimeoutError, IdaError) as error:
+                if isinstance(error, IdaError) and error.payload["code"] != "IDA_TRANSPORT_ERROR":
+                    raise
                 # The command may still be executing. Never restart or replay it.
                 raise IdaError("IDA_OUTCOME_UNKNOWN", "Transport lost while IDA may still be executing; do not retry mutations",
                                tool=name, outcomeUnknown=True, doNotRetry=True) from error
@@ -260,9 +264,13 @@ class IdaSessions:
                 raise IdaError("IDA_NOT_READY", "Session is busy or starting; it has not been killed")
             try:
                 result = tool_value(self._rpc_tool(session, "aidb_close", {"save": save}, 10))
-            except (OSError, TimeoutError) as error:
-                raise IdaError("IDA_OUTCOME_UNKNOWN", "Close outcome unknown; poll status, do not force kill", outcomeUnknown=True) from error
-            if result.get("accepted") is not True or result.get("saved") is not save:
+            except (OSError, TimeoutError, IdaError) as error:
+                if isinstance(error, IdaError) and error.payload["code"] != "IDA_TRANSPORT_ERROR":
+                    raise
+                raise IdaError("IDA_OUTCOME_UNKNOWN", "Close outcome unknown; poll status, do not force kill",
+                               outcomeUnknown=True, doNotRetry=True) from error
+            if (not isinstance(result, dict) or result.get("accepted") is not True
+                    or result.get("saved") is not save):
                 raise IdaError("IDA_OUTCOME_UNKNOWN", "Invalid close/save receipt; session is preserved",
                                outcomeUnknown=True, doNotRetry=True)
             session.state = "closing"

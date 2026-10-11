@@ -1,5 +1,6 @@
 import ast
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -16,9 +17,44 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from ida_backend.sessions import IdaSessions, Session
-from ida_backend.transport import IdaError, tool_value
+from ida_backend.transport import IdaError, rpc, tool_value
 from ida_backend.stdio import serve
 from tools import install_aidebugger as installer
+
+
+class IdaTransportTests(unittest.TestCase):
+    def test_valid_result_and_explicit_rpc_error_remain_distinct(self):
+        for body in (b'{"id":"request","result":{}}',
+                     b'{"id":"request","error":{"code":-32601}}'):
+            connection = Mock()
+            connection.getresponse.return_value.status = 200
+            connection.getresponse.return_value.read.return_value = body
+            with patch('ida_backend.transport.http.client.HTTPConnection', return_value=connection), \
+                    patch('ida_backend.transport.uuid.uuid4', return_value=SimpleNamespace(hex='request')):
+                if b'"error"' in body:
+                    with self.assertRaisesRegex(IdaError, 'IDA_RPC_ERROR'):
+                        rpc(14000, 'private', 'tools/call')
+                else:
+                    self.assertEqual({}, rpc(14000, 'private', 'tools/call'))
+
+    def test_invalid_responses_are_typed_transport_errors(self):
+        bodies = [b'{', b'[]', b'null', b'{"id":"request"}',
+                  b'{"id":"request","result":{},"error":{}}']
+        for body in bodies + [http.client.IncompleteRead(b'partial', 20)]:
+            with self.subTest(body=body):
+                connection = Mock()
+                response = connection.getresponse.return_value
+                response.status = 200
+                if isinstance(body, Exception):
+                    response.read.side_effect = body
+                else:
+                    response.read.return_value = body
+                with patch('ida_backend.transport.http.client.HTTPConnection', return_value=connection), \
+                        patch('ida_backend.transport.uuid.uuid4', return_value=SimpleNamespace(hex='request')):
+                    with self.assertRaisesRegex(IdaError, 'IDA_TRANSPORT_ERROR'):
+                        rpc(14000, 'private', 'tools/call', {'name': 'patch'})
+                connection.request.assert_called_once()
+                connection.close.assert_called_once()
 
 
 class DebugContextTests(unittest.TestCase):
@@ -259,6 +295,32 @@ class IdaLifecycleTests(unittest.TestCase):
             self.assertEqual(rpc.call_count, 2)  # one identity query, one mutation
         self.process.terminate.assert_not_called()
 
+    def test_transport_error_preserves_unknown_mutation_and_close(self):
+        for close in (False, True):
+            with self.subTest(close=close), patch.object(
+                self.manager, "_rpc_tool", side_effect=[self.result(self.identity),
+                    IdaError("IDA_TRANSPORT_ERROR", "Invalid response")],
+            ) as call:
+                with self.assertRaisesRegex(IdaError, "IDA_OUTCOME_UNKNOWN") as error:
+                    if close:
+                        self.manager.close("target")
+                    else:
+                        self.manager.call("target", "patch", {"patches": []})
+                self.assertTrue(error.exception.payload["doNotRetry"])
+                self.assertEqual(2, call.call_count)
+                self.assertIsNone(self.session.closing_at)
+                self.process.terminate.assert_not_called()
+
+    def test_invalid_transport_preflight_does_not_dispatch_mutation(self):
+        with patch.object(self.manager, "_rpc_tool", side_effect=IdaError(
+            "IDA_TRANSPORT_ERROR", "Invalid identity response",
+        )) as call:
+            with self.assertRaisesRegex(IdaError, "IDA_NOT_READY"):
+                self.manager.call("target", "patch", {})
+            self.assertEqual(1, call.call_count)
+            self.assertEqual("busy", self.session.state)
+        self.process.terminate.assert_not_called()
+
     def test_save_error_keeps_session_and_process(self):
         with patch.object(self.manager, "_rpc_tool", side_effect=[self.result(self.identity), {"isError": True, "content": []}]):
             with self.assertRaisesRegex(IdaError, "IDA_TOOL_ERROR"):
@@ -274,9 +336,12 @@ class IdaLifecycleTests(unittest.TestCase):
         self.process.terminate.assert_not_called()
 
     def test_invalid_save_receipt_does_not_authorize_termination(self):
-        with patch.object(self.manager, "_rpc_tool", side_effect=[self.result(self.identity), self.result({"accepted": True, "saved": False})]):
-            with self.assertRaisesRegex(IdaError, "IDA_OUTCOME_UNKNOWN"):
-                self.manager.close("target")
+        for receipt in ({"accepted": True, "saved": False}, None, [], "accepted"):
+            with self.subTest(receipt=receipt), patch.object(self.manager, "_rpc_tool",
+                side_effect=[self.result(self.identity), self.result(receipt)],
+            ):
+                with self.assertRaisesRegex(IdaError, "IDA_OUTCOME_UNKNOWN"):
+                    self.manager.close("target")
         self.assertIsNone(self.session.closing_at)
         self.process.terminate.assert_not_called()
 

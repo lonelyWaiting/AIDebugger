@@ -100,3 +100,17 @@ Regression tests verify rejected requests do not call step/close, valid idle
 close still succeeds, and malformed records cannot block or replace a valid
 record. These are source/MCP routing and controlled-fixture tests, not live VS
 debuggee shutdown evidence.
+
+The next correctness pass fixed completion handling in chunked VS memory
+search: after successful full-range coverage, no trailing overlap request is
+issued. A regression injects a stale-context error on an unwanted third request
+and verifies that the completed two-request search remains successful. Backend
+partial/truncated results retain their existing continuation rules.
+
+IDA now validates response object/identity and the exclusive result/error
+envelope, and classifies incomplete HTTP or malformed JSON as transport errors.
+Transport failure after a tool or close request reports `IDA_OUTCOME_UNKNOWN`
+with `doNotRetry`; failed identity preflight does not dispatch the operation.
+Malformed close/save receipts also preserve uncertainty without terminating the
+owned process. These guarantees have controlled transport/lifecycle regression
+evidence, without live IDA fault injection or live kernel acceptance.
