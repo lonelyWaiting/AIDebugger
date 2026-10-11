@@ -40,3 +40,23 @@ This resets the consecutive-clean count to zero.
 Validation: all 43 kernel tests and 370 Python tests passed; syntax and diff
 checks passed. Native execution/status failures were injected through owned
 mock engine interfaces; live kernel stepping remains unverified.
+
+## Round 3: snapshot completeness and stack enumeration
+
+Reviewed VS sliced thread capture, composite completeness and native follow-up
+results, memory chunk continuations, plus the revised IDA/kernel lifecycle
+boundaries. Found that VS stack collection/count exceptions were swallowed and
+converted to zero frames without marking the result partial. This affected both
+thread capture and fallback module scanning.
+
+Stack count capture now distinguishes a real empty stack from an unavailable
+collection. Both callers preserve thread metadata and report partial capture
+with a diagnostic when the count fails. Metadata-only capture still avoids
+reading the stack count. A controlled C# getter test proves that failure is
+distinct from zero and the getter is called once, without retry.
+
+Validation: 116 C# tests, 370 Python tests, diff checks and Release compilation
+passed. The initial build
+identified a missing UI-thread assertion inside the new getter lambda; that
+assertion was added before the successful rebuild. Real VS COM fault injection
+and deployment have not been performed. Clean-pass count remains zero.

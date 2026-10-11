@@ -2682,6 +2682,24 @@ namespace VSDebuggerMCP.Tests
         }
 
         [TestMethod]
+        public void ThreadFrameCountFailureIsDistinctFromAnEmptyStack()
+        {
+            Assert.IsTrue(ThreadCaptureBudget.TryCaptureFrameCount(() => 0, out int count, out string error));
+            Assert.AreEqual(0, count);
+            Assert.IsNull(error);
+
+            int reads = 0;
+            Assert.IsFalse(ThreadCaptureBudget.TryCaptureFrameCount(() =>
+            {
+                reads++;
+                throw new InvalidOperationException("COM stack query failed");
+            }, out count, out error));
+            Assert.AreEqual(1, reads);
+            Assert.AreEqual(0, count);
+            StringAssert.Contains(error, "COM stack query failed");
+        }
+
+        [TestMethod]
         public void CollectionCaptureBudgetsBoundHostileFieldsAndAggregateBytes()
         {
             string hostile = new string('x', 100000);

@@ -1,3 +1,4 @@
+using System;
 using System.Text;
 using System.Web.Script.Serialization;
 using VSDebuggerMCP.Protocol;
@@ -15,6 +16,22 @@ namespace VSDebuggerMCP.Services
 
         internal static string BoundField(string value, out bool truncated) =>
             OutputContentBudget.FitPrefix(value ?? string.Empty, MaxFieldBytes, out truncated);
+
+        internal static bool TryCaptureFrameCount(Func<int> readCount, out int count, out string error)
+        {
+            try
+            {
+                count = readCount();
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                count = 0;
+                error = "Stack frame count unavailable: " + exception.Message;
+                return false;
+            }
+        }
 
         internal bool TryConsumeThreadHeader(ThreadInfo thread)
         {

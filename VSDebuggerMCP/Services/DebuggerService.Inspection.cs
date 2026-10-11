@@ -666,6 +666,11 @@ namespace VSDebuggerMCP
                 }
 
                 ThreadInfo threadInfo = metadata.Thread;
+                if (!string.IsNullOrEmpty(metadata.Error))
+                {
+                    result.Partial = true;
+                    AddPartialReason(partialReasons, $"thread {threadInfo.Id}: {metadata.Error}");
+                }
                 if (!captureBudget.TryConsumeThreadHeader(threadInfo))
                 {
                     stoppedForPageBoundary = true;
@@ -854,12 +859,20 @@ namespace VSDebuggerMCP
                 // Keep the collection within this UI slice. A metadata-only
                 // thread list needs its top location, not a full stack depth.
                 EnvDTE.StackFrames stackFrames = null;
-                try { stackFrames = thread.StackFrames; } catch { }
                 int frameCount = 0;
+                string frameCountError = null;
                 if (includeFrameCount)
                 {
-                    try { frameCount = stackFrames?.Count ?? 0; } catch { }
+                    ThreadCaptureBudget.TryCaptureFrameCount(() =>
+                    {
+                        ThreadHelper.ThrowIfNotOnUIThread();
+                        stackFrames = thread.StackFrames;
+                        if (stackFrames == null)
+                            throw new InvalidOperationException("Stack frame collection unavailable");
+                        return stackFrames.Count;
+                    }, out frameCount, out frameCountError);
                 }
+                else try { stackFrames = thread.StackFrames; } catch { }
                 string location = string.Empty;
                 try
                 {
@@ -895,7 +908,8 @@ namespace VSDebuggerMCP
                         SuspendCount = thread.SuspendCount,
                         Truncated = nameTruncated || locationTruncated || priorityTruncated,
                     },
-                    FrameCount = frameCount
+                    FrameCount = frameCount,
+                    Error = frameCountError
                 };
             }
             catch (Exception ex)
@@ -1249,6 +1263,11 @@ namespace VSDebuggerMCP
                     capturePartial = true;
                     AddPartialReason(partialReasons, metadata?.Error ?? $"module thread index {threadIndex}: unavailable");
                     continue;
+                }
+                if (!string.IsNullOrEmpty(metadata.Error))
+                {
+                    capturePartial = true;
+                    AddPartialReason(partialReasons, $"module thread {metadata.Thread.Id}: {metadata.Error}");
                 }
                 if (scanSource != null && threadIndex == scanStartThreadIndex && scanStartFrameIndex > 0 &&
                     (metadata.Thread.Id != continuationThreadId || metadata.FrameCount != continuationFrameCount))
