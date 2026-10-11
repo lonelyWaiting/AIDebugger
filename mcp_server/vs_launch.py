@@ -211,11 +211,24 @@ def _load_persisted_launches() -> None:
             # pywin32's ACL validation raises pywintypes.error, which is not an OSError.
             logger.warning("Ignoring an untrusted launch record %s: %s", entry.name, exc)
             continue
+        file_process_id = int(match.group(1))
+        if not isinstance(payload, dict):
+            _delete_launch_record(file_process_id)
+            continue
+        if type(payload.get("schemaVersion")) is not int or payload["schemaVersion"] != LAUNCH_RECORD_SCHEMA_VERSION:
+            logger.warning("Ignoring unsupported launch record schema in %s", entry.name)
+            continue
         process_id = payload.get("processId")
         start_ticks = payload.get("processStartTimeUtcTicks")
         devenv_path = payload.get("devenvPath")
-        if not isinstance(process_id, int) or not isinstance(start_ticks, int) or not isinstance(devenv_path, str):
-            _delete_launch_record(int(match.group(1)))
+        capabilities = payload.get("requestedCapabilities")
+        if (type(process_id) is not int or process_id != file_process_id
+                or not 0 < process_id <= 0x7FFFFFFF
+                or type(start_ticks) is not int or start_ticks <= 0
+                or not isinstance(devenv_path, str) or not devenv_path.strip()
+                or not isinstance(capabilities, list)
+                or any(not isinstance(value, str) or not value for value in capabilities)):
+            _delete_launch_record(file_process_id)
             continue
         # A reused PID or an exited process must never look like an owned instance.
         state = _process_state(process_id)
@@ -228,7 +241,6 @@ def _load_persisted_launches() -> None:
         if not running or current_ticks != start_ticks:
             _delete_launch_record(process_id)
             continue
-        capabilities = payload.get("requestedCapabilities")
         _LAUNCHES[process_id] = LaunchRecord(
             process_id=process_id,
             launch_id=str(payload.get("launchId") or ""),
@@ -1173,7 +1185,15 @@ async def close_owned_instance(
             "closed": False,
             "errorCode": "STALE_TARGET",
         }
-    if not force and isinstance(debug_state, dict) and debug_state.get("isDebugging"):
+    if not force and (not isinstance(debug_state, dict) or type(debug_state.get("isDebugging")) is not bool):
+        return {
+            "success": False,
+            "message": f"Visual Studio PID {process_id} has no verified debugger status; close was not started. Query its status or explicitly request force=True.",
+            "processId": int(process_id),
+            "closed": False,
+            "errorCode": "DEBUG_STATE_UNAVAILABLE",
+        }
+    if not force and debug_state["isDebugging"]:
         return {
             "success": False,
             "message": (

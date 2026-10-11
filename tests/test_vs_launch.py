@@ -538,6 +538,34 @@ class RecordLivenessTests(unittest.TestCase):
 
 
 class CloseInstanceTests(unittest.TestCase):
+    def test_verified_idle_instance_can_close_without_force(self):
+        record = record_for()
+        vs_launch._LAUNCHES[4242] = record
+        def exit_process(args, **kwargs):
+            record.process.returncode = 0
+            return subprocess.CompletedProcess(args, 0, "", "")
+        with patch.object(vs_launch, "_process_image_name", return_value="devenv.exe"), patch.object(
+            vs_launch, "_process_start_time_utc_ticks", return_value=123456789
+        ), patch.object(vs_launch.subprocess, "run", side_effect=exit_process) as run:
+            result = asyncio.run(vs_launch.close_owned_instance(4242, debug_state={"isDebugging": False}))
+        self.assertTrue(result["closed"])
+        self.assertTrue(result["graceful"])
+        self.assertFalse(result["forced"])
+        self.assertEqual(run.call_count, 1)
+
+    def test_nonforced_close_requires_a_definitive_idle_debugger_receipt(self):
+        for state in (None, {}, {"isDebugging": None}, {"isDebugging": 0}):
+            with self.subTest(state=state):
+                vs_launch._LAUNCHES[4242] = record_for()
+                with patch.object(vs_launch, "_process_image_name", return_value="devenv.exe"), patch.object(
+                    vs_launch, "_process_start_time_utc_ticks", return_value=123456789
+                ), patch.object(vs_launch.subprocess, "run") as run:
+                    result = asyncio.run(vs_launch.close_owned_instance(4242, timeout_seconds=0, debug_state=state))
+                self.assertFalse(result["closed"])
+                self.assertEqual(result["errorCode"], "DEBUG_STATE_UNAVAILABLE")
+                self.assertIn(4242, vs_launch._LAUNCHES)
+                run.assert_not_called()
+
     def test_unavailable_process_identity_does_not_claim_close_or_discard_ownership(self):
         vs_launch._LAUNCHES[4242] = record_for(process=None)
         with patch.object(vs_launch, "_process_state", return_value=None), patch.object(
@@ -579,6 +607,13 @@ class CloseInstanceTests(unittest.TestCase):
     def setUp(self):
         self._launches = dict(vs_launch._LAUNCHES)
         self.addCleanup(self._restore_launches)
+        # Fake PID/state probes must never load or prune real launch receipts.
+        loader = patch.object(vs_launch, "_load_persisted_launches")
+        loader.start()
+        self.addCleanup(loader.stop)
+        deletion = patch.object(vs_launch, "_delete_launch_record")
+        deletion.start()
+        self.addCleanup(deletion.stop)
 
     def _restore_launches(self):
         vs_launch._LAUNCHES.clear()
@@ -924,6 +959,22 @@ class ToolContractTests(unittest.TestCase):
         self.assertEqual(result["errorCode"], "NOT_LAUNCHED_BY_MCP")
         self.assertFalse(result["closed"])
 
+    def test_close_tool_refuses_unknown_debugger_status_without_closing(self):
+        record = record_for(ready_instance=instance_payload(4242, processStartTimeUtcTicks=123456789,
+                            serverInstanceId="11111111111111111111111111111111"))
+        async def check():
+            with patch.object(vs_launch, "get_owned_launch", return_value=record), patch.object(
+                vs_bridge, "call_pipe_exact", AsyncMock(side_effect=VSBridgeError("status unavailable", code="PIPE_TIMEOUT"))
+            ), patch.object(vs_launch, "_process_image_name", return_value="devenv.exe"), patch.object(
+                vs_launch, "_process_start_time_utc_ticks", return_value=123456789
+            ), patch.object(vs_launch.subprocess, "run") as run:
+                response = await vs_server.mcp.call_tool("close_vs_instance", {"process_id": 4242})
+                run.assert_not_called()
+                return response
+        _, payload = self._call(check)
+        self.assertFalse(payload["result"]["closed"])
+        self.assertEqual(payload["result"]["errorCode"], "DEBUG_STATE_UNAVAILABLE")
+
     def test_both_tools_are_published_with_conservative_annotations(self):
         summary = vs_tool_registry.tool_registry_summary()
         support = summary["toolSupport"]
@@ -940,6 +991,36 @@ class ToolContractTests(unittest.TestCase):
 
 class PersistedLaunchRecordTests(unittest.TestCase):
     """The launch record the server writes must satisfy the same trust contract it validates."""
+
+    def test_malformed_receipts_cannot_block_or_replace_a_valid_owned_process(self):
+        import shutil
+        root = pathlib.Path(tempfile.mkdtemp()) / "launches"
+        root.mkdir()
+        self.addCleanup(shutil.rmtree, root.parent, True)
+        saved, loaded = dict(vs_launch._LAUNCHES), vs_launch._LAUNCHES_LOADED
+        def restore():
+            vs_launch._LAUNCHES.clear()
+            vs_launch._LAUNCHES.update(saved)
+            vs_launch._LAUNCHES_LOADED = loaded
+        self.addCleanup(restore)
+        valid = {"schemaVersion": 1, "processId": 4444, "processStartTimeUtcTicks": 123456789,
+                 "devenvPath": installation().devenv_path, "launchId": "good", "requestedCapabilities": ["debug.read"]}
+        cases = ([], None, "bad", dict(valid, launchId="wrong"),
+                 dict(valid, processId=4242, requestedCapabilities=[[]]),
+                 dict(valid, processId=4242, schemaVersion=2))
+        with patch.object(vs_launch, "_launches_root", return_value=root), patch.object(
+            vs_trust, "_validate_registration_security", lambda *args, **kwargs: None
+        ), patch.object(vs_launch, "_process_state", return_value=(123456789, True)):
+            for payload in cases:
+                with self.subTest(payload=payload):
+                    (root / "4242.json").write_text(json.dumps(payload), encoding="utf-8")
+                    (root / "4444.json").write_text(json.dumps(valid), encoding="utf-8")
+                    vs_launch._LAUNCHES.clear()
+                    vs_launch._LAUNCHES_LOADED = False
+                    owned = vs_launch.owned_launches()
+                    self.assertEqual(set(owned), {4444})
+                    self.assertEqual(owned[4444].launch_id, "good")
+                    self.assertTrue((root / "4444.json").is_file())
 
     def test_unavailable_identity_preserves_receipt_and_retries_loading(self):
         import shutil

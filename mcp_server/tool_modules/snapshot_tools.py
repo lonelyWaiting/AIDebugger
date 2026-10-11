@@ -12,6 +12,25 @@ except ImportError:
     from tool_context import *
 
 
+def _validate_step_capture_expressions(expressions: Optional[List[str]]) -> List[str]:
+    if expressions is None:
+        return []
+    if not isinstance(expressions, list) or len(expressions) > 100:
+        raise invalid_argument("expressions must be a list of at most 100 strings")
+    result = list(expressions)
+    for expression in result:
+        if not isinstance(expression, str) or not expression.strip():
+            raise invalid_argument("expressions must contain nonempty strings")
+        try:
+            # VS limits System.String.Length, which counts UTF-16 code units.
+            units = len(expression.encode("utf-16-le")) // 2
+        except UnicodeEncodeError as error:
+            raise invalid_argument("expressions must contain valid Unicode") from error
+        if units > 16 * 1024:
+            raise invalid_argument("each expression must contain at most 16384 UTF-16 code units")
+    return result
+
+
 def _normalize_nonzero_address_literal(value: Any) -> Optional[str]:
     """Return a protocol-safe address literal without evaluating an expression."""
     if value is None:
@@ -880,7 +899,7 @@ async def step_and_capture(
     }
     normalized = validate_enum("action", normalized, tuple(method_by_action))
 
-    normalized_expressions = expressions or []
+    normalized_expressions = _validate_step_capture_expressions(expressions)
     thread_params = add_thread_capture_params(
         {}, thread_include_frames, thread_max_frames_per_thread, thread_max_nodes, thread_budget_ms)
     tool_timeout = clamp_tool_timeout(timeout_seconds, DEBUG_BUNDLE_TIMEOUT_SECONDS)

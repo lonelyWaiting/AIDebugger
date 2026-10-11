@@ -1040,10 +1040,11 @@ asyncio.run(check())
             validate_int_range,
         )
 
-        for invalid in (0, -1, 301, "bad"):
-            with self.subTest(invalid=invalid), self.assertRaises(ToolError) as raised:
-                clamp_tool_timeout(invalid, 20)
-            self.assertIn('"code":"INVALID_ARGUMENT"', str(raised.exception))
+        for invalid in (0, -1, 301, "bad", float("nan"), float("inf"), -float("inf")):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ToolError) as raised:
+                    clamp_tool_timeout(invalid, 20)
+                self.assertIn('"code":"INVALID_ARGUMENT"', str(raised.exception))
         with self.assertRaises(ToolError):
             tool_timeout_for_budget(None, 20, -1)
         self.assertEqual(4, validate_int_range("depth", 4, 0, 8))
@@ -1591,6 +1592,19 @@ asyncio.run(check())
             with self.assertRaises(ToolError):
                 asyncio.run(self._tool(snapshot_tools.step_and_capture)(thread_budget_ms=-1))
             step.assert_not_awaited()
+
+    def test_invalid_step_snapshot_expressions_never_issue_the_step(self) -> None:
+        from mcp_server.tool_modules import snapshot_tools
+        from mcp_server.tool_context import ToolError
+        for expressions in (["x"] * 101, [" "], ["x" * 16385], ["\U0001f600" * 8193], [None]):
+            with self.subTest(case=(len(expressions), type(expressions[0]).__name__)), \
+                 mock.patch.object(snapshot_tools.ide_bridge, "call_with_target", mock.AsyncMock(
+                     return_value=({"success": True, "outcome": "step_completed"}, {"pipeName": "AIDebuggerVS_123"}))) as step, \
+                 mock.patch.object(snapshot_tools.vs_bridge, "call_pipe_exact", mock.AsyncMock(return_value={})) as capture:
+                with self.assertRaises(ToolError):
+                    asyncio.run(self._tool(snapshot_tools.step_and_capture)(expressions=expressions))
+                step.assert_not_awaited()
+                capture.assert_not_awaited()
 
     def test_step_without_observed_new_stop_does_not_capture_or_repeat(self) -> None:
         from mcp_server.tool_modules import snapshot_tools

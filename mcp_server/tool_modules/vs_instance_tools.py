@@ -438,7 +438,8 @@ async def close_vs_instance(
                         timeout=min(10.0, total_timeout),
                     )
                 except vs_bridge.VSBridgeError:
-                    # An unreachable instance has no debug session worth protecting here.
+                    # An unreachable instance may still own a live debuggee. The
+                    # close backend rejects unknown status unless force=True.
                     debug_state = None
                 if (
                     force

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import os
 import re
 from typing import Any, Dict, List, Optional
@@ -91,7 +92,7 @@ def clamp_tool_timeout(timeout_seconds: Optional[float], default_seconds: float)
         value = float(timeout_seconds)
     except (TypeError, ValueError) as exc:
         raise _invalid_argument("timeout_seconds must be a number") from exc
-    if value < 1.0 or value > MAX_TOOL_TIMEOUT_SECONDS:
+    if not math.isfinite(value) or value < 1.0 or value > MAX_TOOL_TIMEOUT_SECONDS:
         raise _invalid_argument(
             f"timeout_seconds must be between 1 and {MAX_TOOL_TIMEOUT_SECONDS:g}"
         )

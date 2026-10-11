@@ -87,3 +87,16 @@ Close also retains ownership and returns `PROCESS_STATE_UNAVAILABLE` when
 process/image queries cannot establish exit. It never reports successful close
 or escalates from an unknown state. Access denied remains unknown; a missing
 process object or a matching object's terminated exit code establishes exit.
+
+The subsequent correctness review reproduced and fixed four input/state issues:
+non-forced VS close now requires an explicitly idle debugger status and returns
+`DEBUG_STATE_UNAVAILABLE` if status cannot be obtained; persisted ownership
+records require an object, supported schema, matching filename/PID and typed
+identity/capabilities; step snapshots validate expression count, nonempty text
+and the VS UTF-16 length limit before issuing the step; tool timeout validation
+rejects NaN and infinities. Unknown record schemas are retained without granting
+ownership. Mock process-close tests cannot load/delete real launch receipts.
+Regression tests verify rejected requests do not call step/close, valid idle
+close still succeeds, and malformed records cannot block or replace a valid
+record. These are source/MCP routing and controlled-fixture tests, not live VS
+debuggee shutdown evidence.
