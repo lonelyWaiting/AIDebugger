@@ -646,7 +646,7 @@ namespace VSDebuggerMCP
                 {
                     int capturedIndex = threadIndex;
                     metadata = ExecuteOnMainThread(
-                        () => CaptureThreadMetadata(capturedIndex),
+                        () => CaptureThreadMetadata(capturedIndex, includeFrames),
                         DefaultMainThreadTimeoutMs);
                 }
                 catch (Exception ex)
@@ -840,7 +840,7 @@ namespace VSDebuggerMCP
         }
 
 
-        private ThreadMetadataCapture CaptureThreadMetadata(int threadIndex)
+        private ThreadMetadataCapture CaptureThreadMetadata(int threadIndex, bool includeFrameCount = true)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             try
@@ -851,20 +851,30 @@ namespace VSDebuggerMCP
                 {
                     return new ThreadMetadataCapture { Error = $"thread index {threadIndex}: unavailable" };
                 }
+                // Keep the collection within this UI slice. A metadata-only
+                // thread list needs its top location, not a full stack depth.
+                EnvDTE.StackFrames stackFrames = null;
+                try { stackFrames = thread.StackFrames; } catch { }
                 int frameCount = 0;
-                try { frameCount = thread.StackFrames?.Count ?? 0; } catch { }
+                if (includeFrameCount)
+                {
+                    try { frameCount = stackFrames?.Count ?? 0; } catch { }
+                }
                 string location = string.Empty;
                 try
                 {
-                    var topFrame = thread.StackFrames?.Item(1) as EnvDTE.StackFrame;
-                    if (topFrame != null && !IsSyntheticExecutionPointName(topFrame.FunctionName))
+                    var topFrame = stackFrames?.Item(1) as EnvDTE.StackFrame;
+                    string functionName = topFrame?.FunctionName;
+                    if (functionName != null && !IsSyntheticExecutionPointName(functionName))
                     {
-                        location = topFrame.FunctionName;
+                        location = functionName;
                     }
                 }
                 catch { }
+                int threadId = thread.ID;
+                var currentThread = debugger.CurrentThread;
                 string name = ThreadCaptureBudget.BoundField(
-                    thread.Name ?? $"Thread {thread.ID}",
+                    thread.Name ?? $"Thread {threadId}",
                     out bool nameTruncated);
                 string boundedLocation = ThreadCaptureBudget.BoundField(
                     location,
@@ -876,9 +886,9 @@ namespace VSDebuggerMCP
                 {
                     Thread = new ThreadInfo
                     {
-                        Id = thread.ID,
+                        Id = threadId,
                         Name = name,
-                        IsCurrent = debugger.CurrentThread != null && thread.ID == debugger.CurrentThread.ID,
+                        IsCurrent = currentThread != null && threadId == currentThread.ID,
                         IsFrozen = thread.IsFrozen,
                         Location = boundedLocation,
                         Priority = priority,

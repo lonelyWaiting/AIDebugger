@@ -277,11 +277,17 @@ async def wait_for_debugging_to_start(
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     last_status = status
     last_error = None
+    poll_delay = 0.0
     while True:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0.1:
             break
-        await asyncio.sleep(min(0.5, remaining))
+        # Probe immediately: the launch response can precede debugger activation
+        # by only a few milliseconds. Back off while pending, without a fixed
+        # half-second floor or a busy loop against the VS UI thread.
+        if poll_delay:
+            await asyncio.sleep(min(poll_delay, remaining))
+        poll_delay = min(0.25, poll_delay * 2) if poll_delay else 0.05
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0.1:
             break

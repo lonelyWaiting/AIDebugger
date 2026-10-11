@@ -845,12 +845,20 @@ async def step_and_capture(
     include_output: bool = False,
     include_exception: bool = False,
     timeout_seconds: Optional[float] = None,
+    include_threads: bool = True,
+    thread_include_frames: bool = False,
+    thread_max_frames_per_thread: Optional[int] = None,
+    thread_max_nodes: Optional[int] = None,
+    thread_budget_ms: Optional[int] = None,
 ) -> str:
     """
     Execute one step operation and capture a debug bundle at the new stop point.
 
     action accepts step_over, step_into, or step_out. Exception inspection is
     opt-in because the Visual Studio backend may evaluate exception expressions.
+    The current callstack is captured; other threads default to metadata only.
+    Set thread_include_frames=True for their frames, or include_threads=False
+    to omit the thread list. Thread capture limits apply to this same bundle.
     """
     normalized = (action or "step_over").strip().lower().replace("-", "_").replace(" ", "_")
     aliases = {
@@ -873,6 +881,8 @@ async def step_and_capture(
     normalized = validate_enum("action", normalized, tuple(method_by_action))
 
     normalized_expressions = expressions or []
+    thread_params = add_thread_capture_params(
+        {}, thread_include_frames, thread_max_frames_per_thread, thread_max_nodes, thread_budget_ms)
     tool_timeout = clamp_tool_timeout(timeout_seconds, DEBUG_BUNDLE_TIMEOUT_SECONDS)
     deadline = asyncio.get_running_loop().time() + tool_timeout
     try:
@@ -903,7 +913,11 @@ async def step_and_capture(
     bundle_error_code = None
     bundle_request_id = None
     bundle_outcome_unknown = False
-    if isinstance(step_result, dict) and step_result.get("success"):
+    if (isinstance(step_result, dict) and step_result.get("success")
+            and step_result.get("outcome") == "step_issued_break_not_observed"):
+        bundle_error = "Step was issued, but no new stop was observed; context capture was skipped. Do not repeat the step."
+        bundle_error_code = "STEP_STOP_NOT_OBSERVED"
+    elif isinstance(step_result, dict) and step_result.get("success"):
         try:
             bundle_timeout = remaining_tool_timeout(deadline, tool_timeout)
             if bundle_timeout is None:
@@ -919,10 +933,11 @@ async def step_and_capture(
                     "includeModules": include_modules,
                     "includeRegisters": include_registers,
                     "includeOutput": include_output,
-                    "includeThreads": True,
+                    "includeThreads": include_threads,
                     "includeException": include_exception,
                     "evaluationPolicy": "engine_default",
                 }
+                bundle_params.update(thread_params)
                 bundle_method = "capture_debug_bundle_safe" if use_vs_safe_backend(
                     normalized_expressions,
                     include_locals=include_locals,

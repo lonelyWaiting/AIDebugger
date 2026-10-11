@@ -74,6 +74,6 @@ def ida_close(session_id: str, save: bool = True) -> dict:
 
 if __name__ == "__main__":
     try:
-        serve(mcp)
+        serve(mcp, fast_tools={"ida_list_sessions"}, control_tools={"ida_close"})
     finally:
         sessions.shutdown()

@@ -969,15 +969,6 @@ def _sync_call_to_pipe(
         wintypes.LPVOID,
         wintypes.LPVOID,
     ]
-    kernel32.PeekNamedPipe.restype = wintypes.BOOL
-    kernel32.PeekNamedPipe.argtypes = [
-        wintypes.HANDLE,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        ctypes.POINTER(wintypes.DWORD),
-        wintypes.LPVOID,
-    ]
     kernel32.WriteFile.restype = wintypes.BOOL
     kernel32.WriteFile.argtypes = [
         wintypes.HANDLE,
@@ -1171,30 +1162,10 @@ def _sync_call_to_pipe(
                         outcome_unknown=True,
                     )
 
-                bytes_available = wintypes.DWORD()
-                peek_ok = kernel32.PeekNamedPipe(
-                    handle,
-                    None,
-                    0,
-                    None,
-                    ctypes.byref(bytes_available),
-                    None,
-                )
-                if not peek_ok:
-                    error = ctypes.get_last_error()
-                    if error == ERROR_BROKEN_PIPE:
-                        raise VSBridgeError("Pipe disconnected by server", code="PIPE_DISCONNECTED", outcome_unknown=True)
-                    raise VSBridgeError(
-                        f"Failed to peek pipe. Error: {error}",
-                        code="TRANSPORT_ERROR",
-                        outcome_unknown=True,
-                    )
-
-                if bytes_available.value == 0:
-                    time.sleep(min(0.02, max(0.0, remaining / 1000.0)))
-                    continue
-
-                to_read = min(buffer_size, bytes_available.value, expected_size - len(received))
+                # A pending byte-mode ReadFile wakes on incoming data. Polling
+                # PeekNamedPipe first imposed a 20ms sleep floor on each chunk.
+                # Keep the OVERLAPPED and buffer alive until completion/reap.
+                to_read = min(buffer_size, expected_size - len(received))
                 bytes_read = wintypes.DWORD()
                 read_overlapped, read_event = _create_overlapped(kernel32, outcome_unknown=True)
                 try:
@@ -1240,7 +1211,7 @@ def _sync_call_to_pipe(
 
                 if bytes_read.value == 0:
                     raise VSBridgeError("No data received from pipe", code="PIPE_DISCONNECTED", outcome_unknown=True)
-                received.extend(buffer.raw[:bytes_read.value])
+                received.extend(ctypes.string_at(buffer, bytes_read.value))
 
             return bytes(received)
 

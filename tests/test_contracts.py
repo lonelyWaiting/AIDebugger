@@ -268,7 +268,7 @@ print(json.dumps({
         for marker in (
             "remaining_timeout_ms",
             "WaitNamedPipeW",
-            "PeekNamedPipe",
+            "WaitForSingleObject",
             "_compute_timeouts",
             "ThreadPoolExecutor",
             "run_in_executor",
@@ -1557,7 +1557,7 @@ print(json.dumps({
 
         self.assertIn("remaining_tool_timeout", server_py)
         self.assertNotIn("return max(1.0, min(default_seconds, remaining))", server_py)
-        self.assertIn("await asyncio.sleep(min(0.5, remaining))", server_py)
+        self.assertIn("await asyncio.sleep(min(poll_delay, remaining))", server_py)
         self.assertIn("timeout=poll_timeout", server_py)
         self.assertNotIn("remaining_timeout = max(1.0, deadline", server_py)
         self.assertIn("deadline = asyncio.get_running_loop().time() + tool_timeout", crash_triage)
@@ -1674,7 +1674,7 @@ print(json.dumps({
         self.assertIn("IsSyntheticExecutionPointFrame", vs_service)
         self.assertIn("CaptureThreadFrame(", vs_service)
         self.assertIn("_sourceLocationAdapter.GetLocation(frame)", vs_service)
-        self.assertIn("!IsSyntheticExecutionPointName(topFrame.FunctionName)", vs_service)
+        self.assertIn("!IsSyntheticExecutionPointName(functionName)", vs_service)
         self.assertIn('StartsWith("[Execution point when dump was captured"', vs_service)
         self.assertNotIn('GetExpression("__FILE__")', vs_service)
         self.assertNotIn('GetExpression("__LINE__")', vs_service)

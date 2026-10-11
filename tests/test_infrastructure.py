@@ -1565,6 +1565,47 @@ asyncio.run(check())
             self.assertEqual("capture_debug_bundle", bundle_call.await_args.args[1])
             self.assertTrue(bundle_call.await_args.args[2]["includeException"])
 
+    def test_step_snapshot_bounds_other_threads_and_keeps_explicit_full_capture(self) -> None:
+        from mcp_server.tool_modules import snapshot_tools
+        target = {"pipeName": "AIDebuggerVS_123"}
+        with mock.patch.object(snapshot_tools.ide_bridge, "call_with_target", mock.AsyncMock(
+                return_value=({"success": True, "outcome": "step_completed"}, target))), \
+             mock.patch.object(snapshot_tools.vs_bridge, "call_pipe_exact", mock.AsyncMock(return_value={})) as capture:
+            asyncio.run(self._tool(snapshot_tools.step_and_capture)())
+            self.assertIs(capture.await_args.args[0], target)
+            self.assertTrue(capture.await_args.args[2]["includeThreads"])
+            self.assertFalse(capture.await_args.args[2]["threadIncludeFrames"])
+            asyncio.run(self._tool(snapshot_tools.step_and_capture)(
+                thread_include_frames=True, thread_max_frames_per_thread=8,
+                thread_max_nodes=64, thread_budget_ms=250))
+            params = capture.await_args.args[2]
+            self.assertTrue(params["threadIncludeFrames"])
+            self.assertEqual((params["threadMaxFramesPerThread"], params["threadMaxNodes"], params["threadBudgetMs"]), (8, 64, 250))
+            asyncio.run(self._tool(snapshot_tools.step_and_capture)(include_threads=False))
+            self.assertFalse(capture.await_args.args[2]["includeThreads"])
+
+    def test_invalid_step_snapshot_budget_never_issues_the_step(self) -> None:
+        from mcp_server.tool_modules import snapshot_tools
+        from mcp_server.tool_context import ToolError
+        with mock.patch.object(snapshot_tools.ide_bridge, "call_with_target", mock.AsyncMock()) as step:
+            with self.assertRaises(ToolError):
+                asyncio.run(self._tool(snapshot_tools.step_and_capture)(thread_budget_ms=-1))
+            step.assert_not_awaited()
+
+    def test_step_without_observed_new_stop_does_not_capture_or_repeat(self) -> None:
+        from mcp_server.tool_modules import snapshot_tools
+        issued = {"success": True, "commandIssued": True, "outcome": "step_issued_break_not_observed"}
+        with mock.patch.object(snapshot_tools.ide_bridge, "call_with_target", mock.AsyncMock(
+                return_value=(issued, {"pipeName": "AIDebuggerVS_123"}))) as step, \
+             mock.patch.object(snapshot_tools.vs_bridge, "call_pipe_exact", mock.AsyncMock()) as capture:
+            response = asyncio.run(self._tool(snapshot_tools.step_and_capture)())
+        payload = self._payload(response)
+        self.assertEqual(payload["step"], issued)
+        self.assertIsNone(payload["bundle"])
+        self.assertEqual(payload["bundleErrorCode"], "STEP_STOP_NOT_OBSERVED")
+        self.assertEqual(step.await_count, 1)
+        capture.assert_not_awaited()
+
     def test_crash_triage_reads_stack_from_captured_literal_register(self) -> None:
         from mcp_server.tool_modules import snapshot_tools
 

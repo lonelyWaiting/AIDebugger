@@ -131,6 +131,7 @@ def kernel_close(session_id: str) -> dict:
 
 if __name__ == "__main__":
     try:
-        serve(mcp)
+        serve(mcp, fast_tools={"kernel_list_sessions", "kernel_session_status", "kernel_job_status"},
+              control_tools={"kernel_interrupt", "kernel_close"})
     finally:
         sessions.shutdown()
