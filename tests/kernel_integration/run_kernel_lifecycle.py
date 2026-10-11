@@ -37,7 +37,14 @@ def main():
         duplicate = client.rpc("tools/call", {"name": "kernel_connect", "arguments": {"connection": f"net:key=4.3.2.1,port={port}"}})
         assert duplicate.get("isError"), duplicate
         report["duplicateEndpointRejected"] = True
-        closed = client.wait(client.call("kernel_close", session_id=remote["sessionId"]), timeout=6)
+        close_job = client.call("kernel_close", session_id=remote["sessionId"])
+        for tool, arguments in (("kernel_query", {"query": "modules"}),
+                                ("kernel_close", {}), ("kernel_interrupt", {})):
+            denied = client.rpc("tools/call", {"name": tool,
+                "arguments": {"session_id": remote["sessionId"], **arguments}})
+            assert denied.get("isError") and "SESSION_CLOSING" in json.dumps(denied), denied
+        report["closingRejectsCommandsInterruptAndDuplicateClose"] = True
+        closed = client.wait(close_job, timeout=6)
         report["closeReceipt"] = closed
         assert closed["state"] == "closed", closed
         end = time.monotonic() + 2

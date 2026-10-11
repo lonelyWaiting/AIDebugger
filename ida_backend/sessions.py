@@ -1,6 +1,7 @@
 """Owned IDA processes, one private database and endpoint per session."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -73,6 +74,7 @@ class IdaSessions:
         self.max_sessions = max_sessions
         self.sessions = {}
         self.lock = threading.RLock()
+        self._opening = 0
 
     def open(self, input_path, mode="headless"):
         if mode not in ("headless", "gui"):
@@ -87,8 +89,10 @@ class IdaSessions:
         if not executable.is_file():
             raise IdaError("IDA_NOT_FOUND", "Requested IDA executable is missing")
         with self.lock:
-            if sum(s.process.poll() is None for s in self.sessions.values()) >= self.max_sessions:
+            if sum(s.process.poll() is None for s in self.sessions.values()) + self._opening >= self.max_sessions:
                 raise IdaError("IDA_SESSION_LIMIT", "Close a session before opening another")
+            self._opening += 1
+        try:
             session_id = uuid.uuid4().hex
             directory = self.root / session_id
             directory.mkdir(parents=True)
@@ -123,8 +127,12 @@ class IdaSessions:
                                            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                            creationflags=flags)
             session = Session(session_id, str(source), sha256, mode, directory, process, token)
-            self.sessions[session_id] = session
+            with self.lock:
+                self.sessions[session_id] = session
             return session.describe()
+        finally:
+            with self.lock:
+                self._opening -= 1
 
     def get(self, session_id):
         with self.lock:
@@ -142,7 +150,7 @@ class IdaSessions:
         finally:
             session.lock.release()
 
-    def _status_locked(self, session):
+    def _status_locked(self, session, timeout=2):
         session_id = session.session_id
         with session.lock:
             if session.process.poll() is not None:
@@ -165,7 +173,7 @@ class IdaSessions:
                 raise IdaError("IDA_IDENTITY_MISMATCH", "Invalid worker registration")
             session.port = data["port"]
             try:
-                identity = tool_value(self._rpc_tool(session, "aidb_identity", {}, timeout=2))
+                identity = tool_value(self._rpc_tool(session, "aidb_identity", {}, timeout=timeout))
             except (OSError, TimeoutError):
                 session.state = "busy"
                 return session.describe()
@@ -191,18 +199,33 @@ class IdaSessions:
         return rpc(session.port, session.token, "tools/call",
                    {"name": name, "arguments": arguments}, timeout)
 
+    @contextmanager
+    def _operation_lock(self, session):
+        if not session.lock.acquire(blocking=False):
+            raise IdaError("IDA_BUSY_NOT_STARTED", "This session already has an operation; poll status",
+                           state="busy", requestStarted=False)
+        try:
+            yield
+        finally:
+            session.lock.release()
+
     def call(self, session_id, name, arguments=None, timeout=30):
         if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 120:
             raise IdaError("INVALID_ARGUMENT", "timeout must be between 0 and 120 seconds")
+        deadline = time.monotonic() + timeout
         session = self.get(session_id)
-        with session.lock:
-            status = self.status(session_id)
+        with self._operation_lock(session):
+            status = self._status_locked(session, timeout=min(2, timeout))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise IdaError("IDA_DEADLINE_EXCEEDED_NOT_STARTED", "Identity preflight exhausted the request budget",
+                               requestStarted=False)
             if status["state"] != "ready":
                 raise IdaError("IDA_NOT_READY", "Poll ida_session_status before using this session", state=status["state"])
             if name in ("aidb_close", "aidb_identity"):
                 raise IdaError("INVALID_ARGUMENT", "Use the lifecycle tools for this operation")
             try:
-                return self._rpc_tool(session, name, arguments or {}, timeout)
+                return self._rpc_tool(session, name, arguments or {}, remaining)
             except (OSError, TimeoutError) as error:
                 # The command may still be executing. Never restart or replay it.
                 raise IdaError("IDA_OUTCOME_UNKNOWN", "Transport lost while IDA may still be executing; do not retry mutations",
@@ -212,16 +235,17 @@ class IdaSessions:
         if not 0 <= offset or not 1 <= count <= 100:
             raise IdaError("INVALID_ARGUMENT", "offset >= 0 and count in 1..100 required")
         session = self.get(session_id)
-        if self.status(session_id)["state"] != "ready":
-            raise IdaError("IDA_NOT_READY", "Session is not ready")
-        data = rpc(session.port, session.token, "tools/list")
+        with self._operation_lock(session):
+            if self._status_locked(session)["state"] != "ready":
+                raise IdaError("IDA_NOT_READY", "Session is not ready")
+            data = rpc(session.port, session.token, "tools/list")
         tools = [t for t in data["tools"] if not t["name"].startswith("aidb_")]
         return {"tools": tools[offset:offset+count], "total": len(tools),
                 "nextOffset": offset+count if offset+count < len(tools) else None}
 
     def close(self, session_id, save=True):
         session = self.get(session_id)
-        with session.lock:
+        with self._operation_lock(session):
             state = self.status(session_id)["state"]
             if state in ("closed", "exited", "closing"):
                 return session.describe()

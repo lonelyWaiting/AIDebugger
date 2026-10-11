@@ -33,7 +33,7 @@ def translate(function):
 @mcp.tool
 @translate
 def ida_open(input_path: str, mode: str = "headless") -> dict:
-    """Open a binary or saved IDB in an owned IDA process. Returns immediately; poll ida_session_status. Default has no GUI."""
+    """Copy and verify a binary or saved IDB, then launch owned IDA. Poll ida_session_status for analysis readiness. Other sessions remain available during input preparation. Default has no GUI."""
     return sessions.open(input_path, mode)
 
 
@@ -61,7 +61,7 @@ def ida_list_tools(session_id: str, offset: int = 0, count: int = 30) -> dict:
 @mcp.tool
 @translate
 def ida_call_tool(session_id: str, tool: str, arguments: dict, timeout_seconds: float = 30) -> dict:
-    """Call a discovered IDA operation against an explicit DLL/IDB session. Preserves upstream content, structuredContent and isError. Mutations are never retried. VS and IDA cannot simultaneously attach to the same PID."""
+    """Call a discovered IDA operation against an explicit DLL/IDB session. Timeout includes identity preflight. Busy same-session calls return IDA_BUSY_NOT_STARTED without queueing. Preserves upstream content, structuredContent and isError. Mutations are never retried. VS and IDA cannot simultaneously attach to the same PID."""
     return sessions.call(session_id, tool, arguments, timeout_seconds)
 
 

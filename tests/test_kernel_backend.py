@@ -9,6 +9,7 @@ import tempfile
 import threading
 import tomllib
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from kernel_backend.contracts import KernelError, capabilities, connection_identity, query_command, validate_operation
@@ -113,6 +114,47 @@ class SupervisorTests(unittest.TestCase):
         self.session = Session("one", "remote", True, {"kind": "remote"}, self.process, status={"state": "paused"})
         self.manager.sessions["one"] = self.session
 
+    def test_short_job_wait_releases_lock_and_wakes_on_native_reply(self):
+        receipt = self.manager.submit("one", "query", {"query": "registers", "arguments": {}})
+        waiting = threading.Event()
+        finished = threading.Event()
+        result = []
+        real_wait = self.session.changed.wait
+        def wait(timeout=None):
+            waiting.set()
+            return real_wait(timeout)
+        def poll():
+            result.append(self.manager.job("one", receipt["jobId"], wait_ms=50))
+            finished.set()
+        with patch.object(self.session.changed, "wait", side_effect=wait):
+            thread = threading.Thread(target=poll)
+            thread.start()
+            self.assertTrue(waiting.wait(1))
+            self.process.stdout = io.BytesIO((json.dumps({"id": receipt["jobId"], "result": {"state": "paused"}}) + "\n").encode())
+            self.manager._read(self.session)
+            self.assertTrue(finished.wait(1))
+            thread.join(1)
+        self.assertEqual(result[0]["state"], "complete")
+
+    def test_short_job_wait_is_bounded_and_does_not_repeat_mutation(self):
+        receipt = self.manager.submit("one", "control", {"action": "step_into"})
+        sent = self.process.stdin.getvalue()
+        with patch.object(self.session.changed, "wait_for", return_value=False) as waiter:
+            self.assertEqual(self.manager.job("one", receipt["jobId"], wait_ms=10)["state"], "running")
+            self.assertEqual(waiter.call_args.kwargs["timeout"], .01)
+        self.assertEqual(self.process.stdin.getvalue(), sent)
+        for invalid in (True, -1, 51, 1.5):
+            with self.assertRaises(KernelError):
+                self.manager.job("one", receipt["jobId"], wait_ms=invalid)
+
+    def test_fresh_event_sequence_survives_bounded_history(self):
+        messages = [{"status": {"state": "paused"}, "eventOutput": {"output": str(i)}} for i in range(12)]
+        messages.append({"status": {"state": "paused"}})  # Query/ack is not a new stop.
+        self.process.stdout = io.BytesIO(b"".join((json.dumps(m) + "\n").encode() for m in messages))
+        self.manager._read(self.session)
+        self.assertEqual(self.manager.status("one")["eventSequence"], 12)
+        self.assertEqual(len(self.session.events), 8)
+
     def test_missing_session_does_not_fall_back(self):
         with self.assertRaises(KernelError):
             self.manager.submit("other", "query", {"query": "modules", "arguments": {}})
@@ -125,6 +167,18 @@ class SupervisorTests(unittest.TestCase):
         interrupt = self.manager.interrupt("one")
         self.assertNotEqual(interrupt["jobId"], receipt["jobId"])
         self.assertEqual(self.session.active, receipt["jobId"])
+
+    def test_pending_interrupts_reserve_capacity_for_close(self):
+        self.manager.MAX_JOBS = 3
+        self.manager.submit("one", "control", {"action": "continue"})
+        self.manager.interrupt("one")
+        with self.assertRaises(KernelError) as error:
+            self.manager.interrupt("one")
+        self.assertEqual(error.exception.code, "JOB_LIMIT")
+        with patch("kernel_backend.sessions.threading.Thread"):
+            closed = self.manager.submit("one", "close", {})
+        self.assertEqual(len(self.session.jobs), 3)
+        self.assertEqual(self.session.close_job, closed["jobId"])
 
     def test_running_status_never_allows_queries(self):
         self.session.status["state"] = "running"
@@ -183,6 +237,99 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(self.manager.job("one", "close")["result"]["nativeCloseConfirmed"])
         self.process.terminate.assert_not_called()
 
+    def test_close_remains_terminal_after_late_operation_reply(self):
+        self.session.jobs["old"] = {"state": "running", "operation": "query", "started": 0}
+        self.session.active = "old"
+        with patch("kernel_backend.sessions.threading.Thread"):
+            closed = self.manager.submit("one", "close", {})
+        messages = [{"id": "old", "result": {"state": "paused"}},
+                    {"status": {"state": "paused"}}]
+        self.process.stdout = io.BytesIO(b"".join(json.dumps(m).encode() + b"\n" for m in messages))
+        self.manager._read(self.session)
+        self.assertEqual(self.session.status["state"], "closing")
+        for operation in ("close", "query"):
+            with self.assertRaises(KernelError) as error:
+                self.manager.submit("one", operation, {} if operation == "close" else {"query": "modules", "arguments": {}})
+            self.assertEqual(error.exception.code, "SESSION_CLOSING")
+        with self.assertRaises(KernelError):
+            self.manager.interrupt("one")
+        self.manager._close_watchdog(self.session, closed["jobId"])
+        self.assertEqual(self.session.status["state"], "closed")
+
+    def test_close_pipe_failure_still_schedules_owned_worker_cleanup(self):
+        self.process.stdin = Mock()
+        self.process.stdin.write.side_effect = BrokenPipeError()
+        with patch("kernel_backend.sessions.threading.Thread") as thread:
+            with self.assertRaises(KernelError):
+                self.manager.submit("one", "close", {})
+            thread.return_value.start.assert_called_once()
+        self.assertEqual(self.session.status["state"], "closing")
+
+    def test_close_job_waits_for_watchdog_receipt_on_eof_or_native_error(self):
+        for messages in ([], [{"error": {"code": "DBGENG_ERROR", "message": "EndSession failed"}}]):
+            with self.subTest(messages=messages):
+                self.session.close_job = None
+                self.session.active = None
+                with patch("kernel_backend.sessions.threading.Thread"):
+                    closed = self.manager.submit("one", "close", {})
+                self.process.stdout = io.BytesIO(b"".join(
+                    json.dumps({"id": closed["jobId"], **m}).encode() + b"\n" for m in messages))
+                self.manager._read(self.session)
+                self.assertEqual(self.manager.job("one", closed["jobId"])["state"], "running")
+                self.manager._close_watchdog(self.session, closed["jobId"])
+                receipt = self.manager.job("one", closed["jobId"])
+                self.assertEqual(receipt["state"], "complete")
+                self.assertFalse(receipt["result"]["nativeCloseConfirmed"])
+                if messages:
+                    self.assertEqual(receipt["result"]["nativeCloseError"]["code"], "DBGENG_ERROR")
+
+    def test_unknown_pipe_outcome_invalidates_cached_snapshot(self):
+        self.process.stdin = Mock()
+        self.process.stdin.write.side_effect = BrokenPipeError()
+        with self.assertRaises(KernelError):
+            self.manager.submit("one", "command", {"command": "bp nt!Foo"})
+        self.assertFalse(self.manager.status("one")["snapshotStable"])
+
+    def test_late_status_cannot_restore_snapshot_after_pipe_failure(self):
+        self.process.stdin = Mock()
+        self.process.stdin.write.side_effect = BrokenPipeError()
+        with self.assertRaises(KernelError):
+            self.manager.submit("one", "command", {"command": "bp nt!Foo"})
+        # Inspect state immediately before EOF cleanup would mask the race.
+        snapshots = []
+        def replies():
+            yield b'{"status":{"state":"paused"}}\n'
+            snapshots.append(self.manager.status("one"))
+        self.process.stdout = replies()
+        self.manager._read(self.session)
+        self.assertFalse(snapshots[0]["snapshotStable"])
+
+    def test_exited_worker_never_reports_cached_pause_as_stable(self):
+        self.process.poll.return_value = 1
+        status = self.manager.status("one")
+        self.assertFalse(status["snapshotStable"])
+        self.assertEqual(status["state"], "disconnected")
+
+    def test_failed_startup_has_no_permanently_running_job(self):
+        process = Mock()
+        process.poll.return_value = None
+        process.stdin.write.side_effect = BrokenPipeError()
+        with patch("kernel_backend.sessions.subprocess.Popen", return_value=process), \
+                patch("kernel_backend.sessions.threading.Thread"):
+            with self.assertRaises(KernelError):
+                self.manager.open("remote", connection="net:port=50001,key=secret")
+        failed = next(s for s in self.manager.sessions.values() if s is not self.session)
+        self.assertEqual(failed.status["state"], "failed")
+        self.assertTrue(all(j["state"] == "failed" for j in failed.jobs.values()))
+        self.assertIsNone(failed.active)
+
+    def test_interrupt_requires_real_boolean(self):
+        self.session.full_access = False
+        for value in ("false", 1, [], None):
+            with self.assertRaises(KernelError):
+                self.manager.interrupt("one", exit_wait=value)
+        self.assertEqual(self.process.stdin.getvalue(), b"")
+
     def test_user_dump_rejected_before_spawning(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "user.dmp"
@@ -199,6 +346,63 @@ class SupervisorTests(unittest.TestCase):
                 self.manager.open("remote", connection="net:key=different,port=50000")
             popen.assert_not_called()
         self.assertNotIn("secret", json.dumps(self.manager.status("one")))
+
+
+class WorkerSchedulingTests(unittest.TestCase):
+    def run_worker(self, running=False):
+        from kernel_backend import worker
+        import queue
+        ready, waited = threading.Event(), threading.Event()
+        timeline = []
+        engine = Mock()
+        engine.output.result.return_value = {"output": "", "truncated": False}
+        def open_engine(config):
+            ready.set()
+            return {"state": "running" if running else "paused"}
+        engine.open.side_effect = open_engine
+        engine.status.return_value = {"state": "paused"}
+        engine.wait.side_effect = lambda: (timeline.append("wait"), waited.set())
+        real_queue = queue.Queue
+        class RecordingQueue(real_queue):
+            def get(self, *args, **kwargs):
+                timeline.append("get")
+                return super().get(*args, **kwargs)
+        config = {"mode": "remote", "connection": "net:port=50000,key=secret",
+                  "full_access": True, "open_id": "open"}
+        def lines():
+            yield json.dumps(config).encode()
+            ready.wait(1)
+            if running:
+                waited.wait(1)
+            else:
+                waited.wait(0.2)  # Observe a genuinely idle interval.
+            yield b'{"id":"close","operation":"close","arguments":{}}'
+        output = io.BytesIO()
+        threads = []
+        real_thread = threading.Thread
+        def start_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            threads.append(thread)
+            return thread
+        with patch.object(worker, "raw_lines", lines), patch.object(worker, "Engine", return_value=engine), \
+                patch.object(worker.sys, "stdout", SimpleNamespace(buffer=output)), \
+                patch.object(worker.queue, "Queue", RecordingQueue), patch.object(worker.threading, "Timer"), \
+                patch.object(worker.threading, "Thread", side_effect=start_thread):
+            worker.run()
+            for thread in threads:
+                thread.join(1)
+                self.assertFalse(thread.is_alive())
+        self.assertIn(b'"state": "closed"', output.getvalue())
+        return engine, timeline
+
+    def test_paused_worker_has_no_periodic_native_status_calls(self):
+        engine, timeline = self.run_worker()
+        engine.status.assert_not_called()
+
+    def test_running_worker_enters_native_wait_before_queue_poll(self):
+        engine, timeline = self.run_worker(running=True)
+        self.assertEqual(timeline[0], "wait")
+        engine.wait.assert_called_once()
 
 
 class InstallerTests(unittest.TestCase):

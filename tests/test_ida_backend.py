@@ -21,6 +21,85 @@ from ida_backend.stdio import serve
 from tools import install_aidebugger as installer
 
 
+class DebugContextTests(unittest.TestCase):
+    def setUp(self):
+        from ida_backend.debug_context import collect_context
+        from functools import wraps
+        self.collect = lambda debugger, api, **limits: collect_context(debugger, api, self.idd, self.names, **limits)
+        self.debugger = Mock()
+        self.debugger.get_current_thread.return_value = 17
+        self.debugger.get_thread_qty.return_value = 3
+        self.debugger.getn_thread.side_effect = lambda i: 17 + i
+        self.trace = [SimpleNamespace(callea=0x1000), SimpleNamespace(callea=0x2000)]
+        self.idd = SimpleNamespace(call_stack_t=lambda: list(self.trace), modinfo_t=lambda: SimpleNamespace(name="test.dll"))
+        self.names = SimpleNamespace(get_nice_colored_name=Mock(return_value="frame"),
+                                     GNCN_NOCOLOR=1, GNCN_NOLABEL=2, GNCN_NOSEG=4, GNCN_PREFDBG=8)
+        self.debugger.collect_stack_trace.return_value = True
+        self.debugger.get_module_info.return_value = True
+        def forbidden_wrapper(function):
+            @wraps(function)
+            def wrapped():
+                raise AssertionError("nested synchronization")
+            return wrapped
+        self.api = SimpleNamespace(dbg_ensure_suspended=Mock(),
+            _get_debug_state_result=Mock(return_value={"suspended": True, "ip": "0x1000"}),
+            dbg_regs=forbidden_wrapper(lambda: {"thread_id": 17, "registers": [{"name": "RIP", "value": "0x1000"}]}),
+            dbg_stacktrace=forbidden_wrapper(lambda: [{"addr": "0x1000"}, {"addr": "0x2000"}]))
+
+    def test_bundle_is_bounded_and_runs_without_nested_sync(self):
+        value = self.collect(self.debugger, self.api, max_threads=2, max_frames=1)
+        self.assertTrue(value["snapshotStable"])
+        self.assertEqual(value["threads"], [17, 18])
+        self.assertTrue(value["threadsTruncated"])
+        self.assertTrue(value["stackTruncated"])
+        self.assertEqual(len(value["stack"]), 1)
+        self.api.dbg_ensure_suspended.assert_called_once_with()
+
+    def test_changed_stop_and_missing_ip_are_unstable(self):
+        for after in ({"suspended": True, "ip": "0x2000"}, {"running": True}, {"suspended": True}):
+            self.api._get_debug_state_result.side_effect = [{"suspended": True, "ip": "0x1000"}, after]
+            self.assertFalse(self.collect(self.debugger, self.api)["snapshotStable"])
+
+    def test_running_debugger_cannot_return_cached_context(self):
+        self.api.dbg_ensure_suspended.side_effect = RuntimeError("running")
+        with self.assertRaisesRegex(RuntimeError, "running"):
+            self.collect(self.debugger, self.api)
+        self.debugger.get_current_thread.assert_not_called()
+
+    def test_empty_stack_has_explicit_unavailable_status(self):
+        self.debugger.collect_stack_trace.return_value = False
+        self.assertEqual(self.collect(self.debugger, self.api)["stackStatus"], "unavailable")
+
+    def test_deep_stack_symbol_resolution_stops_at_requested_bound(self):
+        self.trace = [SimpleNamespace(callea=0x1000 + i) for i in range(10000)]
+        value = self.collect(self.debugger, self.api, max_frames=2)
+        self.assertEqual(len(value["stack"]), 2)
+        self.assertTrue(value["stackTruncated"])
+        self.assertEqual(self.names.get_nice_colored_name.call_count, 2)
+        self.assertEqual(self.debugger.get_module_info.call_count, 2)
+        self.debugger.collect_stack_trace.assert_called_once_with(17, self.trace)
+
+    def test_native_stack_failure_preserves_registers_with_explicit_error(self):
+        self.debugger.collect_stack_trace.side_effect = RuntimeError("unwind failure")
+        value = self.collect(self.debugger, self.api)
+        self.assertEqual(value["stackStatus"], "unavailable")
+        self.assertEqual(value["stackError"], "unwind failure")
+        self.assertTrue(value["registers"]["registers"])
+        self.assertTrue(value["snapshotStable"])
+
+    def test_symbol_failure_is_retained_per_frame(self):
+        self.names.get_nice_colored_name.side_effect = RuntimeError("symbol failure")
+        value = self.collect(self.debugger, self.api, max_frames=1)
+        self.assertEqual(value["stack"][0]["symbol"], "symbol failure")
+        self.assertEqual(value["stack"][0]["module"], "<error>")
+
+    def test_invalid_bounds_do_not_touch_native_debugger(self):
+        for value in (True, 0, 129, 1.5):
+            with self.assertRaises(ValueError):
+                self.collect(self.debugger, self.api, max_threads=value)
+        self.api.dbg_ensure_suspended.assert_not_called()
+
+
 class IdaLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT / ".tmp")
@@ -76,6 +155,102 @@ class IdaLifecycleTests(unittest.TestCase):
     def test_list_does_not_probe_other_session(self):
         with patch.object(self.manager, "_rpc_tool", side_effect=AssertionError):
             self.assertEqual(len(self.manager.list()), 1)
+
+    def test_busy_call_rejected_without_occupying_another_rpc_worker(self):
+        held, release, finished = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        def hold():
+            with self.session.lock:
+                held.set()
+                release.wait(2)
+        def call():
+            try:
+                self.manager.call("target", "patch", {})
+            except IdaError as error:
+                errors.append(error.payload)
+            finally:
+                finished.set()
+        holder = threading.Thread(target=hold)
+        caller = threading.Thread(target=call)
+        with patch.object(self.manager, "_rpc_tool", return_value=self.result(self.identity)) as rpc:
+            holder.start()
+            try:
+                self.assertTrue(held.wait(1))
+                caller.start()
+                self.assertTrue(finished.wait(0.2), "Busy calls must not wait behind the session lock")
+                self.assertEqual(errors[0]["code"], "IDA_BUSY_NOT_STARTED")
+                self.assertFalse(errors[0]["requestStarted"])
+                rpc.assert_not_called()
+            finally:
+                release.set()
+                holder.join(1)
+                if caller.ident is not None:
+                    caller.join(1)
+
+    def test_open_copy_does_not_block_existing_session_listing(self):
+        (self.directory / "idat.exe").touch()
+        source = self.directory / "input.dll"
+        source.write_bytes(b"input")
+        copying, release, listed = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        original_copy = __import__("shutil").copy2
+        def copy(*args):
+            copying.set()
+            release.wait(2)
+            return original_copy(*args)
+        def open_session():
+            try:
+                self.manager.open(source)
+            except Exception as error:
+                errors.append(error)
+        def list_sessions():
+            self.manager.list()
+            listed.set()
+        opener, lister = threading.Thread(target=open_session), threading.Thread(target=list_sessions)
+        with patch("ida_backend.sessions.find_ida", return_value=self.directory), \
+                patch("ida_backend.sessions.shutil.copy2", side_effect=copy), \
+                patch("ida_backend.sessions.subprocess.Popen", return_value=self.process):
+            opener.start()
+            try:
+                self.assertTrue(copying.wait(1))
+                lister.start()
+                self.assertTrue(listed.wait(0.2), "Input copy must not hold the global session lock")
+                self.manager.max_sessions = 2
+                with self.assertRaisesRegex(IdaError, "IDA_SESSION_LIMIT"):
+                    self.manager.open(source)
+            finally:
+                release.set()
+                opener.join(2)
+                if lister.ident is not None:
+                    lister.join(1)
+        self.assertEqual(errors, [])
+
+    def test_failed_open_releases_reserved_capacity(self):
+        (self.directory / "idat.exe").touch()
+        source = self.directory / "input.dll"
+        source.write_bytes(b"input")
+        self.manager.max_sessions = 2
+        with patch("ida_backend.sessions.find_ida", return_value=self.directory), \
+                patch("ida_backend.sessions.shutil.copy2", side_effect=OSError("copy failed")):
+            for _ in range(2):
+                with self.assertRaisesRegex(OSError, "copy failed"):
+                    self.manager.open(source)
+        self.assertEqual(self.manager._opening, 0)
+
+    def test_identity_preflight_charged_to_total_tool_deadline(self):
+        with patch("ida_backend.sessions.time.monotonic", side_effect=[100, 100.1]), \
+                patch.object(self.manager, "_rpc_tool", return_value=self.result(self.identity)) as rpc:
+            self.manager.call("target", "patch", {}, timeout=0.25)
+        self.assertEqual(rpc.call_count, 2)
+        self.assertEqual(rpc.call_args_list[0].kwargs["timeout"], 0.25)
+        self.assertAlmostEqual(rpc.call_args_list[1].args[-1], 0.15)
+
+    def test_expired_preflight_never_dispatches_mutation(self):
+        with patch("ida_backend.sessions.time.monotonic", side_effect=[100, 101]), \
+                patch.object(self.manager, "_rpc_tool", return_value=self.result(self.identity)) as rpc:
+            with self.assertRaisesRegex(IdaError, "IDA_DEADLINE_EXCEEDED_NOT_STARTED"):
+                self.manager.call("target", "patch", {}, timeout=0.25)
+        self.assertEqual(rpc.call_count, 1)
 
     def test_mutation_timeout_unknown_never_retried(self):
         with patch.object(self.manager, "_rpc_tool", side_effect=[self.result(self.identity), TimeoutError]) as rpc:

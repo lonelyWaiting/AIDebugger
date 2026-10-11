@@ -122,6 +122,47 @@ target is preserved if its client disappears.
 
 ## Validation
 
+### Request admission and performance validation (2026-10-10)
+
+Input copy/hash verification runs outside the global session lock. A reserved
+opening slot still enforces the session limit and is released on startup failure.
+Calls, tool discovery and close do not queue behind another operation on the same
+session: they return `IDA_BUSY_NOT_STARTED` with `requestStarted=false`. Poll
+status before explicitly submitting another operation; mutations are never
+automatically retried. Every accepted tool call still validates the live worker,
+input hash and database identity. `timeout_seconds` includes that preflight;
+`IDA_DEADLINE_EXCEEDED_NOT_STARTED` means no tool command was dispatched.
+
+The real IDA/stdio contention probe starts two independent headless IDA sessions
+on isolated system DLL copies. A one-second `py_eval` sleep occupies one owner
+thread while eight same-session read-only calls arrive. Three trials alternate
+baseline/current order; medians below exclude startup and do not measure analysis
+throughput or VS performance.
+
+| Operation under contention | `5e58ec7` baseline | Current source |
+|---|---:|---:|
+| Enumerate sessions | 1023.712 ms | 2.768 ms |
+| Other session's actual `server_health` | 1026.783 ms | 33.873 ms |
+
+All 24 overlapping calls in current-source trials were explicitly rejected
+before starting, rather than reported as completed queries. Source hashes were
+preserved and all owned workers exited. Report:
+`.tmp/performance/ida-contention-3trials.json`. Reproduce with:
+
+```powershell
+python tests/ida_integration/run_ida_performance.py --compare-ref 5e58ec7 `
+    --report .tmp/performance/ida-contention.json
+```
+
+Seven new portable regressions cover global-lock isolation, opening reservations,
+nonblocking same-session admission, preflight deadlines and kernel owner-thread
+scheduling. Six behavior tests fail against the old implementations and pass
+against current source. Final full suite: **327 tests passed**. Real headless IDA
+smoke also passed decompilation, isolated patch/export, save/reopen and unchanged
+source hashes (`.tmp/ida-smoke/1791632610186711200/evidence.json`). No active VS
+instance was available; no VS latency improvement or live kernel step timing is
+claimed. Installed client configuration/runtime was not updated.
+
 ```powershell
 python -m unittest discover -s tests -p "test_*.py"
 python tests/ida_integration/run_ida_smoke.py
@@ -133,6 +174,84 @@ python tests/ida_integration/run_dual_mcp_smoke.py
 python tests/ida_integration/run_dual_mcp_smoke.py --launch-vs
 python tests/ida_integration/run_dual_mcp_smoke.py --debug-vs
 ```
+
+### Common debugger operations (2026-10-10)
+
+Discover `debugger_context` through `ida_list_tools`, then invoke it through
+`ida_call_tool`. It reads paused status, bounded thread IDs, current registers
+and stack within one owning-thread operation and one live identity preflight.
+It does not resume the target or cache state. `max_threads` defaults to 128 and
+`max_frames` to 64. Thread enumeration and stack symbol/module resolution stop
+at these bounds; stack unwinding still uses IDA's native collector. Check
+`snapshotStable`, `stackStatus`, `stackError` and truncation fields. Missing
+stack evidence is explicitly unavailable. A running debugger is rejected.
+
+`tests/run_debug_performance.py` builds and launches only its own C++ fixture,
+runs to its exported probe, and measures fresh source MCP stdio requests.
+Step timings separately record acknowledgement and a subsequent suspended IP
+different from the pre-step IP. This controlled loop does not stand in for
+stepping over expensive application calls, source-line stepping or kernel steps.
+Context comparisons pair and alternate the two paths at the same native pause:
+three separate status/register/stack requests versus the bundle, which also
+includes thread IDs and consistency checks. Registers for all threads, selected
+registers, stack and 64-byte memory reads are measured separately. Reports retain
+raw samples, medians, nearest-rank p95, actual stop addresses and tool schemas.
+
+Final isolated rerun: 30 samples per operation, milliseconds including stdio,
+live identity preflight and completed-result observation:
+
+| Operation | Median | p95 |
+|---|---:|---:|
+| Status + registers + stack as three requests | 57.810 | 92.654 |
+| `debugger_context` (also thread IDs/consistency) | 30.659 | 46.839 |
+| Current-thread registers | 27.280 | 34.490 |
+| Registers for all fixture threads | 30.190 | 47.095 |
+| Stack | 21.879 | 42.823 |
+| Read 64 bytes | 19.909 | 39.672 |
+| Instruction step into: fresh stop observed | 44.493 | 62.948 |
+| Instruction step over: fresh stop observed | 37.328 | 64.669 |
+
+Report: `.tmp/performance/ida-common-final.json`. Scheduling variation is visible
+across reruns; the bundle reduces round trips, but no improvement in native
+instruction execution time is claimed. The full suite passed **335 tests**,
+including five context regressions; real native context and 60 total steps
+passed after the final worker import change. GUI IDA remains an unrun gate.
+
+Further review found that the first bundle implementation sliced only after
+resolving every stack frame. The collector now resolves module/symbol context
+only for the requested frame count. A 10,000-frame portable regression requests
+two frames and verifies exactly two module and symbol lookups. Native unwind
+failure retains registers and returns `stackStatus="unavailable"` plus its
+`stackError`; individual symbol failures remain explicit in the affected frame.
+
+A frozen source snapshot and the revised source each completed 30 measurements
+on an owned recursive fixture. IDA actually unwound only two frames here, so
+this is not proof of a complete 32-level native stack. With `max_frames=1`,
+30 native helper calls performed 60 versus 30 module lookups; helper median was
+0.827 versus 0.748 ms (p95 1.567 versus 1.261 ms). This excludes transport and
+includes profiling overhead. End-to-end latency remains sensitive to scheduling;
+the much larger differences between individual runs are not attributed to this
+small reduction in native work. Reports:
+`.tmp/performance/stack-bound-before.json` and
+`.tmp/performance/stack-bound-after.json`. A separate TCP_NODELAY A/B trial did
+not demonstrate a stable benefit, so that change was removed. Original vendor
+sources, installed runtime/configuration and the IDA Skill remain unchanged.
+Final full Python regression suite: **338 tests passed**; compile checks and
+`git diff --check` passed. Both A/B workers saved/closed, fixture hashes were
+preserved, and each run confirmed 60 actual instruction-step stops. No new
+live VS or remote-kernel performance evidence was obtained in this follow-up.
+
+```powershell
+python tests/run_debug_performance.py --backend all --samples 30 `
+    --dump .tmp/kernel/sample-kernel.dmp `
+    --report .tmp/performance/common-operations.json
+```
+
+All measurements use separately installed licensed IDA and unchanged native
+debugger dependencies. The owned debuggee exits, the IDB saves, the IDA worker
+closes, and fixture hashes remain unchanged. Native headless context/stepping
+proof is separate from GUI IDA, VS, and live kernel acceptance. No runtime/client
+deployment is performed by the benchmark.
 
 The opt-in live tests analyze isolated system DLL copies and debug a project-owned
 native fixture. Evidence and logs go under `.tmp/`. The dual test uses freshly

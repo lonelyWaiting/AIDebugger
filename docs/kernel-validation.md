@@ -47,7 +47,39 @@ suite: **311 tests passed**. Focused kernel + IDA suite: **60 tests passed**.
 `git diff --check` and Python compile checks passed. No VSIX/C# changes were made;
 no VSIX build, installation or live VS attach is claimed by this work.
 
+## Review follow-up: 2026-10-10
+
+The review of `5e58ec7` added nine portable regressions for late replies during
+close, failed close/startup writes, unknown-outcome snapshot invalidation, exited
+workers, strict interrupt flags, close receipt ordering on EOF/native errors,
+and reserved close capacity when interrupts fill the pending-job limit.
+Each regression failed before its corresponding repair. Closing is terminal for
+new requests; helper cleanup owns the final close receipt when native closure
+cannot be confirmed. Session listing also holds the history lock while collecting
+statuses so concurrent history eviction cannot turn a list into SESSION_NOT_FOUND.
+
+Fresh source stdio probes passed against both existing kernel dumps. The no-peer
+KDNET probe also confirmed that query/interrupt/duplicate close are rejected once
+closing starts, polling remains responsive, and the owned helper exits. Forced
+closure still reports unknown target state; local attach still returns E_NOTIMPL.
+These checks do not establish live-target execution or matching-PDB acceptance.
+
+Local reports: `.tmp/kernel/review-fix-smoke.json`,
+`.tmp/kernel/review-fix-smoke2.json`, and `.tmp/kernel/review-fix-lifecycle.json`.
+Final checks: **320 full-suite tests passed**, including **36 focused kernel
+tests**; Python compile checks and `git diff --check` passed.
+The installed client configuration/runtime was not changed by this review.
+
 ## Actual sample identity and local evidence
+
+Performance follow-up: the idle owner now sleeps on its queue, and a known
+running state enters native `WaitForEvent` without the prior 50 ms queue timeout.
+Portable scheduling probes distinguish these changes from live step latency.
+Fresh source dump and no-peer lifecycle probes passed again in
+`.tmp/kernel/performance-smoke.json` and `.tmp/kernel/performance-lifecycle.json`;
+dump bytes remain unchanged and the no-peer helper exits with unknown target-state
+receipts. Final combined Python suite: **327 tests passed**. No connected live
+kernel was available to measure actual breakpoint/step latency.
 
 Public binary fixtures were downloaded into ignored `.tmp/kernel/` from the
 upstream author's sample directory, used as data only, and are not redistributed:
@@ -78,6 +110,35 @@ Ignored local reports (not portable artifacts):
 - `.tmp/kernel/review-fixed-deployed-lifecycle.json`: redeployed no-peer closure.
 
 ## Open acceptance boundaries
+
+Common-operation performance follow-up (2026-10-10): 30 samples per successful
+operation via a fresh source stdio process and real DbgEng. These are warmed
+kernel-dump operations, including request submission and completed-result
+observation, not native execution time alone. The same session compares client
+poll intervals and completion-triggered short waits:
+
+| Operation | 50 ms polling | 5 ms polling | `wait_ms=10` |
+|---|---:|---:|---:|
+| Registers | 51.716 ms | 6.049 ms | 0.539 ms |
+| Stack (raw offsets; matching PDB unverified) | 51.349 ms | 6.040 ms | 0.701 ms |
+| Read 64 captured bytes | 51.398 ms | 6.028 ms | 0.483 ms |
+
+The improvement removes client observation delay; it does not claim an equally
+large increase in DbgEng compute throughput. Existing immediate-poll behavior is
+unchanged unless the caller opts into `wait_ms`. Both sample dumps returned empty
+`!thread` output with this runtime: thread-context evidence is marked unavailable,
+not counted as a successful fast query. Missing kernel symbols/pages were not
+repaired or inferred from these measurements.
+
+Reports: `.tmp/performance/common-operations-final-30.json`,
+`.tmp/performance/kernel-second-dump.json`,
+`.tmp/kernel/common-operations-smoke.json`,
+`.tmp/kernel/common-operations-lifecycle.json`. Native smoke and no-peer lifecycle
+probes passed again, preserving dump hashes and unknown-state close receipts.
+Five IDA context and three kernel wait/event-sequence regressions passed; the
+full Python suite passed **335 tests**. The new event-sequence rule is exercised
+by portable tests; actual remote step latency still needs a configured test
+kernel. Installed runtime/client configuration remains unchanged.
 
 - **No real remote kernel target was available.** KDNET connection to an unused
   local port exercises waiting/cancellation, not connection to a target. Actual

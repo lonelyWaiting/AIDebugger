@@ -61,9 +61,9 @@ def kernel_session_status(session_id: str) -> dict:
 
 @mcp.tool
 @translate
-def kernel_job_status(session_id: str, job_id: str, offset: int = 0, count: int = 8192) -> dict:
-    """Poll an asynchronous operation; page output via nextOffset. Jobs retain at most 128 Ki characters; truncated means evidence incomplete. Mutations are never retried."""
-    return sessions.job(session_id, job_id, offset, count)
+def kernel_job_status(session_id: str, job_id: str, offset: int = 0, count: int = 8192, wait_ms: int = 0) -> dict:
+    """Poll an asynchronous operation; optional wait_ms (0..50) wakes on completion without delaying the native reader. Use 10 ms for short queries, 0 for immediate status. Page via nextOffset; at most 128 Ki characters. Mutations are never retried."""
+    return sessions.job(session_id, job_id, offset, count, wait_ms)
 
 
 @mcp.tool
@@ -111,7 +111,7 @@ def kernel_execute(session_id: str, command: str) -> dict:
 @mcp.tool
 @translate
 def kernel_control(session_id: str, action: str) -> dict:
-    """Request continue/step_into/step_over in a remote full_access paused session. Job completion acknowledges the request; poll session status for the next stop."""
+    """Request continue/step_into/step_over in a remote full_access paused session. Record session eventSequence before control; job completion acknowledges the request. Confirm next stop with a larger eventSequence and paused state."""
     return sessions.submit(session_id, "control", {"action": action})
 
 

@@ -113,6 +113,19 @@ immediately. Poll `kernel_job_status` with short intervals; `nextOffset` pages
 output. A completed control job acknowledges a request; only session status and
 the following debug event establish the next stop.
 
+For short operations, `kernel_job_status(..., wait_ms=10)` waits at most 10 ms
+for the existing job and wakes immediately when its reply arrives. `wait_ms`
+accepts 0..50; default 0 preserves immediate polling. The wait releases the
+session lock, so the native reader, other status requests and interrupt/close
+remain available. It never resubmits a command. If still running, short-poll;
+avoid introducing a fixed 50 ms client delay for a sub-millisecond native query.
+
+Before step/resume, record `kernel_session_status(...).eventSequence`. A control
+job's completion is only acknowledgement. A subsequent paused state and larger
+event sequence establish a new observed stop; query replies do not advance the
+sequence. The counter remains monotonic when the eight-entry event history wraps.
+`tests/kernel_integration/run_kernel_smoke.py --live-control` checks this rule.
+
 ```python
 opened = kernel_open_dump(dump_path="D:/Dumps/kernel.dmp",
     symbol_path="srv*C:/Symbols*https://msdl.microsoft.com/download/symbols")
@@ -131,6 +144,7 @@ DbgEng `Execute` can return S_OK while a command prints an error. Text responses
 therefore report `semanticSuccess="unknown"`; read the output and symbol status.
 Output retains at most 128 Ki characters per job, pages at most 16 Ki characters,
 and retains 64 jobs/session and eight bounded asynchronous event outputs. A
+job slot is reserved for close so pending interrupts cannot prevent cleanup. A
 truncated result is incomplete evidence. At most eight workers can be alive;
 closed history is bounded to 32 sessions.
 
@@ -139,6 +153,10 @@ the engine. A reader thread uses only the documented cross-thread `SetInterrupt`
 Live kernel `WaitForEvent` requires INFINITE, so it runs in an isolated helper,
 never on an MCP request thread. The MCP supervisor remains available for polling
 and interrupt/close while a native call blocks.
+Idle owners block on the request queue instead of polling every 50 ms. After a
+native operation reports running/stepping, the owner enters `WaitForEvent`
+without the extra polling delay. Status is still refreshed on the owning thread
+after native operations/events; parent EOF wakes the queue for bounded cleanup.
 
 `kernel_interrupt(cancel_wait=True)` requests exit from a wait without promising
 that the target stopped. Some engine builds do not promptly interrupt initial
@@ -148,6 +166,12 @@ passive native detach. After two seconds it closes only its owned worker, with
 killed and no kernel is implicitly resumed. A paused remote kernel can remain
 paused after close; explicitly continue it first if that is the desired outcome.
 Mutations are never retried. A lost worker reply is an unknown operation outcome.
+Once close is submitted, late replies cannot restore an inspectable state;
+commands, interrupts and duplicate close requests return `SESSION_CLOSING`.
+Worker EOF or a native close error leaves the close job pending until bounded
+helper cleanup supplies its final receipt. A native close error is retained as
+`nativeCloseError` when only helper closure can be confirmed. Failed request
+writes invalidate the cached snapshot even if an older status reply arrives.
 
 Local kernel inspection requires the relevant Windows permissions/configuration;
 this backend does not request elevation or silently enable boot debugging.

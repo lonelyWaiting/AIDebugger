@@ -166,23 +166,25 @@ def main():
             report["evidence"]["remote"] = client.wait(remote, timeout=120)
             if args.live_control:
                 for action in ("step_into", "step_over"):
+                    previous_event = client.call("kernel_session_status", session_id=remote["sessionId"])["eventSequence"]
                     client.wait(client.call("kernel_control", session_id=remote["sessionId"], action=action))
                     end = time.monotonic() + 30
                     while time.monotonic() < end:
                         status = client.call("kernel_session_status", session_id=remote["sessionId"])
-                        if status["state"] == "paused":
+                        if status["state"] == "paused" and status["eventSequence"] > previous_event:
                             break
                         time.sleep(0.05)
-                    assert status["state"] == "paused", status
+                    assert status["state"] == "paused" and status["eventSequence"] > previous_event, status
+                previous_event = client.call("kernel_session_status", session_id=remote["sessionId"])["eventSequence"]
                 client.wait(client.call("kernel_control", session_id=remote["sessionId"], action="continue"))
                 client.wait(client.call("kernel_interrupt", session_id=remote["sessionId"]))
                 end = time.monotonic() + 30
                 while time.monotonic() < end:
                     status = client.call("kernel_session_status", session_id=remote["sessionId"])
-                    if status["state"] == "paused":
+                    if status["state"] == "paused" and status["eventSequence"] > previous_event:
                         break
                     time.sleep(0.05)
-                assert status["state"] == "paused", status
+                assert status["state"] == "paused" and status["eventSequence"] > previous_event, status
             client.wait(client.call("kernel_close", session_id=remote["sessionId"]))
         report["liveKernelValidated"] = bool(args.connection)
         report["checks"]["dumpBytesPreserved"] = hashlib.sha256(args.dump.read_bytes()).hexdigest() == before

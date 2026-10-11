@@ -10,6 +10,7 @@ import threading
 import time
 
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "vendor"))
 import idaapi
 import ida_auto
@@ -23,6 +24,7 @@ import idc
 from ida_pro_mcp.ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler, idasync
 from ida_pro_mcp.ida_mcp.mainthread import get_pump
 from ida_pro_mcp.ida_mcp.rpc import tool, set_download_base_url, get_cached_output
+from ida_backend.debug_context import collect_context
 
 CONFIG = json.loads(Path(os.environ["AIDB_IDA_CONFIG"]).read_text(encoding="utf-8"))
 DIRECTORY = Path(CONFIG["directory"])
@@ -150,6 +152,16 @@ def event_metadata(event):
         result["exception"] = {"code": exception.code, "canContinue": exception.can_cont,
                                "address": hex(exception.ea), "info": exception.info}
     return result
+
+
+@tool
+@idasync
+def debugger_context(max_threads: int = 128, max_frames: int = 64) -> dict:
+    """Collect paused status, thread IDs, current registers and stack in one owning-thread request. Bounded output; inspect snapshotStable and stackStatus. Does not resume or cache debugger state."""
+    from ida_pro_mcp.ida_mcp import api_debug
+    import ida_idd
+    import ida_name
+    return collect_context(ida_dbg, api_debug, ida_idd, ida_name, max_threads, max_frames)
 
 
 @tool

@@ -65,6 +65,8 @@ def run():
     def pending_close():
         while not requests.empty():
             request = requests.get_nowait()
+            if request is None:
+                continue
             if request["operation"] == "close":
                 try:
                     close_engine()
@@ -109,6 +111,10 @@ def run():
             error(None, exception)
         finally:
             exiting.set()
+            try:
+                requests.put_nowait(None)  # Wake an idle owner without polling.
+            except queue.Full:
+                pass  # The owner will drain queued work and observe exiting.
             # Parent EOF also needs bounded cleanup when the engine refuses
             # interruption. This timer ends only this helper, never a target.
             guard = threading.Timer(2.5, lambda: os._exit(0))
@@ -142,6 +148,7 @@ def run():
                         hashlib.sha256(header).hexdigest() != target["headerSha256"]):
                     raise KernelError("STALE_TARGET", "Dump changed between request and engine startup")
             result = engine.open(config)
+            state = result["state"]
             send({"id": config["open_id"], "result": {**result, **engine.output.result()}})
             send({"status": result})
         except Exception as exception:
@@ -152,17 +159,20 @@ def run():
         while True:
             if exiting.is_set() and requests.empty():
                 break
-            try:
-                request = requests.get(timeout=0.05)
-            except queue.Empty:
-                if config["mode"] == "remote" and engine.status()["state"] == "running":
-                    engine.output.reset()
-                    try:
-                        engine.wait()
-                        engine.verify_target()
-                        send({"status": engine.status(), "eventOutput": engine.output.result()})
-                    except Exception as exception:
-                        send({"status": {"state": "out_of_sync"}, "eventError": {"code": getattr(exception, "code", "ENGINE_ERROR")}})
+            if not exiting.is_set() and config["mode"] == "remote" and state == "running" and requests.empty():
+                engine.output.reset()
+                try:
+                    engine.wait()
+                    engine.verify_target()
+                    status = engine.status()
+                    state = status["state"]
+                    send({"status": status, "eventOutput": engine.output.result()})
+                except Exception as exception:
+                    state = "out_of_sync"
+                    send({"status": {"state": state}, "eventError": {"code": getattr(exception, "code", "ENGINE_ERROR")}})
+                continue
+            request = requests.get()
+            if request is None:
                 continue
             if request["operation"] == "close":
                 close_engine()
@@ -170,13 +180,16 @@ def run():
                 break
             try:
                 result = engine.perform(request["operation"], request["arguments"])
+                state = result["state"]
                 send({"id": request["id"], "result": result})
                 send({"status": {key: result[key] for key in ("state", "executionStatusRaw", "snapshotStable", "snapshotStatus", "stopReason", "stopReasonRaw", "eventDescription")}})
             except Exception as exception:
                 error(request["id"], exception)
                 try:
                     engine.verify_target()
-                    send({"status": engine.status()})
+                    status = engine.status()
+                    state = status["state"]
+                    send({"status": status})
                 except Exception:
                     send({"status": {"state": "failed"}})
                     break
