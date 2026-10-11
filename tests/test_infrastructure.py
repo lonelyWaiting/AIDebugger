@@ -1219,6 +1219,41 @@ asyncio.run(check())
         self.assertIsNone(result["error"])
         self.assertEqual(["0x10100000"], result["matches"])
 
+    def test_chunked_memory_search_stops_after_full_coverage_before_result_limit(self) -> None:
+        from mcp_server import bootstrap
+
+        bootstrap.ensure_deps()
+        from mcp_server.tool_context import MAX_MEMORY_SEARCH_CHUNK_SIZE
+        from mcp_server.tool_modules import memory_tools
+
+        page = {"patternBytes": ["AA", "BB"], "matches": [],
+                "status": "ok", "partial": False, "truncated": False,
+                "hasMore": False}
+        first_page = {**page, "bytesSearched": MAX_MEMORY_SEARCH_CHUNK_SIZE,
+                      "bytesAttempted": MAX_MEMORY_SEARCH_CHUNK_SIZE}
+        final_page = {**page, "matches": ["0x10100000"],
+                      "bytesSearched": 2, "bytesAttempted": 2}
+        with mock.patch.object(
+            memory_tools.ide_bridge, "call_with_target",
+            mock.AsyncMock(return_value=(first_page, {"pipeName": "target"})),
+        ), mock.patch.object(
+            memory_tools.vs_bridge, "call_pipe_exact",
+            mock.AsyncMock(side_effect=[final_page, memory_tools.vs_bridge.VSBridgeError(
+                "Context changed after the completed search", code="STALE_DEBUG_CONTEXT")]),
+        ) as exact_call:
+            response = asyncio.run(memory_tools.search_memory(
+                start_address="0x1000", pattern="AA BB", max_results=100,
+                search_size=MAX_MEMORY_SEARCH_CHUNK_SIZE + 1,
+            ))
+        result = response["result"]
+        self.assertEqual("ok", result["status"])
+        self.assertFalse(result["partial"])
+        self.assertFalse(result["hasMore"])
+        self.assertIsNone(result["errorCode"])
+        self.assertEqual(["0x10100000"], result["matches"])
+        self.assertEqual(MAX_MEMORY_SEARCH_CHUNK_SIZE + 1, result["bytesSearched"])
+        self.assertEqual(1, exact_call.await_count)
+
     def test_get_locals_requires_complete_frame_context(self) -> None:
         from mcp_server import bootstrap
 

@@ -441,17 +441,20 @@ async def search_memory(
                     terminal_backend_no_continuation = True
                 break
 
+            if covered_until >= search_size:
+                # Overlap is needed only while there are unsearched bytes.
+                # Re-reading the tail can incorrectly turn a complete search
+                # into a partial result if the target changes afterward.
+                offset = search_size
+                break
+
             if len(matches) >= max_results:
                 # A backend only emits nextStartOffset when its own result limit
                 # truncated an otherwise still-searchable chunk. If the final
                 # match merely happens to fill the caller's max_results budget,
-                # there may be no backend cursor at all. Finish normally when
-                # the aggregate range is covered; otherwise use the proven
-                # chunk boundary (with overlap) as the continuation.
-                if covered_until >= search_size:
-                    offset = search_size
-                    break
-
+                # there may be no backend cursor at all. Use the proven chunk
+                # boundary (with overlap) as the continuation for the remaining
+                # range; complete coverage has already been handled above.
                 next_offset = max(offset + 1, covered_until - overlap)
                 partial = True
                 status = "partial"
