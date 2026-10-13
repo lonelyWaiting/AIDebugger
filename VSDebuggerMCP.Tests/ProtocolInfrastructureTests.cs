@@ -944,6 +944,81 @@ namespace VSDebuggerMCP.Tests
         }
 
         [TestMethod]
+        public void CompletedStepCaptureFailureRetainsKnownExecutionReceipt()
+        {
+            var result = new DebugControlResult
+            {
+                Action = "StepOver", Success = true, CommandIssued = true,
+                Outcome = "step_completed", Message = "Stepped over",
+            };
+            OperationResultPolicy.RecordCompletedStepCaptureFailure(
+                result, new StaleDebugContextException("context changed before source capture"));
+
+            Assert.IsTrue(result.Success);
+            Assert.IsTrue(result.CommandIssued);
+            Assert.AreEqual("step_completed_capture_unavailable", result.Outcome);
+            Assert.IsNull(result.ErrorCode);
+            Assert.IsNull(result.NewLocation);
+            StringAssert.Contains(result.Message, "context changed before source capture");
+            Assert.IsTrue(OperationResultPolicy.ShouldReturnStructuredResult(result));
+        }
+
+        [TestMethod]
+        public void UnobservedStepCannotBePromotedToSuccessfulExecution()
+        {
+            foreach (string outcome in new[] { "step_issued", "step_outcome_unknown", "step_issued_break_not_observed" })
+            {
+                var result = new DebugControlResult
+                {
+                    Action = "StepOver", Success = true, CommandIssued = true,
+                    Outcome = outcome, Message = "Stepped over",
+                };
+                Assert.ThrowsExactly<InvalidOperationException>(() =>
+                    OperationResultPolicy.RecordCompletedStepCaptureFailure(result, new Exception("capture failed")));
+                Assert.AreEqual(outcome, result.Outcome);
+            }
+        }
+
+        [TestMethod]
+        public void QueryResultStoreRecompletionPreservesCompletionOrderAndTtl()
+        {
+            DateTime now = new DateTime(2026, 7, 22, 0, 0, 0, DateTimeKind.Utc);
+            var store = new QueryResultStore(2, 64, TimeSpan.FromMinutes(5), () => now);
+            store.Complete("one", "old-one");
+            now = now.AddMinutes(1);
+            store.Complete("two", "two");
+            now = now.AddMinutes(3);
+            store.Complete("one", "new-one");
+            now = now.AddMinutes(3);
+
+            Assert.IsFalse(store.TryGet("two", out _, out _));
+            Assert.IsTrue(store.TryGet("one", out string response, out _));
+            Assert.AreEqual("new-one", response);
+            Assert.AreEqual(1, store.Snapshot().EntryCount);
+            Assert.AreEqual(7L, store.Snapshot().RetainedBytes);
+
+            store.Complete("two", "two");
+            store.Complete("one", "newer-one");
+            store.Complete("three", "three");
+            Assert.IsFalse(store.TryGet("two", out _, out _));
+            Assert.IsTrue(store.TryGet("one", out response, out _));
+            Assert.AreEqual("newer-one", response);
+            Assert.AreEqual(14L, store.Snapshot().RetainedBytes);
+        }
+
+        [TestMethod]
+        public void QueryResultStoreOversizedRecompletionDoesNotExposePreviousResult()
+        {
+            var store = new QueryResultStore(2, 16, TimeSpan.FromMinutes(5));
+            store.Complete("query", "old-result");
+            store.Complete("query", new string('x', 17));
+
+            Assert.IsFalse(store.TryGet("query", out _, out _));
+            Assert.AreEqual(0, store.Snapshot().EntryCount);
+            Assert.AreEqual(0L, store.Snapshot().RetainedBytes);
+        }
+
+        [TestMethod]
         public void CommandResultStoreNeverEvictsLateCompletionTombstones()
         {
             DateTime now = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);

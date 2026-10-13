@@ -14,7 +14,7 @@ namespace VSDebuggerMCP.Ipc
         private readonly object _sync = new object();
         private readonly Dictionary<string, Entry> _entries =
             new Dictionary<string, Entry>(StringComparer.Ordinal);
-        private readonly Queue<string> _order = new Queue<string>();
+        private readonly LinkedList<string> _order = new LinkedList<string>();
         private readonly int _capacity;
         private readonly long _byteCapacity;
         private readonly TimeSpan _ttl;
@@ -40,23 +40,24 @@ namespace VSDebuggerMCP.Ipc
         {
             if (string.IsNullOrWhiteSpace(requestId) || response == null) return;
             long bytes = Encoding.UTF8.GetByteCount(response);
-            if (bytes > _byteCapacity) return;
             lock (_sync)
             {
                 PruneLocked();
                 if (_entries.TryGetValue(requestId, out Entry existing))
                 {
                     _retainedBytes -= existing.ResponseBytes;
+                    _order.Remove(existing.OrderNode);
+                    _entries.Remove(requestId);
                 }
-                else
-                {
-                    _order.Enqueue(requestId);
-                }
+                // Queries may reuse an id after completion. A replacement must
+                // supersede the old response even when it is too large to keep.
+                if (bytes > _byteCapacity) return;
                 _entries[requestId] = new Entry
                 {
                     Response = response,
                     ResponseBytes = bytes,
                     CompletedUtc = _utcNow(),
+                    OrderNode = _order.AddLast(requestId),
                 };
                 _retainedBytes += bytes;
                 PruneLocked();
@@ -103,10 +104,10 @@ namespace VSDebuggerMCP.Ipc
             DateTime cutoff = _utcNow() - _ttl;
             while (_order.Count > 0)
             {
-                string oldestId = _order.Peek();
+                string oldestId = _order.First.Value;
                 if (!_entries.TryGetValue(oldestId, out Entry oldest))
                 {
-                    _order.Dequeue();
+                    _order.RemoveFirst();
                     continue;
                 }
                 if (_entries.Count <= _capacity &&
@@ -115,7 +116,7 @@ namespace VSDebuggerMCP.Ipc
                 {
                     break;
                 }
-                _order.Dequeue();
+                _order.RemoveFirst();
                 _entries.Remove(oldestId);
                 _retainedBytes -= oldest.ResponseBytes;
             }
@@ -126,6 +127,7 @@ namespace VSDebuggerMCP.Ipc
             internal string Response { get; set; }
             internal long ResponseBytes { get; set; }
             internal DateTime CompletedUtc { get; set; }
+            internal LinkedListNode<string> OrderNode { get; set; }
         }
     }
 

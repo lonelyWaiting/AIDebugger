@@ -149,6 +149,9 @@ class KernelSessions:
                     session.status["state"] = "failed"
         finally:
             with session.lock:
+                # The only reply reader has stopped. The helper can still be
+                # alive, but no subsequently submitted job can receive a reply.
+                session.pipe_failed = True
                 for job_id, job in session.jobs.items():
                     if job["state"] == "running" and job_id != session.close_job:
                         job.update(state="failed", error={"code": "WORKER_EXITED", "message": "Engine worker exited; operation outcome may be unknown"})
@@ -183,6 +186,8 @@ class KernelSessions:
             require(session.close_job is None,
                     "Session close is already pending or complete", "SESSION_CLOSING")
             require(session.process.poll() is None, "Engine worker has exited", "WORKER_EXITED")
+            require(operation == "close" or not session.pipe_failed,
+                    "Engine worker transport is unavailable; close this session", "WORKER_UNAVAILABLE")
             require(session.active is None or operation == "close", "Poll the active operation before submitting another", "SESSION_BUSY")
             require(operation == "close" or session.status["state"] in {"paused", "local_inspection"},
                     "Target must be available and paused for inspection or commands", "NOT_PAUSED")
@@ -256,6 +261,8 @@ class KernelSessions:
             require(session.close_job is None,
                     "Session close is already pending or complete", "SESSION_CLOSING")
             require(session.process.poll() is None, "Engine worker has exited", "WORKER_EXITED")
+            require(not session.pipe_failed,
+                    "Engine worker transport is unavailable; close this session", "WORKER_UNAVAILABLE")
             require(exit_wait or session.mode == "remote" and session.full_access,
                     "Break-in requires a remote full_access session", "CAPABILITY_DENIED")
             return self._send(session, "interrupt", exit_wait=exit_wait)

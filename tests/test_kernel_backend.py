@@ -236,6 +236,27 @@ class SupervisorTests(unittest.TestCase):
         self.assertIsNone(self.session.active)
         self.assertEqual(self.session.status["state"], "disconnected")
 
+    def test_reply_pipe_end_rejects_interrupt_without_creating_unfinishable_job(self):
+        for response in (b"", b"invalid json\n"):
+            with self.subTest(response=response):
+                self.setUp()
+                self.process.stdout = io.BytesIO(response)
+                self.manager._read(self.session)
+                with self.assertRaises(KernelError) as error:
+                    self.manager.interrupt("one")
+                self.assertEqual(error.exception.code, "WORKER_UNAVAILABLE")
+                self.assertEqual(self.session.jobs, {})
+                self.assertEqual(self.process.stdin.getvalue(), b"")
+
+    def test_reply_pipe_end_still_allows_watchdog_owned_close(self):
+        self.process.stdout = io.BytesIO(b"")
+        self.manager._read(self.session)
+        with patch("kernel_backend.sessions.threading.Thread") as thread:
+            closed = self.manager.submit("one", "close", {})
+            thread.return_value.start.assert_called_once()
+        self.manager._close_watchdog(self.session, closed["jobId"])
+        self.assertEqual(self.manager.job("one", closed["jobId"])["state"], "complete")
+
     def test_failed_pipe_mutation_is_never_retried(self):
         self.process.stdin = Mock()
         self.process.stdin.write.side_effect = BrokenPipeError()
@@ -376,12 +397,13 @@ class SupervisorTests(unittest.TestCase):
 
 
 class WorkerSchedulingTests(unittest.TestCase):
-    def run_worker(self, running=False):
+    def run_worker(self, running=False, close_error=None):
         from kernel_backend import worker
         import queue
         ready, waited = threading.Event(), threading.Event()
         timeline = []
         engine = Mock()
+        engine.close.side_effect = close_error
         engine.output.result.return_value = {"output": "", "truncated": False}
         def open_engine(config):
             ready.set()
@@ -419,17 +441,25 @@ class WorkerSchedulingTests(unittest.TestCase):
             for thread in threads:
                 thread.join(1)
                 self.assertFalse(thread.is_alive())
-        self.assertIn(b'"state": "closed"', output.getvalue())
-        return engine, timeline
+        messages = [json.loads(line) for line in output.getvalue().splitlines()]
+        return engine, timeline, messages
 
     def test_paused_worker_has_no_periodic_native_status_calls(self):
-        engine, timeline = self.run_worker()
+        engine, timeline, messages = self.run_worker()
         engine.status.assert_not_called()
+        self.assertTrue(any(message.get("result", {}).get("state") == "closed" for message in messages))
 
     def test_running_worker_enters_native_wait_before_queue_poll(self):
-        engine, timeline = self.run_worker(running=True)
+        engine, timeline, messages = self.run_worker(running=True)
         self.assertEqual(timeline[0], "wait")
         engine.wait.assert_called_once()
+        self.assertTrue(any(message.get("result", {}).get("state") == "closed" for message in messages))
+
+    def test_failed_native_close_is_not_retried_and_error_belongs_to_close_job(self):
+        engine, timeline, messages = self.run_worker(close_error=KernelError("DBGENG_ERROR", "EndSession failed"))
+        engine.close.assert_called_once()
+        errors = [message for message in messages if "error" in message]
+        self.assertEqual(errors, [{"id": "close", "error": {"code": "DBGENG_ERROR", "message": "EndSession failed"}}])
 
 
 class InstallerTests(unittest.TestCase):

@@ -199,15 +199,21 @@ def install(home, clients=("claude", "codex"), python=None, dry_run=False, backe
             written.append(path)
     except BaseException as error:
         for path in reversed(written):
-            current = path.read_bytes() if path.exists() else None
-            if current != destinations[path]:
-                error.add_note("Concurrent edit preserved during rollback: " + str(path))
-                continue
-            old = snapshots[path]
-            if old is None:
-                path.unlink(missing_ok=True)
-            else:
-                atomic_write(path, old)
+            try:
+                checked_path(path)
+                current = path.read_bytes() if path.exists() else None
+                if current != destinations[path]:
+                    error.add_note("Concurrent edit preserved during rollback: " + str(path))
+                    continue
+                old = snapshots[path]
+                if old is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    atomic_write(path, old)
+            except Exception as rollback_error:
+                # A locked or inaccessible destination must not prevent restoring
+                # the rest of the transaction or hide the original failure.
+                error.add_note(f"Rollback failed for {path}: {rollback_error}")
         raise
     return {"installed": True, "server": str(server), "clients": list(clients),
             "servers": {b: str(p) for b, p in servers.items()}, "configBackups": str(backup), "fileCount": len(destinations)}

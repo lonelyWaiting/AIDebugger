@@ -14,6 +14,7 @@ description: 使用 IDA MCP 分析二进制、驱动及受保护控制流，导�
 - 每次操作显式传 `session_id`；通过 `ida_list_tools` 分页获取实际工具和完整参数 schema，再用 `ida_call_tool(session_id, tool, arguments)` 调用。保留上游 `content/structuredContent/isError`；批量结果也要检查每项 `error`，不能仅看外层 `isError=false`。
 - 就绪与自动分析完成分开：检查 `identity.autoAnalysisReady`；需要时调用 `server_warmup` 的实际 schema 等待分析，不能把已可查询视为全库分析完成。
 - 调试先调用 `debugger_configure` 设置调试器和 EXE；DLL 需要加载它的宿主 EXE或明确附加的 PID。再使用 `dbg_start` 或 `debugger_attach`；读取状态、寄存器、事件确认，不因请求被接受就断言附加成功。`debugger_detach` 不终止目标，`dbg_exit` 终止目标。动态实验仍需用户授权范围。
+- 本项目 `dbg_status` 在暂停时可能只返回 `suspended=True` 而省略 `running`，不能用 `not status.get("running")` 判断分离或退出。确认 `state == "not_running"` 后，再用绑定到本次目标身份的 OS 进程句柄区分“分离后仍存活”和“进程已退出”。`debugger_events` 记录原生通知；同一次停点可能包含 breakpoint/step 与 suspend 通知，通知条数不等于命中次数。
 - patch 默认修改隔离 IDB。`export_patched_binary` 只写新文件，核验输入哈希、每个文件偏移与原始字节，拒绝未映射 patch。导出会改变签名有效性；原 DLL 不变，导出成功不等于运行功能验证。
 - VS 现场与 IDA 数据库关联时先核对模块哈希，使用 `RVA=IDA地址-imageBase` 和 `运行时地址=模块加载基址+RVA`；不能只按 DLL 名称或裸地址对应。
 - `ida_close(save=True)` 保存确认后关闭，短轮询到进程退出。保存失败或调试仍活跃时不关闭。GUI 插件退出残留可在已确认保存、无活动调试的关闭请求后，通过原始 owned 进程句柄结束；返回 receipt 明示该动作。禁止对外部实例或 unknown outcome 执行该处理。

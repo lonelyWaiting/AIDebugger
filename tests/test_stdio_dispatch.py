@@ -1,4 +1,5 @@
 """Portable starvation/admission proof, not native debugger timing."""
+import io
 import json
 import queue
 import threading
@@ -27,6 +28,19 @@ class Output:
 
 
 class StdioDispatchTests(unittest.TestCase):
+    def test_unicode_response_and_request_id_always_produce_json_bytes(self):
+        for value in ("中文 \U0001f41e", "unpaired \ud800 and \udfff"):
+            with self.subTest(value=ascii(value)):
+                response = {"jsonrpc": "2.0", "id": value, "result": {"text": value}}
+                mcp = SimpleNamespace(
+                    registry=SimpleNamespace(dispatch=lambda _: response),
+                    _transport_session_id=threading.local())
+                incoming = io.BytesIO((json.dumps({
+                    "jsonrpc": "2.0", "id": value, "method": "ping"}) + "\n").encode())
+                output = io.BytesIO()
+                serve(mcp, incoming, output)
+                self.assertEqual([response], [json.loads(line) for line in output.getvalue().splitlines()])
+
     def harness(self):
         incoming, output = Input(), Output()
         occupied = threading.Barrier(9)

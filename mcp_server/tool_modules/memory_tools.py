@@ -477,9 +477,14 @@ async def search_memory(
             next_start_offset = continuation_offset
             remaining_bytes = continuation_remaining
         elif covered_until < search_size and not terminal_backend_no_continuation:
+            # The bytes at the end of the completed chunk have been read, but
+            # candidates starting there still need the next chunk's bytes.
+            # Preserve that overlap when an interruption prevents the next
+            # request from returning a backend continuation.
+            resume_offset = max(0, covered_until - overlap)
             next_start_expression = start_address
-            next_start_offset = start_offset + covered_until
-            remaining_bytes = search_size - covered_until
+            next_start_offset = start_offset + resume_offset
+            remaining_bytes = search_size - resume_offset
 
         unattempted_bytes = max(0, search_size - bytes_attempted)
         failed_reads = unreadable_bytes

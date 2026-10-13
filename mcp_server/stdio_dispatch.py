@@ -16,7 +16,9 @@ def serve(mcp, stdin=None, stdout=None, *, fast_tools=(), control_tools=()):
         if response is not None and not disconnected.is_set():
             try:
                 with output_lock:
-                    stdout.write(json.dumps(response, ensure_ascii=False).encode("utf-8") + b"\n")
+                    # JSON escaping also handles isolated UTF-16 surrogates from
+                    # request IDs or debugger strings without dropping the reply.
+                    stdout.write(json.dumps(response).encode("utf-8") + b"\n")
                     stdout.flush()
             except (BrokenPipeError, OSError):
                 disconnected.set()

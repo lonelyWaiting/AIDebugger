@@ -23,7 +23,7 @@ import ida_nalt
 import idc
 from ida_pro_mcp.ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler, idasync
 from ida_pro_mcp.ida_mcp.mainthread import get_pump
-from ida_pro_mcp.ida_mcp.rpc import tool, set_download_base_url, get_cached_output
+from ida_pro_mcp.ida_mcp.rpc import tool, set_download_base_url, get_cached_output, OUTPUT_LIMIT_MAX_CHARS
 from ida_backend.debug_context import collect_context
 
 CONFIG = json.loads(Path(os.environ["AIDB_IDA_CONFIG"]).read_text(encoding="utf-8"))
@@ -154,6 +154,23 @@ def event_metadata(event):
     return result
 
 
+class DebugEventHooks(ida_dbg.DBG_Hooks):
+    """Record native notifications, never repeated observations of a stop."""
+
+    def _record(self, *args):
+        try:
+            EVENTS.append(event_metadata(ida_dbg.get_debug_event()))
+        except Exception as error:
+            EVENTS.append({"observationError": str(error)})
+        del EVENTS[:-200]
+        return 0
+
+    dbg_process_start = dbg_process_attach = dbg_process_exit = dbg_process_detach = _record
+    dbg_thread_start = dbg_thread_exit = dbg_library_load = dbg_library_unload = _record
+    dbg_information = dbg_exception = dbg_bpt = dbg_suspend_process = _record
+    dbg_step_into = dbg_step_over = dbg_run_to = dbg_step_until_ret = _record
+
+
 @tool
 @idasync
 def debugger_context(max_threads: int = 128, max_frames: int = 64) -> dict:
@@ -167,7 +184,7 @@ def debugger_context(max_threads: int = 128, max_frames: int = 64) -> dict:
 @tool
 @idasync
 def debugger_events(clear: bool = False) -> dict:
-    """Read bounded events collected by headless event pump; does not resume the target."""
+    """Read bounded native debugger notifications; does not resume the target."""
     result = {"events": list(EVENTS), "active": bool(ida_dbg.is_debugger_on())}
     if clear:
         EVENTS.clear()
@@ -223,8 +240,15 @@ def read_cached_output(output_id: str, offset: int = 0, count: int = 8000) -> di
         raise ValueError("Output expired or unknown; do not repeat a mutation to recreate it")
     serialized = json.dumps(value, ensure_ascii=False)
     end = min(offset + count, len(serialized))
-    return {"text": serialized[offset:end], "totalChars": len(serialized),
-            "nextOffset": end if end < len(serialized) else None}
+    while True:
+        page = {"text": serialized[offset:end], "totalChars": len(serialized),
+                "nextOffset": end if end < len(serialized) else None}
+        # The vendor limits the ASCII-escaped JSON of the whole response.
+        # Keep this page below that limit so its text and nextOffset cannot
+        # diverge when non-ASCII characters trigger a second truncation.
+        if len(json.dumps(page)) <= OUTPUT_LIMIT_MAX_CHARS:
+            return page
+        end = offset + (end - offset) // 2
 
 
 def parent_handle():
@@ -244,7 +268,7 @@ PARENT = parent_handle()
 
 def tick():
     global CLOSING
-    if PARENT and (not PARENT[1] or PARENT[0].WaitForSingleObject(PARENT[1], 0) == 0):
+    if not CLOSING and PARENT and (not PARENT[1] or PARENT[0].WaitForSingleObject(PARENT[1], 0) == 0):
         # Preserve a live debug target if client disappears. It can be detached
         # from this IDA explicitly; do not silently terminate another process.
         if not ida_dbg.is_debugger_on():
@@ -255,18 +279,18 @@ def tick():
         # Give the closing HTTP response time to flush before qexit.
         return -1
     if CONFIG["mode"] == "headless" and ida_dbg.is_debugger_on():
-        event_id = ida_dbg.wait_for_next_event(ida_dbg.WFNE_ANY | ida_dbg.WFNE_SILENT, 0)
-        if event_id > 0:
-            try:
-                EVENTS.append(event_metadata(ida_dbg.get_debug_event()))
-            except Exception as error:
-                EVENTS.append({"observationError": str(error), "eid": event_id})
-            del EVENTS[:-200]
+        # While paused this can return the same current event on every tick.
+        # Hooks record actual notifications, including distinct hits at the
+        # same address, without flooding the ring during an idle pause.
+        ida_dbg.wait_for_next_event(ida_dbg.WFNE_ANY | ida_dbg.WFNE_SILENT, 0)
     return 100
 
 
 def main():
-    global CLOSING
+    global CLOSING, EVENT_HOOKS
+    EVENT_HOOKS = DebugEventHooks()
+    if not EVENT_HOOKS.hook():
+        raise RuntimeError("Could not register owned debugger event hooks")
     pump = get_pump()
     if CONFIG["mode"] == "headless":
         pump.arm()

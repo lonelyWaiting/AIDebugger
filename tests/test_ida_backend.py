@@ -171,6 +171,25 @@ class IdaLifecycleTests(unittest.TestCase):
             self.assertEqual(self.manager.status("target")["state"], "busy")
         self.process.terminate.assert_not_called()
 
+    def test_registration_sharing_conflict_remains_starting_until_next_status(self):
+        with patch.object(Path, "read_text", side_effect=PermissionError("sharing conflict")), \
+                patch.object(self.manager, "_rpc_tool") as rpc:
+            self.assertEqual(self.manager.status("target")["state"], "starting")
+            rpc.assert_not_called()
+        with patch.object(self.manager, "_rpc_tool", return_value=self.result(self.identity)):
+            self.assertEqual(self.manager.status("target")["state"], "ready")
+        self.process.terminate.assert_not_called()
+
+    def test_registration_sharing_conflict_cannot_dispatch_a_command(self):
+        self.session.identity = self.identity
+        self.session.state = "ready"
+        with patch.object(Path, "read_text", side_effect=PermissionError("sharing conflict")), \
+                patch.object(self.manager, "_rpc_tool") as rpc:
+            with self.assertRaisesRegex(IdaError, "IDA_NOT_READY"):
+                self.manager.call("target", "patch", {})
+            self.assertEqual(self.session.state, "busy")
+            rpc.assert_not_called()
+
     def test_status_does_not_wait_for_running_tool_on_same_session(self):
         locked = threading.Event()
         release = threading.Event()
@@ -454,6 +473,82 @@ class WorkerBoundaryTests(unittest.TestCase):
         function.decorator_list = []
         exec(compile(ast.Module(body=[function], type_ignores=[]), "worker-boundary", "exec"), environment)
         return environment[name]
+
+    def test_idle_pump_does_not_duplicate_events_but_native_notifications_do(self):
+        event = {"eid": 5, "pid": 10, "tid": 11, "ea": "0x1000"}
+        debugger = Mock(WFNE_ANY=1, WFNE_SILENT=2)
+        debugger.DBG_Hooks = object
+        debugger.is_debugger_on.return_value = True
+        debugger.wait_for_next_event.return_value = 5
+        events = []
+        environment = {"ida_dbg": debugger, "EVENTS": events, "event_metadata": lambda value: dict(event),
+                       "PARENT": None, "CLOSING": False, "EXIT_AT": 0, "time": time,
+                       "CONFIG": {"mode": "headless"}}
+        tree = ast.parse((ROOT / "ida_backend/worker.py").read_text(encoding="utf-8"))
+        hook = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DebugEventHooks")
+        exec(compile(ast.Module(body=[hook], type_ignores=[]), "worker-boundary", "exec"), environment)
+        hooks = environment["DebugEventHooks"]()
+        hooks.dbg_bpt(11, 0x1000)
+        tick = self.function("tick", environment)
+        for _ in range(300):
+            self.assertEqual(tick(), 100)
+        self.assertEqual(events, [event])
+        # A later real hit at the same address is a distinct notification.
+        hooks.dbg_bpt(11, 0x1000)
+        self.assertEqual(events, [event, event])
+        self.assertEqual(debugger.wait_for_next_event.call_count, 300)
+
+    def test_unicode_cached_output_pages_reconstruct_without_nested_truncation(self):
+        # The vendor's output limiter measures json.dumps(structuredContent),
+        # including ASCII escaping. Non-BMP characters require 12 bytes each.
+        value = {"output": "\U0001f600" * 18000}
+        serialized = json.dumps(value, ensure_ascii=False)
+        read = self.function("read_cached_output", {"json": json,
+            "get_cached_output": lambda output_id: value, "OUTPUT_LIMIT_MAX_CHARS": 50000})
+        for count in (8000, 10000):
+            with self.subTest(count=count):
+                offset, chunks = 0, []
+                while True:
+                    page = read("cached", offset=offset, count=count)
+                    self.assertLessEqual(len(json.dumps(page)), 50000,
+                        "A cache page must not itself be truncated while retaining its nextOffset")
+                    chunks.append(page["text"])
+                    self.assertEqual(page["totalChars"], len(serialized))
+                    if page["nextOffset"] is None:
+                        break
+                    self.assertGreater(page["nextOffset"], offset)
+                    self.assertEqual(page["nextOffset"], offset + len(page["text"]))
+                    offset = page["nextOffset"]
+                self.assertEqual("".join(chunks), serialized)
+
+    def test_parent_exit_does_not_save_an_acknowledged_discard_close(self):
+        kernel = Mock()
+        kernel.WaitForSingleObject.return_value = 0
+        loader, debugger, pump = Mock(), Mock(), Mock()
+        debugger.is_debugger_on.return_value = False
+        tick = self.function("tick", {"PARENT": (kernel, 1), "CLOSING": True,
+            "SAVE": False, "EXIT_AT": time.monotonic() - 1, "time": time,
+            "ida_loader": loader, "ida_dbg": debugger, "get_pump": lambda: pump,
+            "CONFIG": {"mode": "headless"}})
+        self.assertEqual(tick(), -1)
+        loader.save_database.assert_not_called()
+        pump.stop.assert_called_once()
+
+    def test_parent_exit_retries_failed_save_then_stops_saving_after_success(self):
+        kernel = Mock()
+        kernel.WaitForSingleObject.return_value = 0
+        loader, debugger, pump = Mock(), Mock(), Mock()
+        loader.save_database.side_effect = [False, True]
+        debugger.is_debugger_on.return_value = False
+        environment = {"PARENT": (kernel, 1), "CLOSING": False, "EXIT_AT": 0,
+            "time": time, "ida_loader": loader, "ida_dbg": debugger,
+            "get_pump": lambda: pump, "CONFIG": {"mode": "headless"}}
+        tick = self.function("tick", environment)
+        self.assertEqual(tick(), 100)
+        self.assertFalse(environment["CLOSING"])
+        self.assertEqual(tick(), -1)
+        self.assertEqual(tick(), -1)
+        self.assertEqual(loader.save_database.call_count, 2)
 
     def test_unmapped_native_visitor_patch_cannot_create_partial_output(self):
         with tempfile.TemporaryDirectory(dir=ROOT / ".tmp") as directory:

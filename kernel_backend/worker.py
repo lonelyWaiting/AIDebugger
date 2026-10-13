@@ -58,9 +58,11 @@ def run():
     def close_engine():
         nonlocal engine
         with engine_lock:
-            if engine:
-                engine.close()
-                engine = None
+            closing, engine = engine, None
+            if closing:
+                # EndSession may have partially succeeded before failing.
+                # Never retry it or expose its interfaces to interrupts again.
+                closing.close()
 
     def pending_close():
         while not requests.empty():
@@ -175,8 +177,11 @@ def run():
             if request is None:
                 continue
             if request["operation"] == "close":
-                close_engine()
-                send({"id": request["id"], "result": {"state": "closed", "behavior": "passive_detach", "nativeCloseConfirmed": True, "targetResumed": False}})
+                try:
+                    close_engine()
+                    send({"id": request["id"], "result": {"state": "closed", "behavior": "passive_detach", "nativeCloseConfirmed": True, "targetResumed": False}})
+                except Exception as exception:
+                    error(request["id"], exception)
                 break
             try:
                 result = engine.perform(request["operation"], request["arguments"])
@@ -197,12 +202,10 @@ def run():
         error(config["open_id"], exception)
         pending_close()
     finally:
-        with engine_lock:
-            if engine:
-                try:
-                    engine.close()
-                except Exception:
-                    pass
+        try:
+            close_engine()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

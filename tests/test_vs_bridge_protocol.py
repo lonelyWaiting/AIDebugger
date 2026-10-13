@@ -744,6 +744,40 @@ class VSBridgeSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(forwarded_timeout, 0.1)
         self.assertLess(forwarded_timeout, 0.35)
 
+    async def test_exact_call_charges_registration_binding_to_deadline(self) -> None:
+        for binding_seconds in (0.15, 0.5):
+            with self.subTest(binding_seconds=binding_seconds):
+                bridge = vs_bridge.VSBridge()
+                registration = self.registration("AIDebuggerVS_42")
+                target = dict(registration)
+                now = [100.0]
+                transport = AsyncMock(return_value=({"isPaused": True}, target))
+
+                def bind(*args, **kwargs):
+                    now[0] += binding_seconds
+                    return registration, target
+
+                try:
+                    with patch.object(vs_bridge, "time", SimpleNamespace(monotonic=lambda: now[0])), \
+                         patch.object(vs_bridge, "_bind_registration_snapshot", side_effect=bind), \
+                         patch.object(bridge, "call_pipe", transport):
+                        if binding_seconds < 0.4:
+                            self.assertEqual(
+                                {"isPaused": True},
+                                await bridge.call_pipe_exact(target, "get_debug_status", timeout=0.4),
+                            )
+                            self.assertAlmostEqual(0.25, transport.await_args.args[3])
+                        else:
+                            with self.assertRaises(vs_bridge.VSBridgeError) as raised:
+                                await bridge.call_pipe_exact(target, "continue", timeout=0.4)
+                            self.assertEqual("DEADLINE_EXCEEDED_NOT_STARTED", raised.exception.code)
+                            self.assertFalse(raised.exception.outcome_unknown)
+                            transport.assert_not_awaited()
+                finally:
+                    bridge._executor.shutdown(wait=True)
+                    bridge._control_executor.shutdown(wait=True)
+                    bridge._recovery_executor.shutdown(wait=True)
+
     async def test_exact_pin_rejects_registration_replacement_before_transport(self) -> None:
         bridge = vs_bridge.VSBridge()
         target = self.registration("AIDebuggerVS_42")

@@ -168,7 +168,14 @@ class IdaSessions:
             ready = session.directory / "ready.json"
             if not ready.exists():
                 return session.describe()
-            data = json.loads(ready.read_text(encoding="utf-8"))
+            try:
+                data = json.loads(ready.read_text(encoding="utf-8"))
+            except PermissionError:
+                # Windows can briefly deny reads while the worker atomically
+                # publishes its registration. Leave readiness to the next poll;
+                # no command may dispatch before identity validation succeeds.
+                session.state = "busy" if session.identity else "starting"
+                return session.describe()
             if data.get("sessionId") != session_id or data.get("pid") != session.process.pid:
                 raise IdaError("IDA_IDENTITY_MISMATCH", "Invalid worker registration")
             session.port = data["port"]

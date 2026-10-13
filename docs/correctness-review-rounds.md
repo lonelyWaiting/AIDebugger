@@ -148,3 +148,101 @@ criterion is satisfied.
 Final evidence: 377 Python tests, 117 C# tests and VS Release compilation passed
 for the final production source. Live VS deployment/COM fault injection, real
 IDA fault injection and live kernel stepping were not performed in these rounds.
+
+## 2026-10-13: parallel review and repair
+
+Reviewed the clean `512657f` baseline in four concurrent lanes: VS, IDA, kernel,
+and shared transport/installation. Reproduced and fixed ten defects:
+
+1. Interrupted chunked memory search resumed after bytes whose boundary-spanning
+   candidates had not yet been searched. Continuations now preserve the pattern
+   overlap, including nonzero initial offsets and timeout/transport failures.
+2. Exact VS calls reset their timeout after registration binding. Binding now
+   consumes the total budget; an exhausted budget cannot dispatch a command.
+3. Replacing a query recovery response did not update completion order, allowing
+   expired entries to survive and newer responses to be evicted. Replacements
+   now move to the end of the bounded journal.
+4. An oversized replacement left the previous same-ID query response available.
+   The old response is now removed even when its replacement cannot be retained.
+5. Unicode IDA cache pages could exceed the vendor's escaped-JSON output limit
+   and be truncated again without adjusting their cursor. Pages now fit that
+   exact limit and can be reassembled without missing text.
+6. Parent exit could trigger an automatic IDB save after an acknowledged
+   `save=False` close. Automatic saving now respects an established close.
+7. Kernel reply-reader exit still admitted interrupts that could never finish.
+   Failed transport now blocks ordinary work while retaining watchdog close.
+8. A failed native kernel close was retried and attributed to the open job.
+   Close now relinquishes engine ownership once and reports to the close job.
+9. One installer rollback failure skipped other destinations and replaced the
+   original exception. Rollback now attempts each destination and records its
+   failures on the original error, preserving concurrent edits.
+10. A stdio reply containing an isolated Unicode surrogate disappeared during
+    UTF-8 encoding. JSON escaping now preserves a decodable response.
+
+New regressions failed on the prior implementations, then passed after repair.
+Independent cross-reviews found no additional confirmed defect in these changes.
+Final validation: 387 Python tests, 119 C# tests, VS Release `Compile`, and
+`git diff --check` passed. Fresh IDA and kernel MCP processes also completed
+stdio ping/tools-list requests, including an isolated-surrogate request ID.
+
+These checks cover controlled transport, paging, lifecycle, journal and rollback
+failures. They do not establish live VS/COM, real IDA/IDB close, or live kernel
+behavior. No installed runtime, user debugging target, or existing session was
+changed; no commit or deployment was performed.
+
+## 2026-10-13: real targets and deployed-runtime follow-up
+
+Built two separate owned native EXE/PDB fixtures and exercised the current VS
+and IDA implementations concurrently. VS used the isolated
+`AIDBLive20261013a` experimental profile, with the newly built extension's
+loaded DLL hash verified from the owned process. IDA used fresh workspace-source
+MCP/worker processes and private session directories. The existing HeartGame
+Visual Studio instance (PID 69040) and its debugging session were not changed.
+
+Real execution exposed three additional defects, all repaired:
+
+1. VS had observed a completed step, but a later context-epoch change rejected
+   optional source-location capture and incorrectly changed the receipt to
+   `OUTCOME_UNKNOWN`. The completed receipt now survives as
+   `step_completed_capture_unavailable`; the context guard remains enforced,
+   and no step is retried. Positive and negative C# regressions cover the rule.
+2. IDA's headless polling repeatedly appended the current paused event and
+   overflowed the bounded event ring. Native `DBG_Hooks` notifications now own
+   event collection. Idle polls add nothing, while distinct notifications at
+   the same address remain available.
+3. Windows could briefly deny reading IDA's ready file during atomic publication.
+   Readiness now stays starting/busy for the next poll. No tool dispatch occurs
+   before registration identity has been read and validated.
+
+Verified behavior and local evidence:
+
+| Backend | Real validation | Evidence under `.tmp/live-validation-20261013/` |
+| --- | --- | --- |
+| VS | Exact owned PID attach, file breakpoint, paused `OwnedProbe` callstack, memory read, cross-1-MB search and interrupted continuation, step, breakpoint removal, detach, owned-process exit | `vs/evidence.json`, `vs/deployment-receipt.json` |
+| IDA 9.1 | PDB private symbol, Hex-Rays, 18,000-emoji output reconstructed from six pages, breakpoint and both step operations, registers, detach with target still alive, explicit target exit, saved close, IDB reopen after hard/graceful parent disconnect with `save=False` | `ida/evidence.json`, `ida/run_validation.py` |
+| DbgEng | Two real PAGEDU64 dumps, modules/registers/stack/analysis, engine-memory write/read/restore, disassembly, missing pages, Unicode symbol path, isolated access modes, output paging, passive close | `kernel/summary.json`, `kernel/dump-13a.json`, `kernel/dump-9f.json` |
+| Kernel lifecycle | No-peer KDNET wait cancellation/close; failed reply reader with real dump worker; later requests rejected, watchdog closes only the owned worker | `kernel/transport-lifecycle.json` |
+| Installer/stdio | Isolated home deployment preserving VS and unrelated settings; 85 deployed payload hashes verified; fresh deployed IDA/kernel stdio tool discovery and isolated-surrogate ping | `shared/evidence.json` |
+
+The final VS run observed RIP `0x7FF6D7BB1418 -> 0x7FF6D7BB1422`,
+break sequence `1 -> 2`, and stop reason `step`. The loaded extension SHA-256 was
+`4c6aa0bcafee5a2a00d23ffdf559720a40fbd9dc7f14a4ccb8c4f837fe770a29`.
+Reusable VS and kernel lifecycle probes are in
+`tests/vs_integration/run_owned_native_validation.py` and
+`tests/kernel_integration/run_kernel_transport_lifecycle.py`.
+
+Final regression batch: **390 Python tests and 121 C# tests passed**. The updated
+VS extension completed a Release build and experimental-profile deployment.
+The repository IDA Skill now records the observed debugger-state and event-count
+semantics, and passed its validator. Independent review found no blocking issue
+in the three runtime fixes. All owned targets and workers were cleaned up; no
+commit or deployment into the user's primary profile was performed.
+
+Evidence boundaries: VS interrupted search used a controlled client deadline
+after an actual first-chunk read. Native callstack source lines remained
+unavailable, and the register snapshot reported missing RFLAGS; the measured RIP
+was available. Kernel reader failure was injected in the supervisor, leaving the
+real worker/DbgEng unchanged. Offline dumps and a no-peer KDNET wait do not prove
+connected live-kernel breakpoint/step/resume behavior, and matching-PDB crash
+analysis was not established. IDA event counts measure native notifications,
+not exact breakpoint hits, because one stop can emit more than one notification.

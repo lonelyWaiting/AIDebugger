@@ -1985,6 +1985,7 @@ class VSBridge:
         untouched. Callers that must not redirect what a later bare tool call
         resolves to (for example multi-target dispatch) pass it explicitly.
         """
+        call_deadline = time.monotonic() + max(self._MIN_SYNC_TIMEOUT, float(timeout))
         pipe_name = str(target.get("pipeName") or "")
         if registration_snapshot is None and isinstance(target, BoundVSTarget):
             registration_snapshot = target.registration_snapshot()
@@ -2000,11 +2001,18 @@ class VSBridge:
                 )
             ):
                 registration_snapshot = self.get_selected_registration_snapshot()
-        with _scoped_validation_deadline(time.monotonic() + max(self._MIN_SYNC_TIMEOUT, float(timeout))):
+        with _scoped_validation_deadline(call_deadline):
             bound_registration, _ = _bind_registration_snapshot(
                 pipe_name,
                 expected_target=target,
                 registration_snapshot=registration_snapshot,
+            )
+        remaining_timeout = call_deadline - time.monotonic()
+        if remaining_timeout <= self._MIN_SYNC_TIMEOUT:
+            raise VSBridgeError(
+                "Request was not started because target binding exhausted its timeout budget",
+                code="DEADLINE_EXCEEDED_NOT_STARTED",
+                target_identity=dict(target),
             )
         context_keys = ("debugSessionGeneration", "breakSequence", "contextEpoch")
         expected_context = {key: target.get(key) for key in context_keys if key in target}
@@ -2013,7 +2021,7 @@ class VSBridge:
                 pipe_name,
                 method,
                 params,
-                timeout,
+                remaining_timeout,
                 include_target=True,
                 expected_target=target,
                 registration_snapshot=bound_registration,

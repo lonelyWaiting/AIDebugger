@@ -14,6 +14,7 @@ using EnvDTE80;
 using EnvDTE100;
 using Microsoft.VisualStudio.Shell;
 using Microsoft.VisualStudio.Shell.Interop;
+using VSDebuggerMCP.Ipc;
 using VSDebuggerMCP.Protocol;
 using VSDebuggerMCP.Services;
 
@@ -1523,13 +1524,24 @@ namespace VSDebuggerMCP
                     stop.BreakSequence,
                     stop.ContextEpoch);
 
-                result.NewLocation = ExecuteOnMainThread(() =>
-                {
-                    ThreadHelper.ThrowIfNotOnUIThread();
-                    EnvDTE.StackFrame frame = Debugger?.CurrentStackFrame;
-                    return CreateSourceLocation(frame);
-                });
+                // The new stop already proves that execution completed. An
+                // optional source-location capture must not turn that receipt
+                // back into an unknown mutation outcome when a late context
+                // notification changes the epoch before its UI dispatch.
                 result.Outcome = "step_completed";
+                try
+                {
+                    result.NewLocation = ExecuteOnMainThread(() =>
+                    {
+                        ThreadHelper.ThrowIfNotOnUIThread();
+                        EnvDTE.StackFrame frame = Debugger?.CurrentStackFrame;
+                        return CreateSourceLocation(frame);
+                    });
+                }
+                catch (Exception ex)
+                {
+                    OperationResultPolicy.RecordCompletedStepCaptureFailure(result, ex);
+                }
                 return result;
             }
             catch (Exception ex)

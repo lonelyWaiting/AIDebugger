@@ -1,9 +1,23 @@
+using System;
 using VSDebuggerMCP.Protocol;
 
 namespace VSDebuggerMCP.Ipc
 {
     internal static class OperationResultPolicy
     {
+        internal static void RecordCompletedStepCaptureFailure(
+            DebugControlResult result,
+            Exception captureError)
+        {
+            if (result == null) throw new ArgumentNullException(nameof(result));
+            if (captureError == null) throw new ArgumentNullException(nameof(captureError));
+            if (!result.Success || !result.CommandIssued || result.Outcome != "step_completed")
+                throw new InvalidOperationException("Only an observed completed step may retain success after capture failure.");
+
+            result.Outcome = "step_completed_capture_unavailable";
+            result.Message += "; source-location capture was unavailable: " + captureError.Message;
+        }
+
         /// <summary>
         /// A debugger wait timeout is a completed command result, not a transport or
         /// dispatch failure. Preserve issuedContinue, current status, and request-ledger
