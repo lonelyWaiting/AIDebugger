@@ -304,7 +304,7 @@ if (!(Test-Path -LiteralPath $vsix)) { throw "VSIX not found: $vsix" }
 if (!(Test-Path -LiteralPath $createExpInstance)) { throw "VSSDK CreateExpInstance was not found: $createExpInstance" }
 $runningVisualStudio = @(Get-Process -Name devenv -ErrorAction SilentlyContinue)
 if ($runningVisualStudio.Count -ne 0) {
-    throw "Live VS smoke requires all existing Visual Studio processes to be closed because devenv /Setup uses a machine-wide configuration lock"
+    throw "Live VS smoke requires all existing Visual Studio processes to be closed"
 }
 
 & $msbuild $solution /t:Build /p:Configuration=Debug /v:minimal
@@ -313,20 +313,27 @@ if ($LASTEXITCODE -ne 0) { throw "Live-smoke debuggee build failed" }
 if ($LASTEXITCODE -ne 0) { throw "Experimental Instance reset failed for $RootSuffix" }
 & $vsixInstaller /quiet "/rootSuffix:$RootSuffix" $vsix
 if ($LASTEXITCODE -ne 0) { throw "VSIX installation into $RootSuffix failed" }
-$configurationProcess = Start-Process -FilePath $devenv -ArgumentList @(
-    "/RootSuffix", $RootSuffix,
-    "/Setup"
-) -PassThru -WindowStyle Hidden
-$configurationDeadline = [DateTime]::UtcNow.AddMinutes(5)
-while (!$configurationProcess.HasExited -and [DateTime]::UtcNow -lt $configurationDeadline) {
-    $configurationProcess.WaitForExit(500) | Out-Null
-}
-if (!$configurationProcess.HasExited) {
-    Stop-Process -Id $configurationProcess.Id -Force -ErrorAction SilentlyContinue
-    throw "Visual Studio extension configuration refresh timed out for $RootSuffix"
-}
-if ($configurationProcess.ExitCode -ne 0) {
-    throw "Visual Studio extension configuration refresh failed for $RootSuffix"
+if ($AsSmokeUser) {
+    # Password-logon scheduled tasks run in session 0 with no interactive desktop.
+    # devenv /Setup hangs there; VSIXInstaller already registered the extension into
+    # the Experimental Instance hive for this user.
+    Write-Host "Skipping devenv /Setup under non-interactive smoke user (VSIXInstaller registration is sufficient)."
+} else {
+    $configurationProcess = Start-Process -FilePath $devenv -ArgumentList @(
+        "/RootSuffix", $RootSuffix,
+        "/Setup"
+    ) -PassThru -WindowStyle Hidden
+    $configurationDeadline = [DateTime]::UtcNow.AddMinutes(5)
+    while (!$configurationProcess.HasExited -and [DateTime]::UtcNow -lt $configurationDeadline) {
+        $configurationProcess.WaitForExit(500) | Out-Null
+    }
+    if (!$configurationProcess.HasExited) {
+        Stop-Process -Id $configurationProcess.Id -Force -ErrorAction SilentlyContinue
+        throw "Visual Studio extension configuration refresh timed out for $RootSuffix"
+    }
+    if ($configurationProcess.ExitCode -ne 0) {
+        throw "Visual Studio extension configuration refresh failed for $RootSuffix"
+    }
 }
 
 # Capability vocabulary must match DebugMethodCatalog / debug_method_manifest.json.
