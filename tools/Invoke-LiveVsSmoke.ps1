@@ -11,11 +11,56 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
 function Test-HighIntegrityProcess {
-    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    foreach ($group in $identity.Groups) {
-        if ($group.Value -eq "S-1-16-12288") { return $true }
+    # WindowsIdentity.Groups does not include the Mandatory Label SID. Query the
+    # token integrity level the same way ProcessIntegrityValidator does (RID >= 0x3000).
+    $aidbTypeDef = @"
+using System;
+using System.Runtime.InteropServices;
+public static class AidbTokenIntegrity {
+    const int TokenIntegrityLevel = 25;
+    const uint TokenQuery = 0x0008;
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool GetTokenInformation(IntPtr tokenHandle, int tokenInformationClass, IntPtr tokenInformation, int tokenInformationLength, out int returnLength);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern IntPtr GetSidSubAuthority(IntPtr sid, uint subAuthority);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool IsValidSid(IntPtr sid);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr handle);
+    public static bool IsHighOrAbove() {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), TokenQuery, out token)) return false;
+        try {
+            int needed;
+            GetTokenInformation(token, TokenIntegrityLevel, IntPtr.Zero, 0, out needed);
+            if (needed <= 0) return false;
+            IntPtr buffer = Marshal.AllocHGlobal(needed);
+            try {
+                if (!GetTokenInformation(token, TokenIntegrityLevel, buffer, needed, out needed)) return false;
+                IntPtr sid = Marshal.ReadIntPtr(buffer);
+                if (sid == IntPtr.Zero || !IsValidSid(sid)) return false;
+                IntPtr countPointer = GetSidSubAuthorityCount(sid);
+                if (countPointer == IntPtr.Zero) return false;
+                byte subAuthorityCount = Marshal.ReadByte(countPointer);
+                if (subAuthorityCount == 0) return false;
+                IntPtr ridPointer = GetSidSubAuthority(sid, (uint)(subAuthorityCount - 1));
+                if (ridPointer == IntPtr.Zero) return false;
+                return unchecked((uint)Marshal.ReadInt32(ridPointer)) >= 0x3000u;
+            } finally { Marshal.FreeHGlobal(buffer); }
+        } finally { CloseHandle(token); }
     }
-    return $false
+}
+"@
+    if (-not ("AidbTokenIntegrity" -as [type])) {
+        Add-Type -TypeDefinition $aidbTypeDef -ErrorAction Stop
+    }
+    return [AidbTokenIntegrity]::IsHighOrAbove()
 }
 
 function Ensure-LiveSmokeUser {
