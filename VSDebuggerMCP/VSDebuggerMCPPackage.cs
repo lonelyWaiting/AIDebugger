@@ -421,6 +421,17 @@ namespace VSDebuggerMCP
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             if (!ProcessIntegrityValidator.IsCurrentProcessElevated()) return true;
+            // GitHub-hosted Windows runners are High integrity with UAC disabled; same-user
+            // de-elevation cannot produce a Medium token. CI live smoke sets this opt-in so
+            // the Experimental Instance can exercise the authenticated pipe without weakening
+            // the default interactive elevation refusal.
+            string allowElevated = Environment.GetEnvironmentVariable("AIDB_ALLOW_ELEVATED_SERVER");
+            if (string.Equals(allowElevated, "1", StringComparison.Ordinal))
+            {
+                LogMessage(
+                    $"AIDB_ALLOW_ELEVATED_SERVER=1: allowing elevated Visual Studio to {operation} (CI/automation only).");
+                return true;
+            }
             string message =
                 $"AIDebugger refuses to {operation} from an elevated Visual Studio process. " +
                 "Its MCP Python runtime and client configuration are per-user files; crossing the elevation boundary would be unsafe. " +
