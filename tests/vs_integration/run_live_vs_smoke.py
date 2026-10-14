@@ -14,21 +14,56 @@ sys.path.insert(0, str(ROOT))
 from mcp_server import bootstrap
 
 bootstrap.ensure_deps()
-from mcp_server import vs_bridge
+from mcp_server import vs_bridge, vs_launch
 
 
 PROGRAM = ROOT / "tests" / "vs_integration" / "Debuggee" / "Program.cs"
 
 
 async def wait_for_instance(process_id: int, timeout: float = 300.0) -> str:
+    """Wait for the AIDB pipe, matching vs_launch's /Command grace + DTE fallback."""
     deadline = time.monotonic() + timeout
     last = []
-    while time.monotonic() < deadline:
+
+    async def _poll_once() -> str | None:
+        nonlocal last
         instances = await vs_bridge.discover_instances()
         last = [instance.to_dict() for instance in instances]
         for instance in instances:
             if instance.process_id == process_id and instance.connection_status == "ok":
                 return instance.pipe_name
+        return None
+
+    grace = min(vs_launch.LAUNCH_SWITCH_GRACE_SECONDS, max(0.0, deadline - time.monotonic()))
+    grace_deadline = time.monotonic() + grace
+    while time.monotonic() < grace_deadline:
+        pipe_name = await _poll_once()
+        if pipe_name is not None:
+            return pipe_name
+        await asyncio.sleep(0.5)
+
+    # /Command often races the Exp Instance command table on cold CI startups.
+    # The production launcher falls back to DTE ExecuteCommand; smoke must too.
+    # Cold Exp Instance on GitHub-hosted runners can take well over the default
+    # 45s DTE lookup window before the automation object appears in the ROT.
+    original_dte_timeout = vs_launch.DTE_LOOKUP_TIMEOUT_SECONDS
+    vs_launch.DTE_LOOKUP_TIMEOUT_SECONDS = min(120.0, max(0.0, deadline - time.monotonic()))
+    try:
+        loop = asyncio.get_running_loop()
+        status = await loop.run_in_executor(
+            None,
+            vs_launch._invoke_launcher_command,
+            process_id,
+            os.environ.get("AIDB_LAUNCH_ID") or "live-smoke",
+        )
+        print(f"LIVE_VS_SMOKE_DTE_FALLBACK: {status}")
+    finally:
+        vs_launch.DTE_LOOKUP_TIMEOUT_SECONDS = original_dte_timeout
+
+    while time.monotonic() < deadline:
+        pipe_name = await _poll_once()
+        if pipe_name is not None:
+            return pipe_name
         await asyncio.sleep(0.5)
     raise AssertionError(f"AIDebugger pipe for devenv PID {process_id} did not appear: {last}")
 
