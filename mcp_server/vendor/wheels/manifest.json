@@ -7,7 +7,7 @@
                    "cp313",
                    "cp314"
                ],
-    "generatedAt":  "2026-07-21",
+    "generatedAt":  "2026-10-14",
     "wheels":  [
                    {
                        "file":  "vendor/wheels/annotated_types-0.7.0-py3-none-any.whl",
@@ -56,6 +56,10 @@
                    {
                        "file":  "vendor/wheels/cryptography-49.0.0-cp39-abi3-win_amd64.whl",
                        "sha256":  "026ac7423e6fa66872d3bf889be5974507da3944f866f704fa200eadacd00001"
+                   },
+                   {
+                       "file":  "vendor/wheels/exceptiongroup-1.3.1-py3-none-any.whl",
+                       "sha256":  "a7a39a3bd276781e98394987d3a5701d0c4edffb633bb7a5144577f82c773598"
                    },
                    {
                        "file":  "vendor/wheels/h11-0.16.0-py3-none-any.whl",

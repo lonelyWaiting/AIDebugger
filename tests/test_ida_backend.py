@@ -19,10 +19,14 @@ sys.path.insert(0, str(ROOT))
 from ida_backend.sessions import IdaSessions, Session
 from ida_backend.transport import IdaError, rpc, tool_value
 from ida_backend.stdio import serve
-from tools import install_aidebugger as installer
 
 _TEST_TMP = ROOT / ".tmp"
 _TEST_TMP.mkdir(parents=True, exist_ok=True)
+_HAS_INSTALLER = sys.version_info >= (3, 11)
+if _HAS_INSTALLER:
+    from tools import install_aidebugger as installer
+else:
+    installer = None  # type: ignore[assignment]
 
 
 class IdaTransportTests(unittest.TestCase):
@@ -592,6 +596,7 @@ class WorkerBoundaryTests(unittest.TestCase):
         event.exc.assert_not_called()
 
 
+@unittest.skipUnless(_HAS_INSTALLER, "install_aidebugger requires Python 3.11+ (tomllib)")
 class IdaInstallerTests(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(os.environ, {"CODEX_HOME": ""})

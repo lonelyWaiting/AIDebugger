@@ -370,53 +370,46 @@ class VSBridgeResponseTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "win32", "Windows ACL behavior")
     def test_registration_acl_accepts_only_owner_and_rejects_world_access(self) -> None:
-        import win32api
-        import win32con
         import win32security
         import ntsecuritycon
+        from mcp_server import vs_trust
 
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ,
             {"LOCALAPPDATA": directory},
         ):
-            aidb_root = pathlib.Path(directory) / "AIDebugger"
-            instances_root = aidb_root / "instances"
-            instances_root.mkdir(parents=True)
+            # Elevated CI runners often create TEMP files owned by Administrators
+            # while TokenUser is the interactive SID; set owner+DACL explicitly.
+            aidb_root = vs_trust.ensure_owner_only_directory(
+                pathlib.Path(directory) / "AIDebugger"
+            )
+            instances_root = vs_trust.ensure_owner_only_directory(aidb_root / "instances")
             path = instances_root / "instance.json"
             path.write_text("{}", encoding="utf-8")
-            token = win32security.OpenProcessToken(
-                win32api.GetCurrentProcess(),
-                win32con.TOKEN_QUERY,
-            )
-            owner_sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
-            dacl = win32security.ACL()
-            dacl.AddAccessAllowedAce(win32security.ACL_REVISION, ntsecuritycon.FILE_ALL_ACCESS, owner_sid)
-            security_information = (
-                win32security.DACL_SECURITY_INFORMATION
-                | win32security.PROTECTED_DACL_SECURITY_INFORMATION
-            )
-            for secured_path in (aidb_root, instances_root, path):
-                win32security.SetNamedSecurityInfo(
-                    str(secured_path),
-                    win32security.SE_FILE_OBJECT,
-                    security_information,
-                    None,
-                    None,
-                    dacl,
-                    None,
-                )
+            vs_trust.apply_owner_only_security(path)
             vs_bridge._validate_registration_security(path)
 
+            security = win32security.GetFileSecurity(
+                str(path),
+                win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION,
+            )
+            owner = security.GetSecurityDescriptorOwner()
+            dacl = win32security.ACL()
+            dacl.AddAccessAllowedAce(win32security.ACL_REVISION, ntsecuritycon.FILE_ALL_ACCESS, owner)
             world_sid = win32security.CreateWellKnownSid(win32security.WinWorldSid, None)
             dacl.AddAccessAllowedAce(win32security.ACL_REVISION, ntsecuritycon.FILE_GENERIC_READ, world_sid)
-            win32security.SetNamedSecurityInfo(
+            descriptor = win32security.SECURITY_DESCRIPTOR()
+            descriptor.SetSecurityDescriptorOwner(owner, False)
+            descriptor.SetSecurityDescriptorDacl(True, dacl, False)
+            descriptor.SetSecurityDescriptorControl(
+                win32security.SE_DACL_PROTECTED, win32security.SE_DACL_PROTECTED
+            )
+            win32security.SetFileSecurity(
                 str(path),
-                win32security.SE_FILE_OBJECT,
-                security_information,
-                None,
-                None,
-                dacl,
-                None,
+                win32security.OWNER_SECURITY_INFORMATION
+                | win32security.DACL_SECURITY_INFORMATION
+                | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor,
             )
             with self.assertRaises(vs_bridge.VSBridgeError) as raised:
                 vs_bridge._validate_registration_security(path)
@@ -1258,6 +1251,11 @@ class VSBridgeSelectionTests(unittest.IsolatedAsyncioTestCase):
         try:
             with patch.object(vs_bridge, "_discover_vs_pipes", return_value=[pipe_name]), \
                  patch.object(vs_bridge, "_load_instance_registration", return_value=registration) as load, \
+                 patch.object(
+                     vs_bridge,
+                     "_trusted_visual_studio_paths",
+                     return_value=frozenset({r"C:\trusted\Common7\IDE\devenv.exe"}),
+                 ), \
                  patch.object(vs_bridge, "_sync_call_to_pipe", side_effect=probe):
                 instances = bridge._sync_discover_instances()
             self.assertEqual(1, len(instances))

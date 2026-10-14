@@ -2,13 +2,19 @@
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from tools import install_aidebugger as installer
+_HAS_INSTALLER = sys.version_info >= (3, 11)
+if _HAS_INSTALLER:
+    from tools import install_aidebugger as installer
+else:
+    installer = None  # type: ignore[assignment]
 
 
+@unittest.skipUnless(_HAS_INSTALLER, "install_aidebugger requires Python 3.11+ (tomllib)")
 class InstallerRollbackTests(unittest.TestCase):
     def test_rollback_failure_does_not_skip_remaining_files_or_hide_install_error(self):
         for failure_kind in ("restore", "unlink", "read"):

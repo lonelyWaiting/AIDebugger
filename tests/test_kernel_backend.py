@@ -7,16 +7,21 @@ import subprocess
 import sys
 import tempfile
 import threading
-import tomllib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from kernel_backend.contracts import KernelError, capabilities, connection_identity, query_command, validate_operation
 from kernel_backend.sessions import KernelSessions, Session
-from tools import install_aidebugger as installer
 
 ROOT = Path(__file__).resolve().parents[1]
+_HAS_INSTALLER = sys.version_info >= (3, 11)
+if _HAS_INSTALLER:
+    import tomllib
+    from tools import install_aidebugger as installer
+else:
+    tomllib = None  # type: ignore[assignment]
+    installer = None  # type: ignore[assignment]
 
 
 class PolicyTests(unittest.TestCase):
@@ -462,6 +467,7 @@ class WorkerSchedulingTests(unittest.TestCase):
         self.assertEqual(errors, [{"id": "close", "error": {"code": "DBGENG_ERROR", "message": "EndSession failed"}}])
 
 
+@unittest.skipUnless(_HAS_INSTALLER, "install_aidebugger requires Python 3.11+ (tomllib)")
 class InstallerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
