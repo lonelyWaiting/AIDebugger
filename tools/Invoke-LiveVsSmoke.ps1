@@ -3,6 +3,8 @@ param(
     [string]$Configuration = "Release",
     # Internal: set when the High-IL host re-launches this script as the non-admin smoke user.
     [switch]$AsSmokeUser,
+    # Host already prepared the Experimental Instance and copied it into the smoke profile.
+    [switch]$SkipPrepare,
     # Absolute python.exe — scheduled-task users do not inherit the job PATH from setup-python.
     [string]$PythonPath = ""
 )
@@ -167,6 +169,138 @@ function New-MediumWritableDirectory {
     & icacls $Path /setintegritylevel "(OI)(CI)M" /T /C /Q | Out-Null
 }
 
+function Get-VsInstallContext {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    $installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+    if ([string]::IsNullOrWhiteSpace($installPath)) { throw "Visual Studio with MSBuild was not found" }
+    $installationVersion = [Version](& $vswhere -latest -products * -property installationVersion)
+    $instanceId = & $vswhere -latest -products * -property instanceId
+    return [pscustomobject]@{
+        Vswhere = $vswhere
+        InstallPath = $installPath
+        Devenv = (Join-Path $installPath "Common7\IDE\devenv.exe")
+        VsixInstaller = (Join-Path $installPath "Common7\IDE\VSIXInstaller.exe")
+        Msbuild = (Join-Path $installPath "MSBuild\Current\Bin\MSBuild.exe")
+        CreateExpInstance = (Join-Path $installPath "VSSDK\VisualStudioIntegration\Tools\Bin\CreateExpInstance.exe")
+        InstallationVersion = $installationVersion
+        InstanceId = $instanceId
+        VsInstance = "$($installationVersion.Major).0_$instanceId"
+        VsixName = if ($installationVersion.Major -ge 18) { "VSDebuggerMCP.VS2026.vsix" } else { "VSDebuggerMCP.VS2022.vsix" }
+    }
+}
+
+function Invoke-ExpInstancePrepare {
+    param(
+        [Parameter(Mandatory = $true)]$Vs,
+        [Parameter(Mandatory = $true)][string]$RootSuffix,
+        [Parameter(Mandatory = $true)][string]$Configuration,
+        [switch]$AllowSetup
+    )
+
+    $vsix = Join-Path $repoRoot "VSDebuggerMCP\bin\$Configuration\$($Vs.VsixName)"
+    $solution = Join-Path $repoRoot "tests\vs_integration\AIDebugger.LiveSmoke.sln"
+    if (!(Test-Path -LiteralPath $vsix)) { throw "VSIX not found: $vsix" }
+    if (!(Test-Path -LiteralPath $Vs.CreateExpInstance)) {
+        throw "VSSDK CreateExpInstance was not found: $($Vs.CreateExpInstance)"
+    }
+    $runningVisualStudio = @(Get-Process -Name devenv -ErrorAction SilentlyContinue)
+    if ($runningVisualStudio.Count -ne 0) {
+        throw "Live VS smoke requires all existing Visual Studio processes to be closed"
+    }
+
+    & $Vs.Msbuild $solution /t:Build /p:Configuration=Debug /v:minimal
+    if ($LASTEXITCODE -ne 0) { throw "Live-smoke debuggee build failed" }
+    & $Vs.CreateExpInstance /Reset "/VSInstance=$($Vs.VsInstance)" "/RootSuffix=$RootSuffix"
+    if ($LASTEXITCODE -ne 0) { throw "Experimental Instance reset failed for $RootSuffix" }
+    & $Vs.VsixInstaller /quiet "/rootSuffix:$RootSuffix" $vsix
+    if ($LASTEXITCODE -ne 0) { throw "VSIX installation into $RootSuffix failed" }
+
+    if (-not $AllowSetup) {
+        Write-Host "Skipping devenv /Setup under non-interactive smoke user (host prepare already refreshed the hive)."
+        return
+    }
+
+    $configurationProcess = Start-Process -FilePath $Vs.Devenv -ArgumentList @(
+        "/RootSuffix", $RootSuffix,
+        "/Setup"
+    ) -PassThru -WindowStyle Hidden
+    $configurationDeadline = [DateTime]::UtcNow.AddMinutes(5)
+    while (!$configurationProcess.HasExited -and [DateTime]::UtcNow -lt $configurationDeadline) {
+        $configurationProcess.WaitForExit(500) | Out-Null
+    }
+    if (!$configurationProcess.HasExited) {
+        Stop-Process -Id $configurationProcess.Id -Force -ErrorAction SilentlyContinue
+        throw "Visual Studio extension configuration refresh timed out for $RootSuffix"
+    }
+    if ($configurationProcess.ExitCode -ne 0) {
+        throw "Visual Studio extension configuration refresh failed for $RootSuffix"
+    }
+}
+
+function Ensure-SmokeUserProfile {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Cred,
+        [Parameter(Mandatory = $true)][string]$OutDir
+    )
+    $marker = Join-Path $OutDir "profile-ready.txt"
+    $profileWrapper = Join-Path $OutDir "create-profile.ps1"
+    @"
+Set-Content -LiteralPath '$marker' -Value `$env:LOCALAPPDATA -Encoding UTF8
+"@ | Set-Content -LiteralPath $profileWrapper -Encoding UTF8
+    $taskName = "AIDebuggerSmokeProfile_" + ([guid]::NewGuid().ToString("N").Substring(0, 8))
+    try {
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$profileWrapper`""
+        Register-ScheduledTask -TaskName $taskName -Action $action -User $Cred.UserName -Password $Cred.Password -RunLevel Limited -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+        $deadline = [DateTime]::UtcNow.AddMinutes(2)
+        while (-not (Test-Path -LiteralPath $marker) -and [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not (Test-Path -LiteralPath $marker)) {
+            throw "Unable to create a profile for smoke user '$($Cred.UserName)'"
+        }
+        return (Get-Content -LiteralPath $marker -Raw).Trim()
+    }
+    finally {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+
+function Copy-ExpHiveToSmokeUser {
+    param(
+        [Parameter(Mandatory = $true)][string]$RootSuffix,
+        [Parameter(Mandatory = $true)][string]$SmokeLocalAppData,
+        [Parameter(Mandatory = $true)][string]$UserName
+    )
+    $sourceRoot = Join-Path $env:LOCALAPPDATA "Microsoft\VisualStudio"
+    $destRoot = Join-Path $SmokeLocalAppData "Microsoft\VisualStudio"
+    if (!(Test-Path -LiteralPath $sourceRoot)) {
+        throw "Host Visual Studio LocalAppData hive was not found: $sourceRoot"
+    }
+    New-Item -ItemType Directory -Path $destRoot -Force | Out-Null
+    $copied = 0
+    Get-ChildItem -LiteralPath $sourceRoot -Directory -ErrorAction Stop |
+        Where-Object { $_.Name -like "*$RootSuffix*" } |
+        ForEach-Object {
+            $dest = Join-Path $destRoot $_.Name
+            if (Test-Path -LiteralPath $dest) {
+                Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            & robocopy $_.FullName $dest /E /NFL /NDL /NJH /NJS /NC /NS | Out-Null
+            # robocopy exit codes 0-7 are success
+            if ($LASTEXITCODE -ge 8) {
+                throw "robocopy failed copying Exp hive '$($_.Name)' to smoke user (exit $LASTEXITCODE)"
+            }
+            & icacls $dest /grant "${UserName}:(OI)(CI)F" /T /C /Q | Out-Null
+            & icacls $dest /setintegritylevel "(OI)(CI)M" /T /C /Q | Out-Null
+            $copied += 1
+            Write-Host "Copied Exp hive '$($_.Name)' to smoke user profile."
+        }
+    if ($copied -eq 0) {
+        throw "No Experimental Instance directories matching '*$RootSuffix*' were found under $sourceRoot"
+    }
+}
+
 function Resolve-SmokePython {
     param([string]$Preferred)
     if (-not [string]::IsNullOrWhiteSpace($Preferred) -and (Test-Path -LiteralPath $Preferred)) {
@@ -202,6 +336,13 @@ function Invoke-AsNonAdminSmokeUser {
     $outDir = Join-Path $env:PUBLIC ("AIDebuggerLiveSmoke\" + $taskName)
     New-MediumWritableDirectory -Path $outDir -UserName $cred.UserName
 
+    # devenv /Setup needs an interactive-capable elevated host. Prepare the Exp
+    # hive as the runner, then copy it into the non-admin profile before launch.
+    $vs = Get-VsInstallContext
+    Invoke-ExpInstancePrepare -Vs $vs -RootSuffix $RootSuffix -Configuration $Configuration -AllowSetup
+    $smokeLocalAppData = Ensure-SmokeUserProfile -Cred $cred -OutDir $outDir
+    Copy-ExpHiveToSmokeUser -RootSuffix $RootSuffix -SmokeLocalAppData $smokeLocalAppData -UserName $cred.UserName
+
     $exitFile = Join-Path $outDir "exitcode.txt"
     $logFile = Join-Path $outDir "stdout.txt"
     $startedFile = Join-Path $outDir "started.txt"
@@ -211,7 +352,7 @@ Set-Content -LiteralPath '$startedFile' -Value (Get-Date).ToString('o') -Encodin
 `$ErrorActionPreference = 'Continue'
 `$code = 1
 try {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$ScriptPath' -RootSuffix '$RootSuffix' -Configuration '$Configuration' -AsSmokeUser -PythonPath '$PythonPath' *> '$logFile'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$ScriptPath' -RootSuffix '$RootSuffix' -Configuration '$Configuration' -AsSmokeUser -SkipPrepare -PythonPath '$PythonPath' *> '$logFile'
     `$code = `$LASTEXITCODE
     if (`$null -eq `$code) { `$code = 1 }
 } catch {
@@ -286,54 +427,14 @@ if (Test-HighIntegrityProcess) {
     throw "Live VS smoke is still High integrity after the non-admin re-launch; MCP server start would be refused"
 }
 
-$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-$installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
-if ([string]::IsNullOrWhiteSpace($installPath)) { throw "Visual Studio with MSBuild was not found" }
-$devenv = Join-Path $installPath "Common7\IDE\devenv.exe"
-$vsixInstaller = Join-Path $installPath "Common7\IDE\VSIXInstaller.exe"
-$msbuild = Join-Path $installPath "MSBuild\Current\Bin\MSBuild.exe"
-$createExpInstance = Join-Path $installPath "VSSDK\VisualStudioIntegration\Tools\Bin\CreateExpInstance.exe"
-$installationVersion = [Version](& $vswhere -latest -products * -property installationVersion)
-$instanceId = & $vswhere -latest -products * -property instanceId
-$vsInstance = "$($installationVersion.Major).0_$instanceId"
-$vsixName = if ($installationVersion.Major -ge 18) { "VSDebuggerMCP.VS2026.vsix" } else { "VSDebuggerMCP.VS2022.vsix" }
-$vsix = Join-Path $repoRoot "VSDebuggerMCP\bin\$Configuration\$vsixName"
+$vs = Get-VsInstallContext
+$devenv = $vs.Devenv
 $solution = Join-Path $repoRoot "tests\vs_integration\AIDebugger.LiveSmoke.sln"
 $activityLog = Join-Path $env:TEMP ("AIDebugger-" + $RootSuffix + "-ActivityLog.xml")
-if (!(Test-Path -LiteralPath $vsix)) { throw "VSIX not found: $vsix" }
-if (!(Test-Path -LiteralPath $createExpInstance)) { throw "VSSDK CreateExpInstance was not found: $createExpInstance" }
-$runningVisualStudio = @(Get-Process -Name devenv -ErrorAction SilentlyContinue)
-if ($runningVisualStudio.Count -ne 0) {
-    throw "Live VS smoke requires all existing Visual Studio processes to be closed"
-}
-
-& $msbuild $solution /t:Build /p:Configuration=Debug /v:minimal
-if ($LASTEXITCODE -ne 0) { throw "Live-smoke debuggee build failed" }
-& $createExpInstance /Reset "/VSInstance=$vsInstance" "/RootSuffix=$RootSuffix"
-if ($LASTEXITCODE -ne 0) { throw "Experimental Instance reset failed for $RootSuffix" }
-& $vsixInstaller /quiet "/rootSuffix:$RootSuffix" $vsix
-if ($LASTEXITCODE -ne 0) { throw "VSIX installation into $RootSuffix failed" }
-if ($AsSmokeUser) {
-    # Password-logon scheduled tasks run in session 0 with no interactive desktop.
-    # devenv /Setup hangs there; VSIXInstaller already registered the extension into
-    # the Experimental Instance hive for this user.
-    Write-Host "Skipping devenv /Setup under non-interactive smoke user (VSIXInstaller registration is sufficient)."
+if (-not $SkipPrepare) {
+    Invoke-ExpInstancePrepare -Vs $vs -RootSuffix $RootSuffix -Configuration $Configuration -AllowSetup:(-not $AsSmokeUser)
 } else {
-    $configurationProcess = Start-Process -FilePath $devenv -ArgumentList @(
-        "/RootSuffix", $RootSuffix,
-        "/Setup"
-    ) -PassThru -WindowStyle Hidden
-    $configurationDeadline = [DateTime]::UtcNow.AddMinutes(5)
-    while (!$configurationProcess.HasExited -and [DateTime]::UtcNow -lt $configurationDeadline) {
-        $configurationProcess.WaitForExit(500) | Out-Null
-    }
-    if (!$configurationProcess.HasExited) {
-        Stop-Process -Id $configurationProcess.Id -Force -ErrorAction SilentlyContinue
-        throw "Visual Studio extension configuration refresh timed out for $RootSuffix"
-    }
-    if ($configurationProcess.ExitCode -ne 0) {
-        throw "Visual Studio extension configuration refresh failed for $RootSuffix"
-    }
+    Write-Host "Using Experimental Instance hive prepared and copied by the elevated host."
 }
 
 # Capability vocabulary must match DebugMethodCatalog / debug_method_manifest.json.
