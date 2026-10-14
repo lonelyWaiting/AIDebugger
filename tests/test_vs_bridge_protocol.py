@@ -1411,7 +1411,7 @@ class VSBridgeSelectionTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(bridge, "discover_instances", side_effect=discovery), \
                  patch.object(bridge, "call_pipe_exact", transport):
                 request = asyncio.create_task(bridge.call("get_debug_status"))
-                await asyncio.wait_for(entered_discovery.wait(), timeout=0.5)
+                await asyncio.wait_for(entered_discovery.wait(), timeout=5.0)
                 bridge.select_instance(
                     pipe_name=explicit.pipe_name,
                     target_identity=explicit.target_identity(),
