@@ -285,8 +285,8 @@
 
   <Target Name="BuildManagedInspectionHelper" BeforeTargets="BeforeBuild" Condition="'$(DesignTimeBuild)' != 'true'">
     <MSBuild Projects="$(MSBuildProjectDirectory)\ManagedInspectionHelper\ManagedInspectionHelper.csproj"
-             Targets="Build"
-             Properties="Configuration=$(Configuration);Platform=AnyCPU" />
+             Targets="Restore;Build"
+             Properties="Configuration=$(Configuration);Platform=AnyCPU;RestorePackagesConfig=false" />
   </Target>
 
   <Target Name="CreateSplitVsixPackages" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' and Exists('$(MSBuildProjectDirectory)\$(OutputPath)$(AssemblyName).vsix')">

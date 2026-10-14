@@ -68,7 +68,9 @@ jobs:
         python-version: '3.14'
 
     - name: Restore NuGet packages
-      run: nuget restore VSDebuggerMCP/VSDebuggerMCP.csproj
+      run: |
+        nuget restore VSDebuggerMCP/VSDebuggerMCP.csproj
+        msbuild VSDebuggerMCP/ManagedInspectionHelper/ManagedInspectionHelper.csproj /t:Restore /p:Configuration=Release
 
     - name: Build VSIX (Release)
       run: msbuild VSDebuggerMCP/VSDebuggerMCP.csproj /p:Configuration=Release /p:DeployExtension=false
