@@ -8,6 +8,9 @@ import sys
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from mcp_server.typing_compat import ensure_pep655_typing_markers
+
+ensure_pep655_typing_markers()
 sys.path.insert(0, str(ROOT / "ida_backend/vendor/ida_pro_mcp/ida_mcp"))
 from zeromcp import McpServer, McpToolError
 sys.path.pop(0)

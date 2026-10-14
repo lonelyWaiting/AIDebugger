@@ -15,7 +15,6 @@ import shutil
 import sys
 import tempfile
 import time
-import tomllib
 
 SOURCE = Path(__file__).resolve().parents[1]
 SKILL = "ida-evidence-analysis"
@@ -25,10 +24,20 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def _tomllib():
+    """TOML parsing for installer registration edits (stdlib on 3.11+)."""
+    try:
+        import tomllib
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised on Python 3.10 CI
+        raise RuntimeError("install_aidebugger requires Python 3.11+ (tomllib)") from exc
+    return tomllib
+
+
 def replace_backend_toml(text, command, server, backend):
     """Replace only the selected backend's table; compare unrelated parsed data."""
     if backend not in {"ida", "kernel"}:
         raise ValueError("Unknown backend")
+    tomllib = _tomllib()
     original = tomllib.loads(text)
     lines = text.splitlines(keepends=True)
     result = []
@@ -45,7 +54,7 @@ def replace_backend_toml(text, command, server, backend):
                "\nargs = [" + json.dumps(str(server)) + "]\nenabled = true\n" +
                "startup_timeout_sec = 20\ntool_timeout_sec = 120\n")
     updated = "".join(result).rstrip() + "\n" + section
-    parsed = tomllib.loads(updated)
+    parsed = _tomllib().loads(updated)
     if parsed.get("mcp_servers", {}).get(backend, {}).get("command") != command:
         raise ValueError("Could not safely replace " + backend + " MCP table")
     # Header-like text inside multiline TOML values must never change unrelated
@@ -81,6 +90,8 @@ def payload_files(backend="ida"):
     entrypoint = "mcp_server/" + backend + "_server.py"
     files[entrypoint] = (SOURCE / entrypoint).read_bytes()
     files["mcp_server/stdio_dispatch.py"] = (SOURCE / "mcp_server/stdio_dispatch.py").read_bytes()
+    # Shared 3.10 typing markers used before vendored zeromcp imports.
+    files["mcp_server/typing_compat.py"] = (SOURCE / "mcp_server/typing_compat.py").read_bytes()
     return files
 
 
