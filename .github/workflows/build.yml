@@ -155,7 +155,13 @@ jobs:
     - name: Run C# protocol infrastructure tests
       run: dotnet test VSDebuggerMCP.Tests/VSDebuggerMCP.Tests.csproj -c Release
 
+    # GitHub-hosted Windows agents have no interactive desktop. Exp Instance devenv
+    # never publishes DTE into the ROT there, so /Command and the DTE fallback cannot
+    # start the AIDebugger pipe. Opt in with repository variable AIDB_RUN_LIVE_VS_SMOKE=true
+    # on an interactive self-hosted runner; locally run tools/Invoke-LiveVsSmoke.ps1
+    # (High-IL hosts get AIDB_ALLOW_ELEVATED_SERVER=1 from the script).
     - name: Run live Visual Studio Experimental Instance smoke test
+      if: ${{ vars.AIDB_RUN_LIVE_VS_SMOKE == 'true' }}
       shell: powershell
       run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/Invoke-LiveVsSmoke.ps1
 
