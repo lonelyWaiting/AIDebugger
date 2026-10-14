@@ -140,13 +140,14 @@ try {
     # Do not wait for DTE/ROT. On headless CI, devenv without /Command parks on the
     # Start Page and never finishes startup. Use the production launcher contract:
     # /Command + AIDB_LAUNCH_* (+ AIDB_ALLOW_ELEVATED_SERVER on High-IL hosts).
-    # Match mcp_server.vs_launch.build_launch_arguments: RootSuffix, solution, /Command.
-    # Keep /Log for CI diagnostics; place it with the other switches before the solution.
+    # Use a built-in /Command so cold Exp Instance still leaves the Start Page and
+    # registers DTE. The AIDebugger command is then dispatched through DTE once the
+    # extension command table is available (see run_live_vs_smoke.py).
     $devenvProcess = Start-Process -FilePath $devenv -ArgumentList @(
         "/RootSuffix", $RootSuffix,
         "/Log", $activityLog,
         $solution,
-        "/Command", "Tools.AIDebugger.StartFullAccessServer"
+        "/Command", "File.SaveAll"
     ) -PassThru -WindowStyle Hidden
     $testVsProcessId = $devenvProcess.Id
     if ($devenvProcess.HasExited) {

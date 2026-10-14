@@ -34,20 +34,12 @@ async def wait_for_instance(process_id: int, timeout: float = 300.0) -> str:
                 return instance.pipe_name
         return None
 
-    grace = min(vs_launch.LAUNCH_SWITCH_GRACE_SECONDS, max(0.0, deadline - time.monotonic()))
-    grace_deadline = time.monotonic() + grace
-    while time.monotonic() < grace_deadline:
-        pipe_name = await _poll_once()
-        if pipe_name is not None:
-            return pipe_name
-        await asyncio.sleep(0.5)
-
-    # /Command often races the Exp Instance command table on cold CI startups.
-    # The production launcher falls back to DTE ExecuteCommand; smoke must too.
-    # Cold Exp Instance on GitHub-hosted runners can take well over the default
-    # 45s DTE lookup window before the automation object appears in the ROT.
+    # CI launches with a built-in /Command (File.SaveAll) so Exp Instance leaves the
+    # Start Page and registers DTE. Dispatch the AIDebugger launcher through DTE as
+    # soon as automation is available — do not wait for a /Command that the cold
+    # Exp command table may not contain yet.
     original_dte_timeout = vs_launch.DTE_LOOKUP_TIMEOUT_SECONDS
-    vs_launch.DTE_LOOKUP_TIMEOUT_SECONDS = min(120.0, max(0.0, deadline - time.monotonic()))
+    vs_launch.DTE_LOOKUP_TIMEOUT_SECONDS = min(180.0, max(0.0, deadline - time.monotonic()))
     try:
         loop = asyncio.get_running_loop()
         status = await loop.run_in_executor(
