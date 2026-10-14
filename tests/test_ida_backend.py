@@ -21,6 +21,9 @@ from ida_backend.transport import IdaError, rpc, tool_value
 from ida_backend.stdio import serve
 from tools import install_aidebugger as installer
 
+_TEST_TMP = ROOT / ".tmp"
+_TEST_TMP.mkdir(parents=True, exist_ok=True)
+
 
 class IdaTransportTests(unittest.TestCase):
     def test_malformed_tool_envelopes_are_transport_errors(self):
@@ -145,7 +148,7 @@ class DebugContextTests(unittest.TestCase):
 
 class IdaLifecycleTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=ROOT / ".tmp")
+        self.temp = tempfile.TemporaryDirectory(dir=_TEST_TMP)
         self.directory = Path(self.temp.name)
         self.manager = IdaSessions(root=self.directory)
         self.process = Mock(pid=123)
@@ -551,7 +554,7 @@ class WorkerBoundaryTests(unittest.TestCase):
         self.assertEqual(loader.save_database.call_count, 2)
 
     def test_unmapped_native_visitor_patch_cannot_create_partial_output(self):
-        with tempfile.TemporaryDirectory(dir=ROOT / ".tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=_TEST_TMP) as directory:
             source = Path(directory) / "input.dll"
             source.write_bytes(b"1234")
             output = Path(directory) / "output.dll"
@@ -593,7 +596,7 @@ class IdaInstallerTests(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(os.environ, {"CODEX_HOME": ""})
         self.env.start()
-        self.temp = tempfile.TemporaryDirectory(dir=ROOT / ".tmp")
+        self.temp = tempfile.TemporaryDirectory(dir=_TEST_TMP)
         self.home = Path(self.temp.name)
         (self.home / ".codex").mkdir()
         self.toml = self.home / ".codex/config.toml"

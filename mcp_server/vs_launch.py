@@ -86,9 +86,9 @@ LAUNCH_FAILED_STATUS = "launch_failed"
 LAUNCH_FAILED_ERROR_CODE = "LAUNCH_FAILED"
 INSTALLATION_NOT_FOUND_ERROR_CODE = "VS_INSTALLATION_NOT_FOUND"
 
-_LAUNCH_ID_PATTERN = re.compile(r"\A[0-9a-f]{32}\z")
-_ROOT_SUFFIX_PATTERN = re.compile(r"\A[A-Za-z0-9]{1,48}\z")
-_CAPABILITY_PATTERN = re.compile(r"\A[a-z][a-z0-9.]{0,63}\z")
+_LAUNCH_ID_PATTERN = re.compile(r"\A[0-9a-f]{32}\Z")
+_ROOT_SUFFIX_PATTERN = re.compile(r"\A[A-Za-z0-9]{1,48}\Z")
+_CAPABILITY_PATTERN = re.compile(r"\A[a-z][a-z0-9.]{0,63}\Z")
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _NT_STILL_ACTIVE = 259
 _DOTNET_EPOCH_TICKS = 504911232000000000
@@ -134,7 +134,7 @@ class LaunchRecord:
 _LAUNCHES: Dict[int, LaunchRecord] = {}
 _LAUNCHES_LOADED = False
 LAUNCH_RECORD_SCHEMA_VERSION = 1
-_LAUNCH_RECORD_NAME = re.compile(r"\A([1-9][0-9]{0,9})\.json\z")
+_LAUNCH_RECORD_NAME = re.compile(r"\A([1-9][0-9]{0,9})\.json\Z")
 
 
 def _launches_root() -> pathlib.Path:

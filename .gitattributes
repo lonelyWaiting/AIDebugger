@@ -1,0 +1,3 @@
+# Signature fixtures are hashed as raw bytes across Python/PowerShell/C#.
+# Force LF so Windows checkouts (core.autocrlf) do not change the digest.
+tests/fixtures/VsBundleSignature/** text eol=lf

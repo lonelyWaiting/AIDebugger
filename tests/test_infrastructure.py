@@ -541,14 +541,19 @@ asyncio.run(check())
 
             old_bundle = make_bundle("1.0.0.0", "old")
             new_bundle = make_bundle("2.0.0.0", "new")
-            launcher.__file__ = str(root / "vs_server.py")
+            # Resolve so Windows short TEMP paths (e.g. RUNNER~1) match _select_server.
+            launcher.__file__ = str((root / "vs_server.py").resolve())
 
             (root / ".active-bundle").write_text(new_bundle.name, encoding="utf-8-sig")
-            self.assertEqual(new_bundle / "vs_server.py", launcher._select_server())
+            self.assertEqual(
+                (new_bundle / "vs_server.py").resolve(), launcher._select_server()
+            )
 
             # A deliberate installer rollback must win over stale higher bundles.
             (root / ".active-bundle").write_text(old_bundle.name, encoding="utf-8")
-            self.assertEqual(old_bundle / "vs_server.py", launcher._select_server())
+            self.assertEqual(
+                (old_bundle / "vs_server.py").resolve(), launcher._select_server()
+            )
 
     def test_vs_launcher_rejects_unexpected_and_reparse_directories(self) -> None:
         spec = importlib.util.spec_from_file_location(
