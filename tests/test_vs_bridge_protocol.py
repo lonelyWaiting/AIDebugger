@@ -975,6 +975,8 @@ class VSBridgeSelectionTests(unittest.IsolatedAsyncioTestCase):
         bridge = vs_bridge.VSBridge()
         pipe_name = "AIDebuggerVS_43"
         calls = []
+        entered = threading.Event()
+        release = threading.Event()
         with vs_bridge._INSTANCE_STATE_LOCK:
             vs_bridge._INSTANCE_STATE[(pipe_name, "instance")] = {"debugSessionGeneration": 7}
 
@@ -984,17 +986,23 @@ class VSBridgeSelectionTests(unittest.IsolatedAsyncioTestCase):
         ):
             calls.append((method, request_id, params))
             if method != "cancel_request":
-                time.sleep(0.2)
+                entered.set()
+                # Block until the test cancels; do not rely on wall-clock races.
+                release.wait(timeout=5.0)
             return {"state": "cancellation_requested"}
 
         try:
             with patch.object(vs_bridge, "_load_instance_registration", side_effect=self.registration), \
                  patch.object(bridge, "_sync_call", side_effect=slow_call):
                 task = asyncio.create_task(bridge.call_pipe(pipe_name, "get_modules", timeout=5.0))
-                await asyncio.sleep(0.02)
+                self.assertTrue(
+                    await self.wait_until(entered.is_set, timeout=5.0),
+                    "sync call did not start",
+                )
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await task
+                release.set()
 
             original_request_id = calls[0][1]
             self.assertTrue(await self.wait_until(lambda: any(
@@ -1002,6 +1010,7 @@ class VSBridgeSelectionTests(unittest.IsolatedAsyncioTestCase):
                 for method, _, params in calls
             )))
         finally:
+            release.set()
             with vs_bridge._INSTANCE_STATE_LOCK:
                 vs_bridge._INSTANCE_STATE.pop((pipe_name, "instance"), None)
             bridge._executor.shutdown(wait=True)
