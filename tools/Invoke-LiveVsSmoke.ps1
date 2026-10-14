@@ -92,8 +92,79 @@ function Grant-SmokeUserRepoAccess {
     foreach ($path in $paths) {
         if (Test-Path -LiteralPath $path) {
             & icacls $path /grant $grant /T /C /Q | Out-Null
+            # Checkout/build trees inherit High IL from the runneradmin process.
+            & icacls $path /setintegritylevel "(OI)(CI)M" /T /C /Q | Out-Null
         }
     }
+}
+
+function Grant-BatchLogonRight {
+    param([Parameter(Mandatory = $true)][string]$UserName)
+    # Register-ScheduledTask -User/-Password does not always grant SeBatchLogonRight.
+    $aidbLsaDef = @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+public static class AidbLsaRight {
+    [StructLayout(LayoutKind.Sequential)]
+    struct LSA_OBJECT_ATTRIBUTES {
+        public int Length;
+        public IntPtr RootDirectory;
+        public IntPtr ObjectName;
+        public int Attributes;
+        public IntPtr SecurityDescriptor;
+        public IntPtr SecurityQualityOfService;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct LSA_UNICODE_STRING {
+        public ushort Length;
+        public ushort MaximumLength;
+        public string Buffer;
+    }
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    static extern uint LsaOpenPolicy(IntPtr systemName, ref LSA_OBJECT_ATTRIBUTES objectAttributes, int desiredAccess, out IntPtr policyHandle);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    static extern uint LsaAddAccountRights(IntPtr policyHandle, byte[] accountSid, LSA_UNICODE_STRING[] userRights, int countOfRights);
+    [DllImport("advapi32.dll")]
+    static extern int LsaClose(IntPtr policyHandle);
+    [DllImport("advapi32.dll")]
+    static extern int LsaNtStatusToWinError(uint status);
+    public static void AddRight(string account, string right) {
+        var sid = (SecurityIdentifier)new NTAccount(account).Translate(typeof(SecurityIdentifier));
+        byte[] sidBytes = new byte[sid.BinaryLength];
+        sid.GetBinaryForm(sidBytes, 0);
+        var attributes = new LSA_OBJECT_ATTRIBUTES();
+        IntPtr policy;
+        uint status = LsaOpenPolicy(IntPtr.Zero, ref attributes, 0xF0FFF, out policy);
+        if (status != 0) throw new Win32Exception(LsaNtStatusToWinError(status));
+        try {
+            var rights = new LSA_UNICODE_STRING[1];
+            rights[0] = new LSA_UNICODE_STRING {
+                Buffer = right,
+                Length = (ushort)(right.Length * 2),
+                MaximumLength = (ushort)((right.Length + 1) * 2)
+            };
+            status = LsaAddAccountRights(policy, sidBytes, rights, 1);
+            if (status != 0) throw new Win32Exception(LsaNtStatusToWinError(status));
+        } finally {
+            LsaClose(policy);
+        }
+    }
+}
+"@
+    if (-not ("AidbLsaRight" -as [type])) {
+        Add-Type -TypeDefinition $aidbLsaDef -ErrorAction Stop
+    }
+    [AidbLsaRight]::AddRight($UserName, "SeBatchLogonRight")
+}
+
+function New-MediumWritableDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$UserName)
+    # High-IL %TEMP% rejects Medium writers via MIC even after a DACL grant.
+    New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    & icacls $Path /grant "${UserName}:(OI)(CI)M" /T /C /Q | Out-Null
+    & icacls $Path /setintegritylevel "(OI)(CI)M" /T /C /Q | Out-Null
 }
 
 function Resolve-SmokePython {
@@ -117,23 +188,26 @@ function Invoke-AsNonAdminSmokeUser {
     )
 
     $cred = Ensure-LiveSmokeUser
+    Grant-BatchLogonRight -UserName $cred.UserName
     Grant-SmokeUserRepoAccess -UserName $cred.UserName
     # setup-python installs into a per-job location; grant RX so the smoke user can execute it.
     $pythonDir = Split-Path -Parent $PythonPath
     if (Test-Path -LiteralPath $pythonDir) {
         & icacls $pythonDir /grant "$($cred.UserName):(OI)(CI)RX" /T /C /Q | Out-Null
+        & icacls $pythonDir /setintegritylevel "(OI)(CI)M" /T /C /Q | Out-Null
     }
 
     $taskName = "AIDebuggerLiveSmoke_" + ([guid]::NewGuid().ToString("N").Substring(0, 8))
-    $outDir = Join-Path $env:TEMP $taskName
-    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-    # Smoke user must write the exit/log files the host waits on.
-    & icacls $outDir /grant "$($cred.UserName):(OI)(CI)M" /T /C /Q | Out-Null
+    # Do not use the High-IL host TEMP; Medium-IL smoke cannot create files there.
+    $outDir = Join-Path $env:PUBLIC ("AIDebuggerLiveSmoke\" + $taskName)
+    New-MediumWritableDirectory -Path $outDir -UserName $cred.UserName
 
     $exitFile = Join-Path $outDir "exitcode.txt"
     $logFile = Join-Path $outDir "stdout.txt"
+    $startedFile = Join-Path $outDir "started.txt"
     $wrapper = Join-Path $outDir "run.ps1"
     $wrapperBody = @"
+Set-Content -LiteralPath '$startedFile' -Value (Get-Date).ToString('o') -Encoding ASCII
 `$ErrorActionPreference = 'Continue'
 `$code = 1
 try {
@@ -153,16 +227,22 @@ Set-Content -LiteralPath '$exitFile' -Value `$code -Encoding ASCII
             -Execute "powershell.exe" `
             -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$wrapper`"" `
             -WorkingDirectory $repoRoot
+        $settings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable `
+            -ExecutionTimeLimit (New-TimeSpan -Minutes 40)
         Register-ScheduledTask `
             -TaskName $taskName `
             -Action $action `
+            -Settings $settings `
             -User $cred.UserName `
             -Password $cred.Password `
             -RunLevel Limited `
             -Force | Out-Null
         Start-ScheduledTask -TaskName $taskName
 
-        $deadline = [DateTime]::UtcNow.AddMinutes(25)
+        $deadline = [DateTime]::UtcNow.AddMinutes(30)
         while (-not (Test-Path -LiteralPath $exitFile) -and [DateTime]::UtcNow -lt $deadline) {
             Start-Sleep -Seconds 2
         }
@@ -171,7 +251,10 @@ Set-Content -LiteralPath '$exitFile' -Value `$code -Encoding ASCII
             Get-Content -LiteralPath $logFile | Write-Host
         }
         if (-not (Test-Path -LiteralPath $exitFile)) {
-            throw "Live VS smoke scheduled task '$taskName' timed out without an exit code"
+            $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+            $started = Test-Path -LiteralPath $startedFile
+            throw ("Live VS smoke scheduled task '{0}' timed out without an exit code (started={1}; lastResult={2}; lastRun={3})" -f `
+                $taskName, $started, $taskInfo.LastTaskResult, $taskInfo.LastRunTime)
         }
         $code = [int]((Get-Content -LiteralPath $exitFile -Raw).Trim())
         if ($code -ne 0) {
