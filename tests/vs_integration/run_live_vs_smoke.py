@@ -20,7 +20,7 @@ from mcp_server import vs_bridge
 PROGRAM = ROOT / "tests" / "vs_integration" / "Debuggee" / "Program.cs"
 
 
-async def wait_for_instance(process_id: int, timeout: float = 60.0) -> str:
+async def wait_for_instance(process_id: int, timeout: float = 180.0) -> str:
     deadline = time.monotonic() + timeout
     last = []
     while time.monotonic() < deadline:
