@@ -6,12 +6,53 @@ param(
 $ErrorActionPreference = "Stop"
 Add-Type -TypeDefinition @"
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 public static class AIDebuggerRot
 {
     [DllImport("ole32.dll")] private static extern int GetRunningObjectTable(int reserved, out IRunningObjectTable table);
     [DllImport("ole32.dll")] private static extern int CreateBindCtx(int reserved, out IBindCtx context);
+
+    private static bool IsVisualStudioDteName(string name, int processId)
+    {
+        if (string.IsNullOrEmpty(name)) return false;
+        string suffix = ":" + processId;
+        // Classic: !VisualStudio.DTE.17.0:1234
+        // Some hosts omit the leading bang or use a different major.minor.
+        if (name.EndsWith(suffix, StringComparison.Ordinal) &&
+            name.IndexOf("VisualStudio.DTE.", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            return true;
+        }
+        return false;
+    }
+
+    public static string[] ListVisualStudioDteNames()
+    {
+        var names = new List<string>();
+        IRunningObjectTable table;
+        IBindCtx context;
+        if (GetRunningObjectTable(0, out table) != 0 || CreateBindCtx(0, out context) != 0)
+        {
+            return names.ToArray();
+        }
+        IEnumMoniker iterator;
+        table.EnumRunning(out iterator);
+        IMoniker[] current = new IMoniker[1];
+        while (iterator.Next(1, current, IntPtr.Zero) == 0)
+        {
+            string name;
+            current[0].GetDisplayName(context, null, out name);
+            if (!string.IsNullOrEmpty(name) &&
+                name.IndexOf("VisualStudio.DTE", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                names.Add(name);
+            }
+        }
+        return names.ToArray();
+    }
+
     public static object GetVisualStudioDte(int processId)
     {
         IRunningObjectTable table;
@@ -24,8 +65,7 @@ public static class AIDebuggerRot
         {
             string name;
             current[0].GetDisplayName(context, null, out name);
-            if (name != null && name.StartsWith("!VisualStudio.DTE.", StringComparison.OrdinalIgnoreCase) &&
-                name.EndsWith(":" + processId, StringComparison.Ordinal))
+            if (IsVisualStudioDteName(name, processId))
             {
                 object instance;
                 table.GetObject(current[0], out instance);
@@ -94,6 +134,7 @@ try {
     $devenvProcess = Start-Process -FilePath $devenv -ArgumentList @(
         "/RootSuffix", $RootSuffix,
         "/Embedding",
+        "/nosplash",
         "/Log", $activityLog
     ) -PassThru -WindowStyle Hidden
     if ($null -eq $previousAutomationNonce) {
@@ -107,15 +148,46 @@ try {
         $env:AIDB_LIVE_SMOKE_ROOT_SUFFIX = $previousAutomationRootSuffix
     }
     $testVsProcessId = $devenvProcess.Id
-    $readyDeadline = [DateTime]::UtcNow.AddSeconds(60)
+    # Cold VS 18 Exp instances on CI often spend well over a minute loading packages
+    # before the automation object appears in the running object table.
+    $readyDeadline = [DateTime]::UtcNow.AddMinutes(3)
     $dte = $null
     while ([DateTime]::UtcNow -lt $readyDeadline) {
-        if ($devenvProcess.HasExited) { throw "Visual Studio exited before registering DTE for $RootSuffix" }
+        if ($devenvProcess.HasExited) {
+            # Start-Process can observe a bootstrapper that exits after spawning the real IDE.
+            $candidates = @(Get-Process -Name devenv -ErrorAction SilentlyContinue |
+                Where-Object { $knownVsPids -notcontains $_.Id } |
+                Select-Object -ExpandProperty Id)
+            if ($candidates.Count -eq 1) {
+                $testVsProcessId = [int]$candidates[0]
+                $devenvProcess = Get-Process -Id $testVsProcessId
+            } else {
+                throw "Visual Studio exited before registering DTE for $RootSuffix"
+            }
+        }
         $dte = [AIDebuggerRot]::GetVisualStudioDte($testVsProcessId)
+        if ($dte) { break }
+        # Fallback when the ROT entry is published under a child devenv PID.
+        $newIds = @(Get-Process -Name devenv -ErrorAction SilentlyContinue |
+            Where-Object { $knownVsPids -notcontains $_.Id } |
+            Select-Object -ExpandProperty Id)
+        foreach ($candidateId in $newIds) {
+            if ($candidateId -eq $testVsProcessId) { continue }
+            $dte = [AIDebuggerRot]::GetVisualStudioDte([int]$candidateId)
+            if ($dte) {
+                $testVsProcessId = [int]$candidateId
+                break
+            }
+        }
         if ($dte) { break }
         Start-Sleep -Milliseconds 500
     }
-    if (!$dte) { throw "Visual Studio DTE did not register for $RootSuffix" }
+    if (!$dte) {
+        $rotNames = @([AIDebuggerRot]::ListVisualStudioDteNames())
+        $devenvIds = @(Get-Process -Name devenv -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+        throw ("Visual Studio DTE did not register for $RootSuffix within 3 minutes " +
+            "(pid=$testVsProcessId; devenv=[$($devenvIds -join ', ')]; rot=[$($rotNames -join ', ')])")
+    }
     $dte.Solution.Open($solution)
     $commandDeadline = [DateTime]::UtcNow.AddSeconds(45)
     $startCommand = $null
