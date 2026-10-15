@@ -482,6 +482,7 @@ namespace VSDebuggerMCP
                     "visual_studio.open_dump_document",
                     () => OpenAndVerifyTargetDocument(dumpPath));
                 if (!TryStartActiveDumpDebuggingCommand(
+                    dumpPath,
                     out string startError,
                     out bool commandIssued,
                     out bool outcomeUnknown))
@@ -507,8 +508,8 @@ namespace VSDebuggerMCP
                     MarkDebugSessionTransitionCommandIssued("start_dump_debugging");
                 result.Success = true;
                 result.Outcome = "dump_debug_start_requested";
-                result.Capability = "official_vs_dump_command";
-                result.Behavior = "debug_engine_selection_is_controlled_by_visual_studio";
+                result.Capability = "vs_native_dump_document_command";
+                result.Behavior = "native_only_exact_dump_document";
                 result.Message = "Requested Visual Studio to start debugging the dump file";
                 TryPopulateDebugStatus(result, debugger);
             }
@@ -572,6 +573,7 @@ namespace VSDebuggerMCP
             try
             {
                 if (!TryStartActiveDumpDebuggingCommand(
+                    activeDocumentPath,
                     out string startError,
                     out bool commandIssued,
                     out bool outcomeUnknown))
@@ -595,8 +597,8 @@ namespace VSDebuggerMCP
                     MarkDebugSessionTransitionCommandIssued("start_active_dump_debugging");
                 result.Success = true;
                 result.Outcome = "dump_debug_start_requested";
-                result.Capability = "official_vs_dump_command";
-                result.Behavior = "debug_engine_selection_is_controlled_by_visual_studio";
+                result.Capability = "vs_native_dump_document_command";
+                result.Behavior = "native_only_exact_dump_document";
                 result.Message = "Requested Visual Studio to start debugging the active dump file";
                 TryPopulateDebugStatus(result, debugger);
             }
@@ -614,6 +616,7 @@ namespace VSDebuggerMCP
         }
 
         private bool TryStartActiveDumpDebuggingCommand(
+            string dumpPath,
             out string error,
             out bool commandIssued,
             out bool outcomeUnknown)
@@ -623,33 +626,54 @@ namespace VSDebuggerMCP
             commandIssued = false;
             outcomeUnknown = false;
             bool dispatchAttempted = false;
+            IntPtr docData = IntPtr.Zero;
 
             try
             {
-                var uiShell = ServiceProvider.GlobalProvider.GetService(typeof(SVsUIShell)) as IVsUIShell;
-                if (uiShell == null)
+                var documents = ServiceProvider.GlobalProvider.GetService(typeof(SVsRunningDocumentTable))
+                    as IVsRunningDocumentTable;
+                if (documents == null)
                 {
-                    error = "Visual Studio shell service is unavailable";
+                    error = "Visual Studio running document table is unavailable";
                     return false;
                 }
-
+                int lookup = documents.FindAndLockDocument((uint)_VSRDTFLAGS.RDT_NoLock,
+                    dumpPath, out IVsHierarchy hierarchy, out uint itemId, out docData, out uint cookie);
+                if (lookup < 0 || docData == IntPtr.Zero || cookie == 0)
+                {
+                    error = "The exact opened dump has no running document data owner";
+                    return false;
+                }
+                var target = Marshal.GetObjectForIUnknown(docData) as Microsoft.VisualStudio.OLE.Interop.IOleCommandTarget;
+                if (target == null)
+                {
+                    error = "The exact dump document exposes no native debug command target";
+                    return false;
+                }
                 Guid commandSet = VisualStudioDebuggerCommandSet;
-                object argument = null;
+                var query = new[] { new Microsoft.VisualStudio.OLE.Interop.OLECMD { cmdID = DebugDumpFileCommandId } };
+                int admission = target.QueryStatus(ref commandSet, 1, query, IntPtr.Zero);
+                if (admission < 0)
+                {
+                    error = $"The exact dump document does not support native debugging (HRESULT 0x{admission:X8})";
+                    return false;
+                }
                 dispatchAttempted = true;
                 int hr = CommandEffectExecutor.Issue(
                     "debugger.start_dump",
                     () =>
                     {
                         ThreadHelper.ThrowIfNotOnUIThread();
-                        return uiShell.PostExecCommand(
+                        return target.Exec(
                             ref commandSet,
                             DebugDumpFileCommandId,
-                            0,
-                            ref argument);
+                            2, // OLECMDEXECOPT_DONTPROMPTUSER
+                            IntPtr.Zero,
+                            IntPtr.Zero);
                     });
                 if (hr < 0)
                 {
-                    error = $"Visual Studio rejected the official dump debugging command (HRESULT 0x{hr:X8})";
+                    error = $"The exact dump document rejected native debugging (HRESULT 0x{hr:X8})";
                     return false;
                 }
                 commandIssued = true;
@@ -659,9 +683,13 @@ namespace VSDebuggerMCP
             {
                 commandIssued = dispatchAttempted;
                 outcomeUnknown = dispatchAttempted;
-                error = "The official Visual Studio dump debugging command failed";
+                error = "The exact dump document native debugging command failed";
                 _log($"Dump debugging command failed: {ex.GetType().Name}");
                 return false;
+            }
+            finally
+            {
+                if (docData != IntPtr.Zero) Marshal.Release(docData);
             }
         }
 

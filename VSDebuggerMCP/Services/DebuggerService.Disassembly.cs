@@ -333,7 +333,8 @@ namespace VSDebuggerMCP
             // tracker generations already invalidate run, break and frame changes.
             return $"{_sessionTracker.Generation}:{_sessionTracker.BreakSequence}:" +
                 $"{_sessionTracker.ContextEpoch}:{processId}:{threadId}:{frameIdentity}:" +
-                $"{functionName}:{moduleName}";
+                $"{functionName}:{moduleName}:" +
+                $"{(processId <= 0 ? GetActiveDumpFilePathCandidate() : string.Empty)}";
         }
 
         private byte[] ReadProcessMemoryContiguous(IntPtr processHandle, ulong startAddress, int requestedSize)

@@ -246,7 +246,8 @@ namespace VSDebuggerMCP
             }
             ObserveDebugContext(debugger);
             StopEventSnapshot stopEvent = _sessionTracker.GetStopEventSnapshot();
-            if (stopEvent.DebuggeeProcessId <= 0)
+            bool hasDumpOwner = !string.IsNullOrEmpty(NormalizeExistingDumpPath(GetActiveDumpFilePathCandidate()));
+            if (stopEvent.DebuggeeProcessId <= 0 && !hasDumpOwner)
             {
                 return new CallStackSliceHeader
                 {
@@ -402,6 +403,9 @@ namespace VSDebuggerMCP
 
         private DebugFrameContext CreateFrameContext(StopEventSnapshot stopEvent, int threadId, int frameIndex)
         {
+            // A native dump has no live OS PID. Its bounded snapshot is owned by
+            // the actual dump session, not a reusable live-process frame token.
+            if (stopEvent.DebuggeeProcessId <= 0) return null;
             return new DebugFrameContext
             {
                 DebugSessionGeneration = stopEvent.Generation,

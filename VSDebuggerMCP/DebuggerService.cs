@@ -287,7 +287,9 @@ namespace VSDebuggerMCP
         private const int BreakpointProbeMaxDistance = 25;
         private static readonly Guid VisualStudioDebuggerCommandSet =
             new Guid("5289D302-2432-4761-8C45-051C64BD00C4");
-        private const uint DebugDumpFileCommandId = 0x00000603;
+        // Native-only command of the exact DmpDocumentBase command target.
+        // The shell's 0x603 command opens a file picker instead.
+        private const uint DebugDumpFileCommandId = 0x00000500;
         private const long SourcePreflightMaxBytes = 16L * 1024L * 1024L;
         private const string AddressBreakpointTagPrefix = "AIDB_ADDR=";
         private const string DataBreakpointTagPrefix = "AIDB_DATA=";

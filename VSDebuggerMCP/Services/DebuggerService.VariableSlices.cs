@@ -245,10 +245,14 @@ namespace VSDebuggerMCP
 
             ObserveDebugContext(debugger);
             StopEventSnapshot beforeEvaluation = _sessionTracker.GetStopEventSnapshot();
-            if (beforeEvaluation.DebuggeeProcessId <= 0)
+            bool hasDumpOwner = !string.IsNullOrEmpty(NormalizeExistingDumpPath(GetActiveDumpFilePathCandidate()));
+            if (beforeEvaluation.DebuggeeProcessId <= 0 && !hasDumpOwner)
                 throw new DebugContextNotFoundException(
                     "The current Visual Studio debuggee has no stable process identity; locals cannot be bound to a reusable frame context.");
             bool hasExplicitContext = !string.IsNullOrWhiteSpace(frameId);
+            if (hasExplicitContext && beforeEvaluation.DebuggeeProcessId <= 0)
+                throw new DebugContextNotFoundException(
+                    "A native dump snapshot has no reusable live-process frame context.");
             if (hasExplicitContext &&
                 (debugSessionGeneration != beforeEvaluation.Generation ||
                  breakSequence != beforeEvaluation.BreakSequence ||
