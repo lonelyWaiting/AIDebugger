@@ -37,6 +37,8 @@ __pycache__/
 *.so
 .Python
 .venv/
+.codex/dependencies/procdump/
+.codex-tmp/vs-python-publish/
 venv/
 ENV/
 env/

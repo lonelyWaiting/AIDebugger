@@ -456,6 +456,47 @@ client sets `AIDB_PREFERRED_IDE=vs`.
 
 ### ensure_vs_instance times out waiting for the launched instance
 
+An explicit `root_suffix` selects a separate experimental profile, not the normal
+profile's extension installation. Deploy AIDebugger into that profile first, or
+reuse a profile already deployed by the owned native-validation workflow. The
+launcher now reports `VS_EXTENSION_NOT_DEPLOYED` before starting an undeployed
+explicit profile. This prerequisite does not replace authenticated readiness or
+prove that an installed extension is enabled. Do not reinstall the normal VSIX
+merely because an empty experimental profile cannot register.
+
+For Python-only VS MCP fixes after an extension build, run
+`powershell -NoProfile -File tools/Publish-VSMcpBundle.ps1 -ReceiptPath <receipt.json>`.
+This entry uses the existing extension's allowlist, hash validation and transactional
+bundle publisher to activate the current repository payload. It requires no VSIX
+rebuild or VS/MCP restart; running servers retain their already loaded bundle and
+new invocations select the new content-addressed bundle. Client configuration and
+the installed VS extension are unchanged.
+
+The experimental `tools/continue_descriptor_breaks.py` is not an accepted crash
+diagnostic entry: the actual absolute Python host failed during COM event
+subscription. Its matching fixture and earlier subscription result do not prove
+live continuation. Do not gate native crash capture on this helper.
+
+For the owned native crash diagnostic, provision official Microsoft ProcDump with
+`tools/Setup-ProcDump.ps1`; retain its Microsoft signature/hash manifest. After
+verifying the target PID, executable and exact OS creation time and confirming no
+other debugger is attached, invoke `procdump64.exe -accepteula -ma -e -n 1 <PID>
+<fresh-owned-dump-directory>`. ProcDump ignores debug breaks by default; do not add
+`-b`, register global AeDebug, or attach VS concurrently. After ProcDump exits,
+open the resulting user dump through AIDB `start_debugging(executable_path=...dmp)`
+and inspect the native stack. The independent kernel backend does not accept a
+user-mode dump.
+
+The VS entry targets the exact RDT dump document's native debug command after
+QueryStatus; it does not post the global `Debug.DebugDumpFile` file-picker command.
+Dump stack snapshots preserve PID0 and have no reusable live-process frame token.
+Read native dump locals through `capture_debug_bundle(include_locals=True)`.
+`tests/vs_integration/verify_owned_dump_snapshot.py` verifies an already paused
+exact IDE/dump/DLL hash without launching another target. For independent CLI
+triage, `tools/read_user_dump.py --dump <path> --symbols <local-pdb-dir>
+--module <basename> --output <json>` uses the locally prepared DbgEng user-dump
+ABI; it does not open a kernel session or silently download symbols.
+
 The launch is honoured only by an extension build that carries the launcher command, which
 is passed as `devenv /Command` and falls back to DTE automation. When the instance starts
 but never publishes a registration:
