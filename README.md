@@ -472,11 +472,6 @@ rebuild or VS/MCP restart; running servers retain their already loaded bundle an
 new invocations select the new content-addressed bundle. Client configuration and
 the installed VS extension are unchanged.
 
-The experimental `tools/continue_descriptor_breaks.py` is not an accepted crash
-diagnostic entry: the actual absolute Python host failed during COM event
-subscription. Its matching fixture and earlier subscription result do not prove
-live continuation. Do not gate native crash capture on this helper.
-
 For the owned native crash diagnostic, provision official Microsoft ProcDump with
 `tools/Setup-ProcDump.ps1`; retain its Microsoft signature/hash manifest. After
 verifying the target PID, executable and exact OS creation time and confirming no
