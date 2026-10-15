@@ -5,7 +5,6 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
-using System.Web.Script.Serialization;
 using System.Collections.Generic;
 
 namespace VSDebuggerMCP
@@ -186,12 +185,11 @@ namespace VSDebuggerMCP
                     { "environment", new Dictionary<string, object> { { "AIDB_PREFERRED_IDE", preferredIde }, { "PYTHONIOENCODING", "utf-8" } } }
                 };
                 // Write updated config
-                var serializer2 = new JavaScriptSerializer();
                 var json = JsonConfigEditor.UpsertOwnedEntry(
                     existingJson,
                     "mcp",
                     entryName,
-                    serializer2.Serialize(serverConfig));
+                    JsonConfigEditor.SerializeUtf8Json(serverConfig));
                 json = JsonConfigEditor.RemoveOwnedEntry(json, "mcp", LegacyMcpServerName, out _);
                 if (string.Equals(json, existingJson, StringComparison.Ordinal))
                 {
@@ -297,12 +295,11 @@ namespace VSDebuggerMCP
                         { "env", new Dictionary<string, object> { { "AIDB_PREFERRED_IDE", preferredIde }, { "PYTHONIOENCODING", "utf-8" } } }
                     };
 
-                    var serializer2 = new JavaScriptSerializer();
                     var json = JsonConfigEditor.UpsertOwnedEntry(
                         existingJson,
                         "mcpServers",
                         entryName,
-                        serializer2.Serialize(serverConfig));
+                        JsonConfigEditor.SerializeUtf8Json(serverConfig));
                     json = JsonConfigEditor.RemoveOwnedEntry(json, "mcpServers", LegacyMcpServerName, out _);
                     if (string.Equals(json, existingJson, StringComparison.Ordinal))
                     {
@@ -593,12 +590,11 @@ namespace VSDebuggerMCP
                 };
 
                 // Write updated config
-                var serializer2 = new JavaScriptSerializer();
                 var json = JsonConfigEditor.UpsertOwnedEntry(
                     existingJson,
                     "mcpServers",
                     entryName,
-                    serializer2.Serialize(serverConfig));
+                    JsonConfigEditor.SerializeUtf8Json(serverConfig));
                 json = JsonConfigEditor.RemoveOwnedEntry(json, "mcpServers", LegacyMcpServerName, out _);
                 if (string.Equals(json, existingJson, StringComparison.Ordinal))
                 {

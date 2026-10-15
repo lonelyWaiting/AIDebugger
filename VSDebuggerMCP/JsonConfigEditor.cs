@@ -527,7 +527,68 @@ namespace VSDebuggerMCP
 
         private static string Quote(string value)
         {
-            return new JavaScriptSerializer().Serialize(value ?? string.Empty);
+            return SerializeUtf8Json(value ?? string.Empty);
+        }
+
+        /// <summary>
+        /// Serializes JSON for client config files without <c>\uXXXX</c> escapes for
+        /// printable Unicode. Control characters and JSON-required escapes stay escaped.
+        /// </summary>
+        public static string SerializeUtf8Json(object value)
+        {
+            string json = new JavaScriptSerializer { MaxJsonLength = int.MaxValue }
+                .Serialize(value);
+            return DecodeNonControlUnicodeEscapes(json);
+        }
+
+        private static string DecodeNonControlUnicodeEscapes(string json)
+        {
+            if (string.IsNullOrEmpty(json) || json.IndexOf("\\u", StringComparison.Ordinal) < 0)
+            {
+                return json;
+            }
+
+            var output = new StringBuilder(json.Length);
+            for (int i = 0; i < json.Length; i++)
+            {
+                if (json[i] == '\\' &&
+                    i + 5 < json.Length &&
+                    json[i + 1] == 'u' &&
+                    TryParseHex16(json, i + 2, out int codeUnit))
+                {
+                    // Keep escapes that JSON requires or that would change token structure.
+                    if (codeUnit < 0x20 || codeUnit == 0x7F || codeUnit == '"' || codeUnit == '\\')
+                    {
+                        output.Append(json, i, 6);
+                    }
+                    else
+                    {
+                        output.Append((char)codeUnit);
+                    }
+                    i += 5;
+                    continue;
+                }
+
+                output.Append(json[i]);
+            }
+
+            return output.ToString();
+        }
+
+        private static bool TryParseHex16(string source, int offset, out int value)
+        {
+            value = 0;
+            for (int i = 0; i < 4; i++)
+            {
+                char ch = source[offset + i];
+                int digit;
+                if (ch >= '0' && ch <= '9') digit = ch - '0';
+                else if (ch >= 'a' && ch <= 'f') digit = ch - 'a' + 10;
+                else if (ch >= 'A' && ch <= 'F') digit = ch - 'A' + 10;
+                else return false;
+                value = (value << 4) | digit;
+            }
+            return true;
         }
     }
 }

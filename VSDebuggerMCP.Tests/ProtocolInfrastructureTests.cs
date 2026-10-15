@@ -38,6 +38,26 @@ namespace VSDebuggerMCP.Tests
         }
 
         [TestMethod]
+        public void SerializeUtf8JsonKeepsReadableChineseAndRequiredEscapes()
+        {
+            var payload = new Dictionary<string, object>
+            {
+                { "serverUseInstructions", "AIDebuggerVS - VS调试信息获取工具\r\n下一行" },
+                { "quote", "say \"hi\"" },
+            };
+
+            string json = JsonConfigEditor.SerializeUtf8Json(payload);
+            StringAssert.Contains(json, "调试信息获取工具");
+            Assert.IsFalse(json.Contains("\\u8c03"), json);
+            StringAssert.Contains(json, "\\r\\n");
+            StringAssert.Contains(json, "say \\\"hi\\\"");
+
+            var roundTrip = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
+            Assert.AreEqual(payload["serverUseInstructions"], roundTrip["serverUseInstructions"]);
+            Assert.AreEqual(payload["quote"], roundTrip["quote"]);
+        }
+
+        [TestMethod]
         public void FreshVsRuntimeStagingIncludesAndImportsOutputModels()
         {
             string repoRoot = FindRepositoryRoot();
