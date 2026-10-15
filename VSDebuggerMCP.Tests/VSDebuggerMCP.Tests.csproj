@@ -41,6 +41,7 @@
     <Compile Include="..\VSDebuggerMCP\Ipc\CommandResponseCompactor.cs" Link="Production\CommandResponseCompactor.cs" />
     <Compile Include="..\VSDebuggerMCP\Ipc\ControlRequestValidator.cs" Link="Production\ControlRequestValidator.cs" />
     <Compile Include="..\VSDebuggerMCP\DebuggerRequestContext.cs" Link="Production\DebuggerRequestContext.cs" />
+    <Compile Include="..\VSDebuggerMCP\DebugSessionTracker.cs" Link="Production\DebugSessionTracker.cs" />
     <Compile Include="..\VSDebuggerMCP\Protocol\DebugModels.cs" Link="Production\DebugModels.cs" />
     <Compile Include="..\VSDebuggerMCP\Protocol\DebugRequest.cs" Link="Production\DebugRequest.cs" />
     <Compile Include="..\VSDebuggerMCP\Protocol\DebugResponse.cs" Link="Production\DebugResponse.cs" />

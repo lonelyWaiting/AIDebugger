@@ -137,6 +137,10 @@ namespace VSDebuggerMCP
                 bool leavingSession = !string.Equals(_mode, "design", StringComparison.Ordinal) &&
                     string.Equals(mode, "design", StringComparison.Ordinal);
                 _mode = mode;
+                // The event advances the epoch itself. The previous mode's frame
+                // identity cannot be compared with the first lazily observed frame
+                // of this stop/run: doing so creates a second, spurious epoch.
+                _debuggerContextSignature = null;
                 _stopReason = reason;
                 _stopReasonRaw = rawReason;
                 if (enteringSession || leavingSession)
