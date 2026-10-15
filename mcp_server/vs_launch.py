@@ -966,11 +966,43 @@ def _select_and_launch(
     """Locate a trusted installation and start it. Runs on a worker thread."""
     installations = discover_devenv_installations()
     installation = select_devenv_installation(installations, install_path, instance_id)
+    _require_explicit_profile_extension(installation, root_suffix)
     return launch_devenv(
         installation,
         requested_capabilities,
         solution_path=solution_path,
         root_suffix=root_suffix,
+    )
+
+
+def _require_explicit_profile_extension(
+    installation: DevenvInstallation, root_suffix: Optional[str]
+) -> None:
+    """Reject an undeployed explicit experimental profile before starting its IDE.
+
+    This is only a deployment prerequisite, never authentication or enabled-package
+    proof. The normal profile and the existing authenticated readiness check retain
+    their original behavior.
+    """
+    if root_suffix is None:
+        return
+    if not _ROOT_SUFFIX_PATTERN.match(str(root_suffix)):
+        raise VSBridgeError("root_suffix must be 1-48 alphanumeric characters", code="INVALID_ARGUMENT")
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    major = installation.installation_version.split(".", 1)[0]
+    profile = pathlib.Path(local_app_data or "") / "Microsoft" / "VisualStudio" / (
+        f"{major}.0_{installation.instance_id}{root_suffix}"
+    )
+    extensions = profile / "Extensions"
+    if local_app_data and extensions.is_dir():
+        for package in extensions.rglob("VSDebuggerMCP.pkgdef"):
+            if (package.parent / "VSDebuggerMCP.dll").is_file():
+                return
+    raise VSBridgeError(
+        f"AIDebuggerVS is not deployed in the requested /RootSuffix {root_suffix} "
+        f"profile ({profile}). Deploy the VSIX into that experimental profile, "
+        "or select an already deployed profile; no Visual Studio was launched.",
+        code="VS_EXTENSION_NOT_DEPLOYED",
     )
 
 

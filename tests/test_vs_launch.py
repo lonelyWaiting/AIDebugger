@@ -112,6 +112,32 @@ class LaunchArgumentTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "INVALID_ARGUMENT")
 
 
+class ExplicitProfileDeploymentTests(unittest.TestCase):
+    def test_missing_extension_refuses_before_process_launch(self):
+        with tempfile.TemporaryDirectory() as local, patch.dict(os.environ, {"LOCALAPPDATA": local}), \
+                patch.object(vs_launch, "discover_devenv_installations", return_value=[installation()]), \
+                patch.object(vs_launch, "launch_devenv") as launch:
+            with self.assertRaises(VSBridgeError) as caught:
+                vs_launch._select_and_launch(("debug.read",), None, None, None, "NGXCrashTriage")
+            self.assertEqual(caught.exception.code, "VS_EXTENSION_NOT_DEPLOYED")
+            self.assertIn("NGXCrashTriage", str(caught.exception))
+            launch.assert_not_called()
+
+    def test_deployed_profile_keeps_authenticated_readiness_path(self):
+        with tempfile.TemporaryDirectory() as local, patch.dict(os.environ, {"LOCALAPPDATA": local}):
+            extension = pathlib.Path(local) / "Microsoft/VisualStudio/18.0_communityProbe/Extensions/pkg"
+            extension.mkdir(parents=True)
+            (extension / "VSDebuggerMCP.pkgdef").touch()
+            with self.assertRaises(VSBridgeError):
+                vs_launch._require_explicit_profile_extension(installation(), "Probe")
+            (extension / "VSDebuggerMCP.dll").touch()
+            vs_launch._require_explicit_profile_extension(installation(), "Probe")
+
+    def test_default_profile_is_not_constrained_by_experimental_deployment(self):
+        with patch.dict(os.environ, {}, clear=True):
+            vs_launch._require_explicit_profile_extension(installation(), None)
+
+
 class LaunchEnvironmentTests(unittest.TestCase):
     def test_environment_contract_is_additive_and_does_not_mutate_the_source(self):
         base = {"PATH": "x", vs_launch.LAUNCH_ID_VARIABLE: "stale"}
@@ -328,6 +354,8 @@ class EnsureInstanceTests(unittest.TestCase):
         ), patch.object(
             vs_launch, "launch_devenv", return_value=record
         ) as launch, patch.object(
+            vs_launch, "_require_explicit_profile_extension"
+        ), patch.object(
             vs_launch, "_request_launcher_server_start",
             AsyncMock(return_value="launcher command dispatched"),
         ) as request_start, patch.object(
