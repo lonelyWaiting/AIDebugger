@@ -9,17 +9,10 @@
       </Group>
     </Groups>
     <Buttons>
-      <Button guid="guidAIDebuggerCommandSet" id="StartServerCommand" priority="0x0100" type="Button">
+      <Button guid="guidAIDebuggerCommandSet" id="StartFullAccessServerCommand" priority="0x0100" type="Button">
         <Parent guid="guidAIDebuggerCommandSet" id="AIDebuggerToolsGroup" />
         <Strings>
-          <ButtonText>Start AIDebugger MCP Server (Read Only)</ButtonText>
-          <CanonicalName>AIDebugger.StartServer</CanonicalName>
-        </Strings>
-      </Button>
-      <Button guid="guidAIDebuggerCommandSet" id="StartFullAccessServerCommand" priority="0x0105" type="Button">
-        <Parent guid="guidAIDebuggerCommandSet" id="AIDebuggerToolsGroup" />
-        <Strings>
-          <ButtonText>Start AIDebugger MCP Server (Choose Capabilities)...</ButtonText>
+          <ButtonText>Start AIDebugger MCP Server</ButtonText>
           <CanonicalName>AIDebugger.StartFullAccessServer</CanonicalName>
         </Strings>
       </Button>
@@ -58,6 +51,7 @@
     <GuidSymbol name="guidAIDebuggerPackage" value="{475DEBBA-1C22-4878-9824-DEF0379A1042}" />
     <GuidSymbol name="guidAIDebuggerCommandSet" value="{B524E80E-2159-4CB6-B020-A9BAA88DC707}">
       <IDSymbol name="AIDebuggerToolsGroup" value="0x1020" />
+      <!-- 0x0100 reserved: retired start-command id; keep unused to avoid command-table collisions. -->
       <IDSymbol name="StartServerCommand" value="0x0100" />
       <IDSymbol name="SetupClientsCommand" value="0x0101" />
       <IDSymbol name="StartFullAccessServerCommand" value="0x0102" />

@@ -266,7 +266,10 @@ def _recommended_workflow_for_access(effective_instance: Optional[Dict[str, Any]
     if "debug.session.write" in allowed:
         workflow.append("Session-write capability is enabled: attach_process/start_debugging may be used.")
     if access_mode == "read_only":
-        workflow.append("Restart the Visual Studio server explicitly in full-access mode before requesting mutating or unsafe capabilities.")
+        workflow.append(
+            "Stop the current Visual Studio AIDebugger server, then start Tools > Start AIDebugger MCP Server. "
+            "That menu starts the full capability set with no prompts."
+        )
     return workflow
 
 

@@ -30,7 +30,6 @@ namespace VSDebuggerMCP
     {
         public const string PackageGuidString = "475DEBBA-1C22-4878-9824-DEF0379A1042";
         private static readonly Guid CommandSetGuid = new Guid("B524E80E-2159-4CB6-B020-A9BAA88DC707");
-        private const int StartServerCommandId = 0x0100;
         private const int SetupClientsCommandId = 0x0101;
         private const int StartFullAccessServerCommandId = 0x0102;
         private const int StopServerCommandId = 0x0103;
@@ -92,9 +91,6 @@ namespace VSDebuggerMCP
                 throw new InvalidOperationException("Visual Studio menu command service is unavailable");
             }
 
-            commandService.AddCommand(new MenuCommand(
-                (_, __) => StartServer(configureCapabilities: false),
-                new CommandID(CommandSetGuid, StartServerCommandId)));
             commandService.AddCommand(new OleMenuCommand(
                 StartFullAccessServerOrLauncher,
                 new CommandID(CommandSetGuid, StartFullAccessServerCommandId)));
@@ -196,7 +192,7 @@ namespace VSDebuggerMCP
             _serverStopTask = StopServerAsync();
         }
 
-        private void StartServer(bool configureCapabilities)
+        private void StartServer()
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             if (!EnsureNonElevatedSecurityBoundary("start the MCP server")) return;
@@ -208,11 +204,9 @@ namespace VSDebuggerMCP
 
             try
             {
-                IReadOnlyCollection<string> capabilities = configureCapabilities
-                    ? SelectServerCapabilities()
-                    : new[] { "server.control", "debug.read" };
-                if (capabilities == null) return;
-                StartServerWithCapabilities(capabilities);
+                // A Tools-menu Start is consent for the full capability catalog; there is no
+                // separate Read Only menu and no per-capability prompts.
+                StartServerWithCapabilities(DebugMethodCatalog.AllCapabilities);
             }
             catch (Exception ex)
             {
@@ -261,9 +255,10 @@ namespace VSDebuggerMCP
         }
 
         /// <summary>
-        /// Handles the full-access command. A user click keeps the interactive capability
-        /// prompts; the AIDebugger launcher instead passes the one-time launch id this
-        /// instance was started with and gets a non-interactive start.
+        /// Handles the full-access command. A user click starts the complete capability
+        /// set with no dialogs; the AIDebugger launcher instead passes the one-time launch
+        /// id this instance was started with and gets a non-interactive start for the
+        /// requested subset.
         /// The long-standing command name is reused on purpose: a command added to the
         /// .vsct is not resolvable until Visual Studio refreshes its command table, which
         /// is keyed per extension version and therefore never happens for a rebuilt VSIX
@@ -283,8 +278,8 @@ namespace VSDebuggerMCP
                 !string.IsNullOrEmpty(expiresAt);
             if (!launcherRequested)
             {
-                // An ordinary menu click: unchanged behaviour.
-                StartServer(configureCapabilities: true);
+                // Ordinary menu click: full catalog, no capability prompts.
+                StartServer();
                 return;
             }
             // Consume immediately: the variables must not survive into any process this
@@ -377,44 +372,6 @@ namespace VSDebuggerMCP
             LogMessage(
                 $"AIDebugger MCP server started with effective access profile '{profile}' and capabilities: " +
                 string.Join(", ", server.AllowedCapabilities));
-        }
-
-        private IReadOnlyCollection<string> SelectServerCapabilities()
-        {
-            ThreadHelper.ThrowIfNotOnUIThread();
-            var selected = new List<string> { "server.control", "debug.read" };
-            var choices = new[]
-            {
-                new CapabilityChoice("debug.memory.read", "Read target-process memory and search its contents."),
-                new CapabilityChoice("debug.binary.inspect", "Parse explicitly requested managed assembly metadata inside the no-capability AppContainer."),
-                new CapabilityChoice("debug.breakpoint.write", "Create, change, enable, or remove breakpoints."),
-                new CapabilityChoice("debug.context.write", "Change the selected debug thread/frame or next statement."),
-                new CapabilityChoice("debug.evaluate.unsafe", "Evaluate expressions that may run target code or have side effects."),
-                new CapabilityChoice("debug.execution.control", "Continue, pause, step, stop, detach, or run to a location."),
-                new CapabilityChoice("debug.session.write", "Start debugging or attach Visual Studio to a process."),
-            };
-            foreach (CapabilityChoice choice in choices)
-            {
-                int answer = VsShellUtilities.ShowMessageBox(
-                    this,
-                    $"Grant this server-session capability?\n\n{choice.Name}\n{choice.Description}\n\n" +
-                    "Yes grants it until the server is stopped. No leaves it disabled. Cancel aborts without starting the server.",
-                    "Configure AIDebugger Session Capabilities",
-                    OLEMSGICON.OLEMSGICON_QUERY,
-                    OLEMSGBUTTON.OLEMSGBUTTON_YESNOCANCEL,
-                    OLEMSGDEFBUTTON.OLEMSGDEFBUTTON_SECOND);
-                if (answer == (int)VSConstants.MessageBoxResult.IDCANCEL) return null;
-                if (answer == (int)VSConstants.MessageBoxResult.IDYES) selected.Add(choice.Name);
-            }
-            int confirmation = VsShellUtilities.ShowMessageBox(
-                this,
-                "Start AIDebugger for this Visual Studio process with these session-scoped capabilities?\n\n" +
-                    string.Join("\n", selected),
-                "Confirm AIDebugger Session Capabilities",
-                OLEMSGICON.OLEMSGICON_QUERY,
-                OLEMSGBUTTON.OLEMSGBUTTON_YESNO,
-                OLEMSGDEFBUTTON.OLEMSGDEFBUTTON_SECOND);
-            return confirmation == (int)VSConstants.MessageBoxResult.IDYES ? selected : null;
         }
 
         private bool EnsureNonElevatedSecurityBoundary(string operation, bool showDialog = true)
@@ -600,18 +557,6 @@ namespace VSDebuggerMCP
 
             internal string Name { get; }
             internal string Path { get; }
-        }
-
-        private sealed class CapabilityChoice
-        {
-            internal CapabilityChoice(string name, string description)
-            {
-                Name = name;
-                Description = description;
-            }
-
-            internal string Name { get; }
-            internal string Description { get; }
         }
 
         private void HandleRegistrationResult(RegistrationResult result, string clientName)

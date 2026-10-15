@@ -2149,7 +2149,7 @@ class VSBridge:
                     "MCP server launch one (and optionally attach to a process) in a single step. "
                     "To use a Visual Studio you started yourself instead:\n"
                     "1. Start Visual Studio\n"
-                    "2. Run Tools > Start AIDebugger MCP Server (or 'Choose Capabilities' for full access)\n"
+                    "2. Run Tools > Start AIDebugger MCP Server\n"
                     "3. Confirm the AIDebuggerVS extension is installed and enabled",
                     code="NO_VS_INSTANCE",
                 )

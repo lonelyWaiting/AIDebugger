@@ -290,6 +290,13 @@ namespace VSDebuggerMCP
         {
             var sb = new StringBuilder();
             sb.AppendLine($"[mcp_servers.{entryName}]");
+            // Codex treats optional MCP servers with a short catalog grace window; without
+            // required=true the Python bridge often misses tool registration on resume.
+            sb.AppendLine("enabled = true");
+            sb.AppendLine("required = true");
+            sb.AppendLine("startup_timeout_sec = 20");
+            sb.AppendLine("tool_timeout_sec = 120");
+            sb.AppendLine("default_tools_approval_mode = \"auto\"");
             sb.AppendLine($"command = \"{EscapeTomlString(runtime.Command)}\"");
             sb.AppendLine("args = [");
 

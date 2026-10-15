@@ -2274,6 +2274,30 @@ print(json.dumps({
         self.assertIn("config.toml", vs_registration)
         self.assertIn("CODEX_HOME", vs_registration)
 
+    def test_codex_registration_defaults_to_required_auto_tools(self) -> None:
+        utilities = read("VSDebuggerMCP/Registration/McpClientRegistration.Utilities.cs")
+        installer = read("tools/install_aidebugger.py")
+        self.assertIn("required = true", utilities)
+        self.assertIn('sb.AppendLine("default_tools_approval_mode = \\"auto\\"");', utilities)
+        self.assertIn("startup_timeout_sec = 20", utilities)
+        self.assertIn("required = true", installer)
+        self.assertIn('default_tools_approval_mode = \\"auto\\"', installer)
+
+    def test_start_menu_is_single_full_access_entry(self) -> None:
+        vs_package = read("VSDebuggerMCP/VSDebuggerMCPPackage.cs")
+        vsct = read("VSDebuggerMCP/AIDebugger.vsct")
+        self.assertIn("StartServerWithCapabilities(DebugMethodCatalog.AllCapabilities)", vs_package)
+        self.assertNotIn("fullAccess:", vs_package)
+        self.assertNotIn("SelectServerCapabilities", vs_package)
+        self.assertNotIn("Grant this server-session capability?", vs_package)
+        self.assertIn(">Start AIDebugger MCP Server<", vsct)
+        self.assertNotIn("Read Only", vsct)
+        self.assertNotIn("Full Access", vsct)
+        self.assertNotIn("Choose Capabilities", vsct)
+        self.assertIn('id="StartFullAccessServerCommand"', vsct)
+        self.assertNotIn('id="StartServerCommand"', vsct.split("<Symbols>", 1)[0])
+        self.assertIn("AIDebugger.StartFullAccessServer", vsct)
+
 
 if __name__ == "__main__":
     unittest.main()

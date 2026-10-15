@@ -327,11 +327,10 @@ strict tree policy so a rejected bundle is rebuilt instead of remaining stuck.
 Visual Studio no longer starts the pipe server or modifies external client
 configuration on every IDE startup. Invoke these commands from **Tools**:
 
-- **Start AIDebugger MCP Server (Read Only)** — exposes only `server.control` and `debug.read`
-- **Start AIDebugger MCP Server (Full Access)** — explicitly enables expression, memory, breakpoint, debugger-context, execution-control, and session-write capabilities
+- **Start AIDebugger MCP Server** — starts the full capability set immediately (no per-capability prompts): expression, memory, breakpoint, debugger-context, execution-control, and session-write
 - **Configure AIDebugger MCP Clients...**
 
-Visual Studio setup registers `AIDebuggerVS` with `AIDB_PREFERRED_IDE=vs`.
+Visual Studio setup registers `AIDebuggerVS` with `AIDB_PREFERRED_IDE=vs`. Codex registration also writes `required = true`, longer startup/tool timeouts, and `default_tools_approval_mode = "auto"` so the server is present in the tool catalog without optional-startup races or per-tool approval prompts.
 
 Supported registration targets:
 
@@ -341,7 +340,7 @@ Supported registration targets:
 - Claude Code: `~/.claude.json`
 - OpenCode: `~/.config/opencode/opencode.json`
 
-Restart the MCP client after installing or updating the IDE extension.
+Restart the MCP client after installing or updating the IDE extension. Re-run **Configure AIDebugger MCP Clients...** once so existing Codex entries pick up `required = true`.
 
 ### Manual MCP Configuration
 

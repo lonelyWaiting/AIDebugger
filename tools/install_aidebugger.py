@@ -52,7 +52,8 @@ def replace_backend_toml(text, command, server, backend):
             result.append(line)
     section = ("\n[mcp_servers." + backend + "]\ncommand = " + json.dumps(command) +
                "\nargs = [" + json.dumps(str(server)) + "]\nenabled = true\n" +
-               "startup_timeout_sec = 20\ntool_timeout_sec = 120\n")
+               "required = true\nstartup_timeout_sec = 20\ntool_timeout_sec = 120\n" +
+               "default_tools_approval_mode = \"auto\"\n")
     updated = "".join(result).rstrip() + "\n" + section
     parsed = _tomllib().loads(updated)
     if parsed.get("mcp_servers", {}).get(backend, {}).get("command") != command:
