@@ -382,15 +382,18 @@ async def ensure_vs_instance(
             attach_result.get("debuggerActivationStatus") if isinstance(attach_result, dict) else None
         )
         result["attached"] = bool(
-            activation == "active"
-            or (isinstance(attach_result, dict) and attach_result.get("attachCompleted"))
+            isinstance(attach_result, dict)
+            and attach_result.get("success")
+            and (activation == "active" or attach_result.get("attachCompleted"))
         )
-        if activation == "timed_out":
+        if not result["attached"]:
             result["partial"] = True
-            result["message"] += (
-                " The attach command was issued, but Visual Studio had not entered debugging mode "
-                "before the timeout; check get_debug_status before repeating anything."
-            )
+            if isinstance(attach_result, dict):
+                result["message"] += " " + attach_result["message"]
+                if not attach_result.get("success"):
+                    result["status"] = "attach_failed"
+                    result["success"] = False
+                    result["errorCode"] = attach_result.get("errorCode")
         return format_result(result)
     except (backend.IDEBridgeError, vs_bridge.VSBridgeError) as error:
         return handle_ide_error(error, "ensure_vs_instance")

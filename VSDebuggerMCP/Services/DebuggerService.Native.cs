@@ -147,6 +147,7 @@ namespace VSDebuggerMCP
                         () =>
                         {
                             ThreadHelper.ThrowIfNotOnUIThread();
+                            SuppressDebuggerAutomationUI();
                             return debugger.Breakpoints.Add(
                                 string.Empty,
                                 string.Empty,

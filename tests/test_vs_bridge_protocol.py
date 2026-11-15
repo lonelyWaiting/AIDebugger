@@ -23,6 +23,52 @@ bootstrap.ensure_deps()
 from mcp_server import vs_bridge, vs_session, vs_tool_registry
 
 
+class VSToolRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_routes_are_isolated_and_leave_the_default_selected(self):
+        from mcp_server.vs_server import mcp
+
+        bridge = vs_bridge.VSBridge()
+        targets = {
+            pid: vs_bridge.BoundVSTarget({
+                "pipeName": f"AIDebuggerVS_{pid}", "processId": pid,
+                "processStartTimeUtcTicks": pid * 10, "serverInstanceId": str(pid),
+            }, {})
+            for pid in (101, 202)
+        }
+        bridge._selected_pipe = targets[101]["pipeName"]
+        bridge._selected_target = dict(targets[101])
+        all_dispatched = asyncio.Event()
+        dispatched = set()
+
+        async def call_exact(target, method, *args, **kwargs):
+            self.assertEqual(method, "get_debug_status")
+            if kwargs.get("advance_selection") is False:
+                dispatched.add(target["processId"])
+                if len(dispatched) == 2:
+                    all_dispatched.set()
+                await asyncio.wait_for(all_dispatched.wait(), 2)
+            return {
+                "isDebugging": True, "isPaused": True, "debugMode": "Break",
+                "currentProcessId": target["processId"] + 1000,
+            }
+
+        async def status(pid=None):
+            params = {} if pid is None else {"vs_process_id": pid}
+            _, payload = await mcp.call_tool("get_debug_status", params)
+            return payload["result"]["currentProcessId"]
+
+        self.assertIn("vs_process_id", next(
+            tool for tool in await mcp.list_tools() if tool.name == "get_debug_status"
+        ).inputSchema["properties"])
+        with patch.object(vs_bridge, "get_bridge", return_value=bridge), \
+             patch.object(vs_session, "_session", vs_session.VSSessionManager(bridge)), \
+             patch.object(bridge, "bind_tool_target", AsyncMock(side_effect=targets.__getitem__)), \
+             patch.object(bridge, "call_pipe_exact", side_effect=call_exact):
+            self.assertEqual(await asyncio.gather(status(101), status(202)), [1101, 1202])
+            self.assertEqual(await status(), 1101)
+        self.assertEqual(bridge._selected_target, dict(targets[101]))
+
+
 class VSBridgeResponseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.request_id = "7e93aa46-d9e4-4a79-8781-71e77e936fec"

@@ -269,8 +269,15 @@ async def wait_for_debugging_to_start(
 
     executable_path = str(result.get("executablePath") or "")
     wait_for_pause = executable_path.lower().endswith((".dmp", ".mdmp", ".hdmp"))
+    attach_pid = result.get("processId") if result.get("action") == "AttachProcess" or (
+        result.get("processStarted") and result.get("attachCompleted") is not None
+    ) else None
     status = result.get("status")
-    if isinstance(status, dict) and status.get("isDebugging") and (not wait_for_pause or status.get("isPaused")):
+    if attach_pid and result.get("attachCompleted"):
+        result["debuggerActivationStatus"] = "active"
+        result["followUpTimedOut"] = False
+        return result
+    if not attach_pid and isinstance(status, dict) and status.get("isDebugging") and (not wait_for_pause or status.get("isPaused")):
         result["debuggerActivationStatus"] = "active"
         result["followUpTimedOut"] = False
         return result
@@ -293,11 +300,12 @@ async def wait_for_debugging_to_start(
         if remaining <= 0.1:
             break
         poll_timeout = min(5.0, remaining)
+        method = "get_debug_processes" if attach_pid else "get_debug_status"
         try:
             last_status = await (
-                vs_bridge.call_pipe_exact(target, "get_debug_status", timeout=poll_timeout)
+                vs_bridge.call_pipe_exact(target, method, timeout=poll_timeout)
                 if target else
-                ide_bridge.call("get_debug_status", timeout=poll_timeout)
+                ide_bridge.call(method, timeout=poll_timeout)
             )
         except (ide_bridge.IDEBridgeError, vs_bridge.VSBridgeError) as e:
             last_error = str(e)
@@ -318,6 +326,20 @@ async def wait_for_debugging_to_start(
             continue
 
         if isinstance(last_status, dict):
+            if attach_pid:
+                if last_status.get("snapshotStable") and any(
+                    process.get("processId") == attach_pid
+                    and bool(result.get("processStartTimeUtcTicks"))
+                    and process.get("processStartTimeUtcTicks") == result.get("processStartTimeUtcTicks")
+                    for process in last_status.get("processes", [])
+                ):
+                    result["attachCompleted"] = True
+                    result["debuggerActivationStatus"] = "active"
+                    result["followUpTimedOut"] = False
+                    result["outcome"] = "process_started_and_attached" if result.get("processStarted") else "attached_existing_process"
+                    result["message"] = f"Attached to process {attach_pid}."
+                    return result
+                continue
             result["status"] = last_status
             if last_status.get("isDebugging") and (not wait_for_pause or last_status.get("isPaused")):
                 result["success"] = True
@@ -334,9 +356,11 @@ async def wait_for_debugging_to_start(
     result["message"] = (
         "The start command succeeded, but activation polling timed out waiting for Visual Studio to pause in dump debugging. Do not repeat the command."
         if wait_for_pause
+        else f"Attach was requested, but Visual Studio did not confirm process {attach_pid} before the deadline."
+        if attach_pid
         else "The start command succeeded, but activation polling timed out waiting for Visual Studio to enter debugging mode. Do not repeat the command."
     )
-    if isinstance(last_status, dict):
+    if not attach_pid and isinstance(last_status, dict):
         result["status"] = last_status
     if last_error:
         result["lastPollError"] = last_error

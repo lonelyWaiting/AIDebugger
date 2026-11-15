@@ -80,34 +80,29 @@ namespace VSDebuggerMCP
 
                     try
                     {
+                        if (IsDebuggedProcess(debugger, target.ProcessId))
+                        {
+                            CompleteAttachResult(result, debugger, target, alreadyAttached: true);
+                            return result;
+                        }
                         ClearDumpSessionState();
                         result.CommandIssued = true;
                         try
                         {
                             CommandEffectExecutor.Issue(
                                 "debugger.attach_process",
-                                targetProcess.Attach);
+                                () => ExecuteWithoutAutomationUI(targetProcess.Attach));
                         }
                         finally
                         {
                             MarkDebugSessionTransitionCommandIssued("attach_process");
                         }
+                        CompleteAttachResult(result, debugger, target);
                     }
                     finally
                     {
                         CloseHandle(identityHandle);
                     }
-                    result.Success = true;
-                    result.AttachCompleted = true;
-                    result.Outcome = "attached_existing_process";
-                    result.ProcessId = target.ProcessId;
-                    result.ProcessName = target.ProcessName;
-                    result.Message = $"Attached to process {target.ProcessName} ({target.ProcessId})";
-                    try { result.Status = BuildDebugStatus(debugger); } catch { }
-                    RecordTrustedLiveProcessIdentity(
-                        target.ProcessId,
-                        target.ProcessStartTimeUtcTicks,
-                        result.Status);
                 }
                 catch (Exception ex)
                 {
@@ -123,6 +118,38 @@ namespace VSDebuggerMCP
 
                 return result;
             }, HeavyMainThreadTimeoutMs);
+        }
+
+        private static bool IsDebuggedProcess(Debugger5 debugger, int processId)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var processes = debugger.DebuggedProcesses;
+            int count = processes?.Count ?? 0;
+            for (int index = 1; index <= count; index++)
+            {
+                if (processes.Item(index)?.ProcessID == processId) return true;
+            }
+            return false;
+        }
+
+        private void CompleteAttachResult(
+            ProcessDebugResult result, Debugger5 debugger, LocalProcessLookup target, bool alreadyAttached = false)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            result.ProcessId = target.ProcessId;
+            result.ProcessName = target.ProcessName;
+            result.AttachCompleted = alreadyAttached || IsDebuggedProcess(debugger, target.ProcessId);
+            result.Success = true;
+            result.Outcome = alreadyAttached ? "already_attached" : result.AttachCompleted
+                ? (result.ProcessStarted ? "process_started_and_attached" : "attached_existing_process")
+                : "attach_requested";
+            result.Message = alreadyAttached
+                ? $"Process {target.ProcessName} ({target.ProcessId}) is already attached"
+                : result.AttachCompleted
+                    ? $"Attached to process {target.ProcessName} ({target.ProcessId})"
+                    : $"Attach requested for {target.ProcessName} ({target.ProcessId}); awaiting debugger confirmation";
+            TryPopulateDebugStatus(result, debugger);
+            RecordTrustedLiveProcessIdentity(target.ProcessId, target.ProcessStartTimeUtcTicks, result.Status);
         }
 
         /// <summary>
@@ -190,6 +217,7 @@ namespace VSDebuggerMCP
                                 () =>
                                 {
                                     ThreadHelper.ThrowIfNotOnUIThread();
+                                    SuppressDebuggerAutomationUI();
                                     debugger.Go(false);
                                 });
                         }
@@ -401,7 +429,7 @@ namespace VSDebuggerMCP
                                 {
                                     CommandEffectExecutor.Issue(
                                         "debugger.attach_started_process",
-                                        targetProcess.Attach);
+                                        () => ExecuteWithoutAutomationUI(targetProcess.Attach));
                                 }
                                 finally
                                 {
@@ -423,16 +451,7 @@ namespace VSDebuggerMCP
                         {
                             CloseHandle(finalIdentityHandle);
                         }
-                        result.Success = true;
-                        result.AttachCompleted = true;
-                        result.Outcome = "process_started_and_attached";
-                        result.ProcessName = target.ProcessName;
-                        result.Message = $"Started and attached to process {target.ProcessName} ({target.ProcessId})";
-                        try { result.Status = BuildDebugStatus(Debugger); } catch { }
-                        RecordTrustedLiveProcessIdentity(
-                            target.ProcessId,
-                            target.ProcessStartTimeUtcTicks,
-                            result.Status);
+                        CompleteAttachResult(result, Debugger, target);
                         return result;
                     }, HeavyMainThreadTimeoutMs);
                 }
@@ -1232,6 +1251,7 @@ namespace VSDebuggerMCP
                             () =>
                             {
                                 ThreadHelper.ThrowIfNotOnUIThread();
+                                SuppressDebuggerAutomationUI();
                                 debugger.Go(false);
                             }); // false = don't wait for break
                     }
@@ -1468,6 +1488,7 @@ namespace VSDebuggerMCP
                         CommandEffectExecutor.Issue("debugger.step:" + action, () =>
                         {
                             ThreadHelper.ThrowIfNotOnUIThread();
+                            SuppressDebuggerAutomationUI();
                             switch (action)
                             {
                                 case "StepInto":
@@ -1785,6 +1806,7 @@ namespace VSDebuggerMCP
                             () =>
                             {
                                 ThreadHelper.ThrowIfNotOnUIThread();
+                                SuppressDebuggerAutomationUI();
                                 debugger.RunToCursor(false);
                             });
                     }

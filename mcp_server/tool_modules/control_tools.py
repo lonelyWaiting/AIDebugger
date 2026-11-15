@@ -145,24 +145,89 @@ async def _call_recovery_target(
 @mcp.tool()
 async def attach_process(
     process_id: Optional[int] = None,
-    process_name: Optional[str] = None
+    process_name: Optional[str] = None,
+    timeout_seconds: Optional[float] = None,
 ) -> str:
     """
     Attach Visual Studio to a local process by PID or executable name.
+    Use attach_processes to attach multiple PIDs to the same Visual Studio.
 
     Examples:
     attach_process(process_name="UnrealEditor.exe")
     attach_process(process_id=12345)
     """
     try:
-        result = await ide_bridge.call(
+        timeout = clamp_tool_timeout(timeout_seconds, START_DEBUGGING_TIMEOUT_SECONDS)
+        deadline = asyncio.get_running_loop().time() + timeout
+        result, target = await ide_bridge.call_with_target(
             "attach_process",
             _build_attach_process_params(process_id, process_name),
             preferred_ide="vs",
+            timeout=timeout,
+        )
+        result = await wait_for_debugging_to_start(
+            result, deadline - asyncio.get_running_loop().time(), True,
+            target=vs_bridge.instance_target(target),
         )
         return format_result(result)
     except ide_bridge.IDEBridgeError as e:
         return handle_ide_error(e, "attach_process")
+
+
+@mcp.tool()
+async def attach_processes(
+    process_ids: List[int], timeout_seconds: Optional[float] = None,
+) -> str:
+    """Attach multiple local PIDs to the same Visual Studio debugger.
+
+    Returns one result per PID. Attachment attempts are serialized in Visual Studio.
+    Use get_debug_processes and switch_process in break mode to inspect each target.
+    """
+    try:
+        ids = [validate_int_range("process_id", pid, 1, 0x7FFFFFFF) for pid in process_ids]
+        if not 1 <= len(ids) <= 32 or len(set(ids)) != len(ids):
+            raise invalid_argument("Provide between 1 and 32 distinct process IDs.")
+        timeout = clamp_tool_timeout(timeout_seconds, START_DEBUGGING_TIMEOUT_SECONDS)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        _, target = await ide_bridge.call_with_target("get_debug_status", timeout=timeout)
+        target = vs_bridge.instance_target(target)
+    except ide_bridge.IDEBridgeError as error:
+        return handle_ide_error(error, "attach_processes", method="get_debug_status")
+
+    results = []
+    for pid in ids:
+        remaining = deadline - loop.time()
+        if remaining <= 0.1:
+            results.append({
+                "processId": pid, "success": False, "attachCompleted": False,
+                "errorCode": "DEADLINE_EXCEEDED_NOT_STARTED", "message": "Attach budget exhausted.",
+            })
+            continue
+        try:
+            result = await vs_bridge.call_pipe_exact(
+                target, "attach_process", {"processId": pid}, timeout=remaining,
+            )
+        except vs_bridge.VSBridgeError as error:
+            result = {
+                "processId": pid, "success": False, "attachCompleted": False,
+                "errorCode": error.code, "message": str(error), "retryCommand": False,
+                "targetIdentity": getattr(error, "target_identity", None),
+                "requestId": getattr(error, "request_id", None),
+                "outcomeUnknown": bool(getattr(error, "outcome_unknown", False)),
+            }
+        results.append(result)
+
+    remaining = deadline - loop.time()
+    results = await asyncio.gather(*(
+        wait_for_debugging_to_start(result, remaining, True, target=target)
+        for result in results
+    ))
+    attached = sum(bool(result.get("success") and result.get("attachCompleted")) for result in results)
+    return format_result({
+        "success": attached == len(ids), "attachedCount": attached,
+        "target": dict(target), "results": results,
+    })
 
 
 @mcp.tool()

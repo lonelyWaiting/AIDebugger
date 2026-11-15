@@ -264,7 +264,7 @@ def _recommended_workflow_for_access(effective_instance: Optional[Dict[str, Any]
     if "debug.context.write" in allowed:
         workflow.append("Context-write capability is enabled: switch_thread/switch_stack_frame and Visual Studio same-session switch_process may be used while paused.")
     if "debug.session.write" in allowed:
-        workflow.append("Session-write capability is enabled: attach_process/start_debugging may be used.")
+        workflow.append("Use attach_process for one target, attach_processes for multiple PIDs, or start_debugging to launch a target.")
     if access_mode == "read_only":
         workflow.append(
             "Stop the current Visual Studio AIDebugger server, then start Tools > Start AIDebugger MCP Server. "

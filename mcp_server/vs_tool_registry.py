@@ -49,7 +49,7 @@ VS_TOOL_DOMAINS: Dict[str, List[str]] = {
     ],
     "control": [
         "get_dispatcher_health", "get_command_status", "cancel_debug_request",
-        "attach_process", "get_debug_processes",
+        "attach_process", "attach_processes", "get_debug_processes",
         "list_debug_processes", "switch_process", "select_process", "start_debugging",
         "debug_control", "debug_continue", "continue", "continue_and_wait_for_break",
         "continue_and_capture_native", "debug_step_over", "step_over", "debug_step_into",
@@ -93,7 +93,8 @@ _COMPOSITE_METHODS = {
     # Launches a Visual Studio instance locally and can then attach, so the catalog
     # keeps the conservative command annotation (attach_process is a session write)
     # even though the launch itself never reaches the pipe catalog.
-    "ensure_vs_instance": ["ping", "get_instance_info", "attach_process"],
+    "ensure_vs_instance": ["ping", "get_instance_info", "attach_process", "get_debug_processes"],
+    "attach_processes": ["get_debug_status", "attach_process", "get_debug_processes"],
     "select_vs_instance": ["ping", "get_instance_info"],
     "crash_triage": ["capture_debug_bundle", "get_disassembly", "resolve_address", "read_memory"],
     "debug_control": ["continue", "step_over", "step_into", "step_out", "break", "stop", "detach"],

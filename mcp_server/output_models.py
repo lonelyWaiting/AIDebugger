@@ -393,6 +393,12 @@ class CapabilityPayload(StrictPayload):
     accessDiscoveryError: Optional[str] = None
 
 
+class StaleVSInstancePayload(IDEInstancePayload):
+    debugSessionGeneration: Optional[int] = None
+    breakSequence: Optional[int] = None
+    contextEpoch: Optional[int] = None
+
+
 class InstanceListPayload(StrictPayload):
     instanceCount: int
     reachableCount: Optional[int] = None
@@ -407,7 +413,7 @@ class InstanceListPayload(StrictPayload):
     preferredIde: Optional[str] = None
     autoSelected: Optional[IDEInstancePayload] = None
     selectedInstance: Optional[IDEInstancePayload] = None
-    staleSelectedTarget: Optional[IDEInstancePayload] = None
+    staleSelectedTarget: Optional[StaleVSInstancePayload] = None
     wouldAutoSelectInstance: Optional[IDEInstancePayload] = None
     message: Optional[str] = None
     selectionStatus: Optional[Literal["selection_changed", "no_reachable_instance", "stale_selection"]] = None
@@ -548,6 +554,7 @@ class DebugStatusPayload(StrictPayload):
     stopReasonRaw: Optional[str] = None
     stopReasonSource: Optional[str] = None
     stopReasonConfidence: Optional[str] = None
+    lastAcknowledgedBreakpointError: Optional[str] = None
     debugSessionGeneration: Optional[int] = None
     breakSequence: Optional[int] = None
     contextEpoch: Optional[int] = None
@@ -1033,6 +1040,18 @@ class ProcessDebugPayload(OperationPayload):
     retryCommand: Optional[bool] = None
 
 
+class AttachProcessItem(ProcessDebugPayload):
+    requestId: Optional[str] = None
+    outcomeUnknown: Optional[bool] = None
+
+
+class AttachProcessesPayload(StrictPayload):
+    success: bool
+    attachedCount: int
+    target: Dict[str, Any]
+    results: List[AttachProcessItem]
+
+
 class BreakpointOperationPayload(OperationPayload):
     operation: Optional[str] = None
     verificationStatus: Optional[str] = None
@@ -1193,6 +1212,7 @@ _MODEL_BY_TOOL: Dict[str, Type[StrictPayload]] = {
         "select_vs_instance", "clear_vs_selection",
     )},
     "ensure_vs_instance": EnsureVSInstancePayload,
+    "attach_processes": AttachProcessesPayload,
     "close_vs_instance": CloseVSInstancePayload,
     "dispatch_vs_instances": MultiVSDispatchPayload,
     "dispatch_vs_commands": MultiVSDispatchPayload,

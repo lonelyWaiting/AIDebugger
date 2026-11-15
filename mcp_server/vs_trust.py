@@ -112,6 +112,13 @@ def _validate_registration_security(path: pathlib.Path, subdirectory: str = "ins
     def plain_path(candidate: pathlib.Path, *, directory: bool) -> bool:
         try:
             metadata = candidate.lstat()
+        except FileNotFoundError as exc:
+            if not directory:
+                raise VSBridgeError(
+                    "Authenticated instance registration was not found",
+                    code="INSTANCE_REGISTRATION_NOT_FOUND",
+                ) from exc
+            return False
         except OSError:
             return False
         is_reparse = candidate.is_symlink() or bool(

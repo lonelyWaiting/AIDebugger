@@ -334,6 +334,7 @@ namespace VSDebuggerMCP
                         () =>
                         {
                             ThreadHelper.ThrowIfNotOnUIThread();
+                            SuppressDebuggerAutomationUI();
                             return debugger.Breakpoints.Add(
                                 functionName,
                                 "",
@@ -431,6 +432,7 @@ namespace VSDebuggerMCP
                         () =>
                         {
                             ThreadHelper.ThrowIfNotOnUIThread();
+                            SuppressDebuggerAutomationUI();
                             return debugger.Breakpoints.Add(
                                 string.Empty,
                                 string.Empty,
@@ -759,6 +761,7 @@ namespace VSDebuggerMCP
                         () =>
                         {
                             ThreadHelper.ThrowIfNotOnUIThread();
+                            if (enabled) SuppressDebuggerAutomationUI();
                             bp.Enabled = enabled;
                         });
                     result.AffectedCount = 1;
@@ -1492,6 +1495,7 @@ namespace VSDebuggerMCP
                 () =>
                 {
                     ThreadHelper.ThrowIfNotOnUIThread();
+                    SuppressDebuggerAutomationUI();
                     return debugger.Breakpoints.Add(
                         string.Empty,
                         filePath,
@@ -1741,6 +1745,8 @@ namespace VSDebuggerMCP
                 result.AffectedCount = 1;
                 result.Outcome = "created_relocated";
                 result.BreakpointInfo = capture.BreakpointInfo;
+                result.VerificationStatus = capture.BreakpointInfo.BindingVerificationStatus;
+                result.VerificationMessage = capture.BreakpointInfo.BindingWarning;
                 result.Message = BuildSetBreakpointMessage(capture.BreakpointInfo, filePath, requestedLineNumber);
                 return result;
             }
@@ -1748,6 +1754,7 @@ namespace VSDebuggerMCP
             MarkNearbyProbeResult(result.BreakpointInfo, attempted: true, succeeded: false);
             result.Success = true;
             result.Outcome = "created_unbound_no_nearby_match";
+            result.VerificationMessage = result.BreakpointInfo.BindingWarning;
             result.Message = $"Breakpoint was created at {filePath}:{requestedLineNumber}, but did not bind in the current session; no nearby bound executable line was found";
             return result;
         }

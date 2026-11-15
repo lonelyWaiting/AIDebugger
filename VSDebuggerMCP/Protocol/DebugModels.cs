@@ -164,6 +164,9 @@ namespace VSDebuggerMCP.Protocol
         [DataMember(Name = "stopReasonConfidence")]
         public string StopReasonConfidence { get; set; }
 
+        [DataMember(Name = "lastAcknowledgedBreakpointError", EmitDefaultValue = false)]
+        public string LastAcknowledgedBreakpointError { get; set; }
+
         [DataMember(Name = "debugSessionGeneration")]
         public long DebugSessionGeneration { get; set; }
 

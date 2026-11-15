@@ -12,6 +12,7 @@ import ctypes
 import time
 import concurrent.futures
 import contextvars
+from contextlib import contextmanager
 from ctypes import wintypes
 from typing import Any, Dict, List, Optional
 import logging
@@ -617,6 +618,24 @@ class BoundVSTarget(dict):
             },
             self._registration_snapshot,
         )
+
+
+_TOOL_VS_TARGET: contextvars.ContextVar[Optional[BoundVSTarget]] = contextvars.ContextVar(
+    "aidb_tool_vs_target", default=None,
+)
+
+
+async def resolve_tool_vs_target(vs_process_id: int) -> BoundVSTarget:
+    return await get_bridge().bind_tool_target(vs_process_id)
+
+
+@contextmanager
+def tool_vs_target(target: BoundVSTarget):
+    token = _TOOL_VS_TARGET.set(target)
+    try:
+        yield
+    finally:
+        _TOOL_VS_TARGET.reset(token)
 
 
 class VSInstance:
@@ -1507,6 +1526,36 @@ class VSBridge:
         async with self._lock:
             self._cached_instances = instances
         return instances
+
+    async def bind_tool_target(self, vs_process_id: int) -> BoundVSTarget:
+        """Resolve only the requested registration. Other VS instances may be busy."""
+        pipe_name = f"AIDebuggerVS_{vs_process_id}"
+        deadline = time.monotonic() + DEFAULT_TIMEOUT
+
+        def bind() -> BoundVSTarget:
+            with _scoped_validation_deadline(deadline):
+                registration, identity = _bind_registration_snapshot(pipe_name)
+            return BoundVSTarget(identity, registration)
+
+        try:
+            future = await self._submit_bounded(
+                self._executor, self._call_admission, bind, (), deadline, "Visual Studio target binding",
+            )
+            return await asyncio.wait_for(
+                asyncio.shield(future), timeout=max(0.0, deadline - time.monotonic()),
+            )
+        except asyncio.TimeoutError as error:
+            raise VSBridgeError(
+                f"Timed out binding Visual Studio PID {vs_process_id}.",
+                code="DEADLINE_EXCEEDED_NOT_STARTED",
+            ) from error
+        except VSBridgeError as error:
+            if error.code == "INSTANCE_REGISTRATION_NOT_FOUND":
+                raise VSBridgeError(
+                    f"No authenticated Visual Studio registration for PID {vs_process_id}.",
+                    code="TARGET_NOT_FOUND",
+                ) from error
+            raise
     
     def select_instance(
         self,
@@ -1985,6 +2034,7 @@ class VSBridge:
         untouched. Callers that must not redirect what a later bare tool call
         resolves to (for example multi-target dispatch) pass it explicitly.
         """
+        advance_selection = advance_selection and _TOOL_VS_TARGET.get() is None
         call_deadline = time.monotonic() + max(self._MIN_SYNC_TIMEOUT, float(timeout))
         pipe_name = str(target.get("pipeName") or "")
         if registration_snapshot is None and isinstance(target, BoundVSTarget):
@@ -2101,6 +2151,12 @@ class VSBridge:
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(self._MIN_SYNC_TIMEOUT, float(timeout))
+        explicit_target = _TOOL_VS_TARGET.get()
+        if explicit_target is not None:
+            return await self.call_pipe_exact(
+                explicit_target, method, params, timeout,
+                include_target=include_target, advance_selection=False,
+            )
         async with self._lock:
             pipe_name = self._selected_pipe
             selected_target = dict(self._selected_target) if self._selected_target is not None else None

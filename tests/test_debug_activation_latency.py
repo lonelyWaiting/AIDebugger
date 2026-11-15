@@ -5,6 +5,29 @@ from mcp_server import tool_context
 
 
 class ActivationLatencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_attach_checks_process_membership_and_creation_time(self):
+        target = {"pipeName": "AIDebuggerVS_123"}
+        receipt = {
+            "action": "AttachProcess", "success": True, "commandIssued": True,
+            "attachCompleted": False, "processId": 20, "processStartTimeUtcTicks": 200,
+            "status": {"isDebugging": True, "currentProcessId": 10},
+        }
+        snapshots = [
+            {"snapshotStable": True, "processes": [
+                {"processId": 20, "processStartTimeUtcTicks": 100},
+            ]},
+            {"snapshotStable": True, "processes": [
+                {"processId": 20, "processStartTimeUtcTicks": 200, "isCurrent": False},
+            ]},
+        ]
+        with patch.object(tool_context.vs_bridge, "call_pipe_exact", AsyncMock(side_effect=snapshots)) as call:
+            result = await tool_context.wait_for_debugging_to_start(receipt, 1, True, target)
+        self.assertTrue(result["attachCompleted"])
+        self.assertEqual(result["debuggerActivationStatus"], "active")
+        self.assertFalse(result["retryCommand"])
+        self.assertEqual(call.await_count, 2)
+        self.assertTrue(all(args.args == (target, "get_debug_processes") for args in call.call_args_list))
+
     async def test_ready_target_is_probed_before_any_poll_delay(self):
         status = {"isDebugging": True, "isPaused": True}
         target = {"pipeName": "AIDebuggerVS_123"}

@@ -430,9 +430,11 @@ namespace VSDebuggerMCP
                 }
                 finally
                 {
+                    await JoinableTaskFactory.SwitchToMainThreadAsync();
                     if (ReferenceEquals(_pipeServer, server))
                     {
                         _pipeServer = null;
+                        _debuggerService?.RestoreDebuggerAutomationUI();
                     }
                 }
             }

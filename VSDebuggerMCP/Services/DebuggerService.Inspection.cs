@@ -50,7 +50,8 @@ namespace VSDebuggerMCP
             {
                 IsDebugging = debugger.CurrentMode != dbgDebugMode.dbgDesignMode,
                 IsPaused = debugger.CurrentMode == dbgDebugMode.dbgBreakMode,
-                DebugMode = GetDebugModeString(debugger.CurrentMode)
+                DebugMode = GetDebugModeString(debugger.CurrentMode),
+                LastAcknowledgedBreakpointError = BreakpointErrorDialogHandler.LastAcknowledgedError,
             };
 
             if (result.IsDebugging && debugger.CurrentProcess != null)

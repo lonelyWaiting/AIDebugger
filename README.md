@@ -383,9 +383,15 @@ It never downloads packages with `pip`.
 8. For first-pass crash/bug diagnosis, prefer `capture_debug_bundle()` in its
    default low-blocking mode and opt in to heavier data only when needed.
 
-When multiple Visual Studio instances are running, use `list_vs_instances` and
-`select_vs_instance` to pin the target. Without a manual selection, the bridge
-prefers a uniquely paused or uniquely debugging instance.
+When multiple Visual Studio instances are running, use `list_vs_instances`
+to find their PIDs. Pass `vs_process_id` to an individual debugger tool to
+route that call without changing the default selection. For example,
+`attach_process(vs_process_id=1000, process_id=2000)` and
+`attach_process(vs_process_id=1001, process_id=2001)` can run concurrently.
+`vs_process_id` identifies the Visual Studio instance and `process_id`
+identifies the debuggee. Use `select_vs_instance` to set the default for calls
+that omit `vs_process_id`. Command recovery tools accept the exact target
+identity from the failed operation.
 For one concurrent operation across several VS instances, use
 `dispatch_vs_instances(method="capture_debug_bundle_safe", process_ids=[...])`, or
 `dispatch_vs_commands(...)` when the same command must run against several

@@ -29,6 +29,8 @@ namespace VSDebuggerMCP
         private readonly DTE2 _dte;
         private readonly Action<string> _log;
         private readonly DebugSessionTracker _sessionTracker;
+        private readonly EnvDTE.DebuggerEvents _debuggerAutomationEvents;
+        private bool _restoreDebuggerAutomationUI;
         private readonly object _trustedLiveProcessSync = new object();
         private int _trustedLiveProcessId;
         private long _trustedLiveProcessStartTimeUtcTicks;
@@ -319,6 +321,8 @@ namespace VSDebuggerMCP
             _visualStudioAdapter = new VisualStudioDebuggerAdapter();
             _debugProcessHandles = new DebugProcessHandleStore();
             _sessionTracker = new DebugSessionTracker(_dte, _log);
+            _debuggerAutomationEvents = _dte.Events.DebuggerEvents;
+            _debuggerAutomationEvents.OnEnterDesignMode += OnDebuggerEnterDesignMode;
             ObserveDebugContext(Debugger);
         }
 
@@ -329,6 +333,39 @@ namespace VSDebuggerMCP
                 ThreadHelper.ThrowIfNotOnUIThread();
                 return _dte.Debugger as Debugger5;
             }
+        }
+
+        private void OnDebuggerEnterDesignMode(dbgEventReason reason)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            RestoreDebuggerAutomationUI();
+        }
+
+        // Attach, resume and breakpoint binding may report errors after EnvDTE
+        // returns. Keep suppression through the debug session.
+        private void SuppressDebuggerAutomationUI()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            BreakpointErrorDialogHandler.Enable(_log);
+            if (_dte.SuppressUI) return;
+            _dte.SuppressUI = true;
+            _restoreDebuggerAutomationUI = true;
+        }
+
+        private void ExecuteWithoutAutomationUI(Action action)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            SuppressDebuggerAutomationUI();
+            action();
+        }
+
+        internal void RestoreDebuggerAutomationUI()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            BreakpointErrorDialogHandler.Disable();
+            if (!_restoreDebuggerAutomationUI) return;
+            _dte.SuppressUI = false;
+            _restoreDebuggerAutomationUI = false;
         }
 
 
@@ -642,7 +679,12 @@ namespace VSDebuggerMCP
         public void Dispose()
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            _sessionTracker.Dispose();
+            try { RestoreDebuggerAutomationUI(); }
+            finally
+            {
+                _debuggerAutomationEvents.OnEnterDesignMode -= OnDebuggerEnterDesignMode;
+                _sessionTracker.Dispose();
+            }
         }
 
         #endregion

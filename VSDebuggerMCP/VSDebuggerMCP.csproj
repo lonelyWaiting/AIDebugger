@@ -70,6 +70,7 @@
     <Compile Include="Services\BuildErrorCodeParser.cs" />
     <Compile Include="Services\BuildErrorCaptureBudget.cs" />
     <Compile Include="Services\BreakpointCaptureBudget.cs" />
+    <Compile Include="Services\BreakpointErrorDialogHandler.cs" />
     <Compile Include="Services\CancelableSingleFlight.cs" />
     <Compile Include="Services\OutputWindowService.cs" />
     <Compile Include="Services\OutputContentBudget.cs" />
@@ -150,6 +151,9 @@
   </ItemGroup>
   <ItemGroup>
     <Reference Include="System" />
+    <Reference Include="PresentationCore" />
+    <Reference Include="PresentationFramework" />
+    <Reference Include="WindowsBase" />
     <Reference Include="System.Design" />
     <Reference Include="System.Xml" />
     <Reference Include="System.Web.Extensions" />
