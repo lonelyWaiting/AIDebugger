@@ -1,7 +1,7 @@
 # AIDebugger MCP
 
-AIDebugger exposes independent Visual Studio, IDA analysis/patch, and Windows
-kernel debugging backends through Model Context Protocol (MCP) servers. It is intended for clients such as
+AIDebugger exposes independent Visual Studio, IDA analysis/patch, Windows kernel,
+and Android native debugging backends through Model Context Protocol (MCP) servers. It is intended for clients such as
 Cursor, Codex, Claude Desktop, Claude Code, and OpenCode.
 
 It supports call stacks, locals, threads, modules, exceptions, build errors,
@@ -17,6 +17,8 @@ and validation](docs/kernel-backend.md) for capabilities and live-validation lim
 Run `Install-AIDebugger.cmd` to deploy IDA/kernel MCP and the project-maintained
 IDA analysis Skill to Claude/Codex; Visual Studio keeps its VSIX installer/setup.
 Use `--backend kernel` to add kernel without changing an existing IDA setup.
+The Android backend uses an AIDebugger-managed ADB and LLDB runtime to attach to a
+running debuggable Android app. See [Android setup and debugging](docs/android-backend.md).
 
 ## Architecture
 
@@ -24,6 +26,7 @@ Use `--backend kernel` to add kernel without changing an existing IDA setup.
 Visual Studio VSIX -- authenticated AIDB/2 pipe --> VS-only FastMCP entry -- stdio --> MCP client
 IDA / IDB         -- private session transport --> IDA MCP entry        -- stdio --> MCP client
 DbgEng worker     -- inherited anonymous pipes --> Kernel MCP entry     -- stdio --> MCP client
+Android app       -- lldb-server, ADB forward --> Android MCP entry     -- stdio --> MCP client
 ```
 
 A Visual Studio instance owns a paired data/control named pipe:

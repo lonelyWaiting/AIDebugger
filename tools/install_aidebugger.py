@@ -1,4 +1,4 @@
-"""Install independent IDA/kernel MCP backends, preserving VS registration.
+"""Install independent AIDebugger MCP backends, preserving VS registration.
 
 Python 3.11+. No pip, IDA plugin replacement, administrator rights or VS required.
 Use --dry-run to review destinations. Existing configuration is backed up.
@@ -18,6 +18,8 @@ import time
 
 SOURCE = Path(__file__).resolve().parents[1]
 SKILL = "ida-evidence-analysis"
+CORE_BACKENDS = ("ida", "kernel")
+BACKENDS = (*CORE_BACKENDS, "android")
 
 
 def digest(data):
@@ -35,7 +37,7 @@ def _tomllib():
 
 def replace_backend_toml(text, command, server, backend):
     """Replace only the selected backend's table; compare unrelated parsed data."""
-    if backend not in {"ida", "kernel"}:
+    if backend not in BACKENDS:
         raise ValueError("Unknown backend")
     tomllib = _tomllib()
     original = tomllib.loads(text)
@@ -74,15 +76,15 @@ def replace_ida_toml(text, command, server):
 
 
 def payload_files(backend="ida"):
-    paths = [* (SOURCE / "ida_backend").rglob("*")]
     if backend == "ida":
+        paths = list((SOURCE / "ida_backend").rglob("*"))
         paths.extend((SOURCE / "skills" / SKILL).rglob("*"))
     else:
         # Share the vendored generic MCP library, without IDA sessions/worker.
         paths = list((SOURCE / "ida_backend/vendor/ida_pro_mcp/ida_mcp/zeromcp").rglob("*"))
         paths.extend(SOURCE / "ida_backend/vendor" / name for name in
                      ("LICENSE.ida-pro-mcp", "LOCAL_CHANGES.md", "UPSTREAM.json"))
-        paths.extend((SOURCE / "kernel_backend").rglob("*"))
+        paths.extend((SOURCE / (backend + "_backend")).rglob("*"))
     files = {}
     for path in paths:
         if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".pyc":
@@ -117,9 +119,10 @@ def atomic_write(path, data):
         Path(name).unlink(missing_ok=True)
 
 
-def install(home, clients=("claude", "codex"), python=None, dry_run=False, backends=("ida", "kernel")):
-    if not backends or len(set(backends)) != len(backends) or any(b not in {"ida", "kernel"} for b in backends):
-        raise ValueError("Choose ida, kernel, or both backends")
+def install(home, clients=("claude", "codex"), python=None, dry_run=False, backends=CORE_BACKENDS,
+            *, accept_android_licenses=False, android_archives=None):
+    if not backends or len(set(backends)) != len(backends) or any(b not in BACKENDS for b in backends):
+        raise ValueError("Choose from ida, kernel, and android")
     home = checked_path(Path(home).absolute())
     codex_home = (checked_path(Path(os.environ.get("CODEX_HOME") or home / ".codex").expanduser().absolute())
                   if "codex" in clients else None)
@@ -196,6 +199,13 @@ def install(home, clients=("claude", "codex"), python=None, dry_run=False, backe
         destinations[manifest_path] = (json.dumps(receipt, indent=2) + "\n").encode("utf-8")
     if dry_run:
         return {"dryRun": True, "server": str(server), "servers": {b: str(p) for b, p in servers.items()}, "destinations": [str(p) for p in destinations]}
+    if "android" in backends:
+        # The script entrypoint runs from tools/, while the backend lives at the repository root.
+        from android_backend.runtime import destination, provision
+
+        android_root = checked_path(home / ".ai-debugger" / "android")
+        checked_path(destination(android_root))
+        provision(android_root, accept_licenses=accept_android_licenses, archives=android_archives)
     backup = deploy / "backups" / str(time.time_ns())
     for index, path in enumerate(configs):
         if snapshots[path] is not None:
@@ -237,12 +247,25 @@ def main():
     parser.add_argument("--client", choices=["claude", "codex", "all"], default="all")
     parser.add_argument("--python", type=Path)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--backend", choices=["ida", "kernel", "all"], default="all")
+    parser.add_argument("--backend", choices=[*BACKENDS, "all"],
+                        help="Default and all install IDA and kernel; all also includes Android "
+                             "when Android download or archive options are supplied.")
+    parser.add_argument("--accept-android-licenses", action="store_true",
+                        help="Accept Google's Android NDK and Platform-Tools terms for automated downloads")
+    parser.add_argument("--android-archives", type=Path,
+                        help="Directory containing the official Android ZIPs for offline setup")
     args = parser.parse_args()
-    backends = ("ida", "kernel") if args.backend == "all" else (args.backend,)
-    result = install(args.home, ("claude", "codex") if args.client == "all" else (args.client,), args.python, args.dry_run, backends)
+    if args.backend in (None, "all"):
+        backends = BACKENDS if args.accept_android_licenses or args.android_archives else CORE_BACKENDS
+    else:
+        backends = (args.backend,)
+    result = install(args.home, ("claude", "codex") if args.client == "all" else (args.client,),
+                     args.python, args.dry_run, backends,
+                     accept_android_licenses=args.accept_android_licenses,
+                     android_archives=args.android_archives)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
+    sys.path.insert(0, str(SOURCE))
     main()
