@@ -17,6 +17,9 @@ sys.path.pop(0)
 from android_backend.runtime import AndroidError, Runtime, destination
 from android_backend.sessions import Sessions
 from android_backend.transport import Adb
+from debug_backend.errors import DebugEngineError
+from debug_backend.inspection import DebugPlatform, InspectionView
+from mcp_server.debug_discovery import register_debug_tools
 from mcp_server.stdio_dispatch import serve
 
 mcp = McpServer("AIDebugger Android")
@@ -68,7 +71,7 @@ def translate(function):
     def wrapped(*args, **kwargs):
         try:
             return function(*args, **kwargs)
-        except (AndroidError, OSError, ValueError) as error:
+        except (AndroidError, DebugEngineError, OSError, ValueError) as error:
             raise McpToolError(str(error)) from error
     return wrapped
 
@@ -329,8 +332,48 @@ def android_detach(session_id: str) -> dict:
     return sessions.submit(session_id, "detach")
 
 
+def inspect_native(session_id, query):
+    if query == "snapshot":
+        return android_snapshot(session_id)
+    if query == "registers":
+        return android_native_query(session_id, query)
+    return android_inspect(session_id, query)
+
+
+def resolve_inspection_view(session_id, view):
+    with sessions.lock:
+        mode = sessions.get(session_id).connection.mode
+    if view and mode not in (view, "dual"):
+        raise DebugEngineError("UNSUPPORTED_INSPECTION", f"This Android session uses the {mode} view")
+    return view or ("native" if mode == "dual" else mode)
+
+
+ANDROID_INSPECTION = ("status", "threads", "stack", "locals", "breakpoints")
+platform = DebugPlatform(
+    "android", "Android session ID from android_attach or android_launch. The default view follows the session mode, with native as the default in dual mode.",
+    {
+        "native": InspectionView("lldb",
+            {**dict.fromkeys((*ANDROID_INSPECTION, "modules"), "android_inspect"),
+             "registers": "android_native_query", "snapshot": "android_snapshot"}, inspect_native),
+        "java": InspectionView("jdwp", dict.fromkeys(ANDROID_INSPECTION, "android_java_inspect"), android_java_inspect),
+    },
+    {
+        "session": ("android_list_devices", "android_attach", "android_launch", "android_list_sessions",
+                    "android_job_status", "android_cancel_job", "android_detach"),
+        "inspection": ("android_inspect", "android_snapshot", "android_native_query", "android_java_inspect",
+                       "android_java_object"),
+        "execution": ("android_control", "android_run_until_stop", "android_java_control"),
+        "breakpoints": ("android_set_breakpoint", "android_configure_breakpoint", "android_remove_breakpoint",
+                        "android_watchpoint", "android_java_breakpoint", "android_java_exception_breakpoint"),
+        "memory": ("android_native_query", "android_write_memory"),
+    },
+    resolve_view=resolve_inspection_view,
+)
+register_debug_tools(mcp, platform, translate, default_view="")
+
+
 if __name__ == "__main__":
     try:
-        serve(mcp, fast_tools={"android_list_sessions", "android_job_status", "android_cancel_job"})
+        serve(mcp, fast_tools={"debug_capabilities", "android_list_sessions", "android_job_status", "android_cancel_job"})
     finally:
         sessions.shutdown()

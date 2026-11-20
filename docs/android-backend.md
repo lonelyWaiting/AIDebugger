@@ -26,8 +26,14 @@ For offline setup, give `--android-archives <directory>` containing the official
 new session after registration. The device must have USB or wireless debugging
 enabled and authorize this host. Windows USB connections can require the
 manufacturer's device driver.
-To install IDA, kernel, and Android together, pass `--backend all` with
+To install IDA, kernel, Windows dump, and Android together, pass `--backend all` with
 `--accept-android-licenses` or `--android-archives`.
+
+Use `debug_capabilities(domain="inspection")` to discover native and Java views
+and their direct tools. `debug_inspect(target=<session ID>, query="stack", view="java")`
+returns the regular Android job receipt. Poll it with `android_job_status`.
+Use the direct inspection tools to select a thread, frame, or page.
+Omit `view` to use the session's debugger, or the native view in a dual session.
 
 ## Launch or attach
 

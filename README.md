@@ -1,7 +1,7 @@
 # AIDebugger MCP
 
-AIDebugger exposes independent Visual Studio, IDA analysis/patch, Windows kernel,
-and Android native debugging backends through Model Context Protocol (MCP) servers. It is intended for clients such as
+AIDebugger exposes independent Visual Studio, IDA, Windows user-mode dump,
+Windows kernel, and Android debugging MCP servers. It is intended for clients such as
 Cursor, Codex, Claude Desktop, Claude Code, and OpenCode.
 
 It supports call stacks, locals, threads, modules, exceptions, build errors,
@@ -17,6 +17,8 @@ and validation](docs/kernel-backend.md) for capabilities and live-validation lim
 Run `Install-AIDebugger.cmd` to deploy IDA/kernel MCP and the project-maintained
 IDA analysis Skill to Claude/Codex; Visual Studio keeps its VSIX installer/setup.
 Use `--backend kernel` to add kernel without changing an existing IDA setup.
+Use `--backend windows` for Windows user-mode minidump inspection with DbgEng.
+See [Windows setup, platform discovery and migration coverage](docs/windows-backend.md).
 The Android backend uses an AIDebugger-managed ADB and LLDB runtime plus an
 integrated JDWP client for native, Java, and dual Java/JNI debugging, including
 startup. See [Android setup and debugging](docs/android-backend.md).
@@ -27,6 +29,7 @@ startup. See [Android setup and debugging](docs/android-backend.md).
 Visual Studio VSIX -- authenticated AIDB/2 pipe --> VS-only FastMCP entry -- stdio --> MCP client
 IDA / IDB         -- private session transport --> IDA MCP entry        -- stdio --> MCP client
 DbgEng worker     -- inherited anonymous pipes --> Kernel MCP entry     -- stdio --> MCP client
+DbgEng worker     -- inherited anonymous pipes --> Windows MCP entry    -- stdio --> MCP client
 Android app       -- LLDB and JDWP over ADB  --> Android MCP entry     -- stdio --> MCP client
 ```
 

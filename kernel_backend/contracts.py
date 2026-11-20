@@ -2,10 +2,7 @@
 import re
 
 
-class KernelError(RuntimeError):
-    def __init__(self, code, message):
-        self.code = code
-        super().__init__(message)
+from debug_backend.errors import DebugEngineError as KernelError
 
 
 def require(condition, message, code="INVALID_ARGUMENT"):

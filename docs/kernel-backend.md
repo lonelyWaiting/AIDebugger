@@ -1,6 +1,6 @@
 # Windows kernel debugging
 
-AIDebugger has three independent MCP entrypoints. The kernel backend uses the
+AIDebugger has independent MCP entrypoints. The kernel backend uses the
 public Microsoft DbgEng interfaces directly, without requiring a third-party
 MCP server or loading IDAPython into the debugger process.
 
@@ -19,7 +19,8 @@ MCP client
 | Source/PDB user-mode debugger, managed locals, VS project/output | VS |
 | Driver disassembly/decompilation, xrefs/types, persistent IDB/patch export | IDA |
 | Kernel dumps, remote kernel execution, kernel memory/context/extensions | Kernel |
-| Stdio dispatch and generic vendored JSON-RPC/MCP code | Shared transport only |
+| Stdio dispatch and generic vendored JSON-RPC/MCP code | Shared transport |
+| DbgEng DLL selection, integrity checks, COM binding and virtual-memory reads | Shared with Windows user-mode dumps |
 | Client registration, backups, hash ownership and rollback | Project installer |
 
 The kernel deployment shares the existing vendored generic MCP implementation
