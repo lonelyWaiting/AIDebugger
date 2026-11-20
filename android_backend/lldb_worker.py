@@ -31,14 +31,17 @@ def check(error):
 
 def frame_info(frame):
     location = frame.GetLineEntry()
+    line = location.GetLine()
     return {"index": frame.GetFrameID(), "function": frame.GetDisplayFunctionName(),
             "pc": address(frame.GetPC()), "module": file_path(frame.GetModule().GetFileSpec()),
-            "file": file_path(location.GetFileSpec()), "line": location.GetLine() or None}
+            "file": file_path(location.GetFileSpec()),
+            "line": line if line not in (0, lldb.LLDB_INVALID_LINE_NUMBER) else None}
 
 
 def breakpoint_info(bp):
     return {"breakpointId": bp.GetID(), "locations": bp.GetNumLocations(),
-            "resolvedLocations": bp.GetNumResolvedLocations(), "hitCount": bp.GetHitCount()}
+            "resolvedLocations": bp.GetNumResolvedLocations(), "hitCount": bp.GetHitCount(),
+            "enabled": bp.IsEnabled(), "condition": bp.GetCondition()}
 
 
 def quote(value):
@@ -120,6 +123,8 @@ class Debugger:
             if thread.IsValid():
                 result.update(threadId=thread.GetThreadID(), stopReason=thread.GetStopReason(),
                               stopDescription=thread.GetStopDescription(512))
+        elif state == lldb.eStateExited:
+            result.update(exitStatus=process.GetExitStatus(), exitDescription=process.GetExitDescription())
         return result
 
     def selected_thread(self):
@@ -188,9 +193,11 @@ class Debugger:
                               "error": value.GetError().GetCString()})
         return {"frame": frame_info(frame), "variables": variables}
 
-    def set_breakpoint(self, symbol, file, line, module):
+    def set_breakpoint(self, symbol, file, line, module, load_address=None, condition=""):
         self.paused()
-        if symbol:
+        if load_address is not None:
+            bp = self.target.BreakpointCreateByAddress(load_address)
+        elif symbol:
             bp = (self.target.BreakpointCreateByName(symbol, module) if module
                   else self.target.BreakpointCreateByName(symbol))
         elif module:
@@ -201,13 +208,140 @@ class Debugger:
             bp = self.target.BreakpointCreateByLocation(file, line)
         if not bp.IsValid():
             raise RuntimeError("LLDB could not create the breakpoint")
+        if condition:
+            bp.SetCondition(condition)
         return breakpoint_info(bp)
+
+    def native(self, query, thread_id=0, index=0, load_address=None, count=32, expression="", pattern=""):
+        self.paused()
+        if query in {"memory", "search_memory"}:
+            error = lldb.SBError()
+            data = self.process.ReadMemory(load_address, count, error) or b""
+            result = {"address": address(load_address), "bytesRead": len(data),
+                      "partial": len(data) != count, "error": error.GetCString()}
+            if query == "memory":
+                return {**result, "dataHex": data.hex()}
+            needle = bytes.fromhex(pattern)
+            matches, offset = [], data.find(needle)
+            while offset >= 0 and len(matches) < 128:
+                matches.append(address(load_address + offset))
+                offset = data.find(needle, offset + 1)
+            return {**result, "matches": matches, "truncated": offset >= 0}
+        if query == "resolve_address":
+            where = self.target.ResolveLoadAddress(load_address)
+            entry = where.GetLineEntry()
+            function, symbol = where.GetFunction(), where.GetSymbol()
+            line = entry.GetLine()
+            return {"address": address(load_address), "module": file_path(where.GetModule().GetFileSpec()),
+                    "function": (function.GetName() if function.IsValid() else symbol.GetName()),
+                    "file": file_path(entry.GetFileSpec()),
+                    "line": line if line not in (0, lldb.LLDB_INVALID_LINE_NUMBER) else None}
+        if query == "disassembly":
+            start = (self.target.ResolveLoadAddress(load_address) if load_address is not None
+                     else self.thread(thread_id).GetFrameAtIndex(index).GetPCAddress())
+            if not start.IsValid():
+                raise ValueError("Disassembly address is unavailable")
+            instructions = self.target.ReadInstructions(start, count)
+            return {"instructions": [
+                {"address": address(item.GetAddress().GetLoadAddress(self.target)),
+                 "mnemonic": item.GetMnemonic(self.target), "operands": item.GetOperands(self.target),
+                 "comment": item.GetComment(self.target)}
+                for item in (instructions.GetInstructionAtIndex(i) for i in range(instructions.GetSize()))]}
+        frame = self.thread(thread_id).GetFrameAtIndex(index)
+        if not frame.IsValid():
+            raise ValueError("Android stack frame is unavailable")
+        if query == "registers":
+            registers = frame.GetRegisters()
+            groups = [registers.GetValueAtIndex(i) for i in range(registers.GetSize())]
+            return {"groups": [
+                {"name": group.GetName(), "registers": [
+                    {"name": value.GetName(), "value": value.GetValue()}
+                    for value in (group.GetChildAtIndex(i) for i in range(min(group.GetNumChildren(), count)))]}
+                for group in groups]}
+        options = lldb.SBExpressionOptions()
+        options.SetTimeoutInMicroSeconds(2_000_000)
+        options.SetIgnoreBreakpoints(True)
+        options.SetUnwindOnError(True)
+        options.SetTryAllThreads(False)
+        value = frame.EvaluateExpression(expression, options)
+        check(value.GetError())
+        return {"type": value.GetTypeName(), "value": value.GetValue(), "summary": value.GetSummary()}
+
+    def write_memory(self, load_address, data_hex, expected_stop_id):
+        self.paused()
+        stop_id = self.process.GetStopID()
+        if expected_stop_id is not None and expected_stop_id != stop_id:
+            raise ValueError("Android stop changed before memory write")
+        data = bytes.fromhex(data_hex)
+        width = self.process.GetAddressByteSize()
+        if not width or load_address + len(data) >= 1 << (8 * width):
+            raise ValueError("Memory write range exceeds the target address space")
+        write_error = lldb.SBError()
+        written = self.process.WriteMemory(load_address, data, write_error)
+        result = {"address": address(load_address), "stopId": stop_id,
+                  "bytesRequested": len(data), "bytesWritten": written, "partial": written < len(data),
+                  "writeError": write_error.GetCString(), "bytesReadBack": 0, "verified": None,
+                  "requestedRangeVerified": False, "readBackError": None}
+        if written:
+            try:
+                verify_error = lldb.SBError()
+                actual = self.process.ReadMemory(load_address, written, verify_error) or b""
+                result.update(bytesReadBack=len(actual), readBackError=verify_error.GetCString())
+                if verify_error.Success() and len(actual) == written:
+                    result["verified"] = actual == data[:written]
+                    result["requestedRangeVerified"] = (written == len(data) and write_error.Success()
+                                                        and result["verified"])
+            except Exception as error:
+                result["readBackError"] = str(error)
+        return result
+
+    def watchpoint(self, load_address, size, read, write, watchpoint_id=0):
+        self.paused()
+        if watchpoint_id:
+            if not self.target.DeleteWatchpoint(watchpoint_id):
+                raise ValueError("Android watchpoint does not exist")
+            return {"removed": watchpoint_id}
+        error = lldb.SBError()
+        options = lldb.SBWatchpointOptions()
+        options.SetWatchpointTypeRead(read)
+        options.SetWatchpointTypeWrite(lldb.eWatchpointWriteTypeAlways if write
+                                       else lldb.eWatchpointWriteTypeDisabled)
+        watch = self.target.WatchpointCreateByAddress(load_address, size, options, error)
+        check(error)
+        if not watch.IsValid():
+            raise RuntimeError("LLDB could not install the hardware watchpoint")
+        return {"watchpointId": watch.GetID(), "address": address(load_address), "size": size}
+
+    def snapshot(self, thread_id=0, depth=12, limit=32):
+        first = self.status()
+        snapshot = {"status": first}
+        if self.process.GetState() in PAUSED:
+            thread_id = thread_id or first.get("threadId", 0)
+            snapshot["stack"] = self.inspect("stack", thread_id, limit=depth)["frames"]
+            if snapshot["stack"]:
+                snapshot["locals"] = self.inspect("locals", thread_id, limit=limit)["variables"]
+            last = self.status()
+            if last["stopId"] != first["stopId"] or last["state"] != first["state"]:
+                return {"status": last, "snapshotStable": False}
+        snapshot["snapshotStable"] = self.process.GetState() in PAUSED
+        return snapshot
 
     def remove_breakpoint(self, breakpoint_id):
         self.paused()
         if not self.target.BreakpointDelete(breakpoint_id):
             raise ValueError("Android breakpoint does not exist")
         return {"removed": breakpoint_id}
+
+    def configure_breakpoint(self, breakpoint_id, enabled, condition):
+        self.paused()
+        bp = self.target.FindBreakpointByID(breakpoint_id)
+        if not bp.IsValid():
+            raise ValueError("Android breakpoint does not exist")
+        if enabled is not None:
+            bp.SetEnabled(enabled)
+        if condition is not None:
+            bp.SetCondition(condition or None)
+        return breakpoint_info(bp)
 
     def control(self, action, thread_id):
         if action == "pause":
@@ -248,7 +382,8 @@ def emit(payload):
 def main():
     debugger = Debugger()
     operations = {name: getattr(debugger, name) for name in (
-        "prepare", "connect", "inspect", "set_breakpoint", "remove_breakpoint", "control", "detach")}
+        "prepare", "connect", "inspect", "set_breakpoint", "remove_breakpoint", "configure_breakpoint", "control",
+        "snapshot", "native", "write_memory", "watchpoint", "detach")}
     emit({"ready": True})
     try:
         for line in sys.__stdin__:

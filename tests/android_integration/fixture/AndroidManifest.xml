@@ -1,0 +1,8 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.aidebugger.dualprobe">
+    <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="34" />
+    <application android:debuggable="true" android:extractNativeLibs="true"
+        android:label="AIDebugger JNI probe">
+        <activity android:name=".ProbeActivity" android:exported="true" />
+    </application>
+</manifest>

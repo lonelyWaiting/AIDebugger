@@ -1,10 +1,9 @@
-# Android native debugging
+# Android debugging
 
-Android MCP attaches LLDB to a running debuggable app on a connected Android
-device or emulator. The host runtime supports Windows x64. Use native C/C++
-debug builds with matching unstripped libraries to resolve source lines and
-inspect variables. Managed Java/Kotlin debugging and app launch are outside
-this backend.
+Android MCP launches or attaches to debuggable apps on Windows x64. Choose
+native LLDB, Java JDWP, or both on the same process for Java/JNI handoffs.
+Native source inspection uses matching unstripped libraries. Java source lines
+and locals use the APK's bytecode debug metadata.
 
 ## Install
 
@@ -19,7 +18,7 @@ The installer downloads pinned Google ZIPs (about 790 MB total), verifies their
 sizes and SHA-256 hashes, extracts the debugging files, and smoke-tests ADB
 and LLDB before registering the Android MCP server. The private runtime lives
 under `~/.ai-debugger/android/runtime/` and is reused on later runs. Android
-Studio, a system Android SDK/NDK, and Android paths on `PATH` are unnecessary.
+Studio, a system Android SDK/NDK or JDK, and Android paths on `PATH` are unnecessary.
 
 For offline setup, give `--android-archives <directory>` containing the official
 `android-ndk-r27c-windows.zip` and `platform-tools_r37.0.3-win.zip`. Omit
@@ -30,32 +29,78 @@ manufacturer's device driver.
 To install IDA, kernel, and Android together, pass `--backend all` with
 `--accept-android-licenses` or `--android-archives`.
 
-## Debug a running app
+## Launch or attach
 
-1. Start the app and call `android_list_devices`. Note the serial of the device
-   in the `device` state.
-2. Call `android_attach` with the serial and Android application ID. Supply
-   `symbol_dirs` as absolute directories containing the exact unstripped
-   libraries for this build and ABI. Use `source_map` to map build-machine path
-   prefixes to existing local source directories. To attach to a secondary
-   process, supply its `package:suffix` name. Specify `abi` if package metadata
-   fails to identify the target architecture.
-3. Poll `android_job_status` with the session and job IDs. Once attached, set a
-   breakpoint by symbol or file and line using `android_set_breakpoint`, then
-   continue with `android_control`. A breakpoint reporting zero resolved
-   locations can resolve when the library loads.
-4. Inspect `status` and compare `stopId` to confirm a new stop. Use
-   `android_inspect` for threads, call stacks, locals, modules, or breakpoints.
-   Use a returned thread ID when a thread other than the selected thread is needed.
-5. Call `android_detach` and poll its result to release the target and delete
-   this session's forwarding and temporary device files. A job can report
-   cleanup errors or an unknown target state after a transport failure.
+1. Call `android_list_devices` and choose the serial in the `device` state.
+2. Use `android_attach` for a running app. Use `android_launch` with its
+   application ID and activity class, such as `.MainActivity`, to set breakpoints
+   before startup. The target process must be stopped for launch. Choose the
+   `native`, `java` or `dual` mode. To select a secondary process, use its
+   `package:suffix` name.
+3. In native or dual mode, set `symbol_dirs` to directories containing exact
+   unstripped libraries for the installed build and ABI. Use `source_map` to map
+   build-machine source prefixes to existing local directories. Supply an
+   explicit `abi` when package metadata cannot identify the runtime architecture.
+4. Poll `android_job_status` with both IDs. Attach and launch report a phase
+   such as `wait_for_jdwp`, `prepare_symbols`, `deploy_lldb_server` or
+   `connect_lldb`. They accept a `deadline_ms` and support cancellation through
+   `android_cancel_job`. A cancelled wait leaves any previously submitted
+   continue or step in effect. A transport interruption after dispatch can
+   return an unknown target state. Cleanup errors are reported in the job receipt.
+5. Use `android_detach` to release both debuggers, the native forward and the
+   direct JDWP connection. A live
+   debugger in another IDE can prevent attaching to the same process.
 
-The host starts a dedicated LLDB process for each session. ADB transfers the
-matching `lldb-server`, starts it through Android's `run-as`, and forwards a
-host loopback port to its unique abstract Unix socket. ADB device transports,
-Android sessions, and job IDs are explicit. An existing Android Studio or LLDB
-attachment can prevent a second debugger from attaching to the same process.
+## Native inspection and execution
+
+- `android_set_breakpoint` supports symbols, source lines and load addresses,
+  with optional conditions. `android_configure_breakpoint` changes conditions
+  and enabled state. `android_watchpoint` sets or removes hardware watchpoints
+  where the target supports them.
+- `android_inspect` exposes threads, stack, locals, loaded modules and breakpoints.
+  `android_native_query` adds registers, disassembly, address resolution, bounded
+  memory reads/search, and LLDB expression evaluation. Evaluation can run code
+  in the target process.
+- `android_write_memory` writes raw bytes supplied as contiguous hex pairs to
+  a paused native target. Pass `expected_stop_id` to tie the write to a specific
+  stop. `requestedRangeVerified` confirms a complete write and readback match.
+  `bytesWritten` and `verified` describe the prefix reported by LLDB. A lost
+  reply, transport error or short write can leave bytes changed.
+- `android_snapshot` captures one stop's status, stack and top-frame locals.
+  `android_run_until_stop` can issue one continue or step and capture the next
+  stop in a single job. Compare `stopId` and inspect `outcome` and
+  `snapshotStable`. LLDB can stop on an unrelated signal before a breakpoint.
+- The server reuses pulled system symbol files across sessions on the same
+  device build and ABI. Each native session owns its own `lldb-server` and ADB
+  forwarding. Android can still report an input-dispatch ANR while a foreground
+  app is paused at a debugger stop.
+
+## Java and JNI
+
+For startup, provide `java_breakpoints` with `class_name` and `method` or
+`line`, and `native_breakpoints` with `symbol`, source location or `address`.
+Breakpoints can bind as classes and shared libraries load. Use a Java method
+descriptor to distinguish overloads when needed.
+
+- In native mode, continue once to release the startup gate and run to an
+  initial breakpoint such as `JNI_OnLoad`.
+- In Java mode, use `android_java_control`. It can wait server-side and return
+  the new Java stop, stack and locals. Set method or source-line breakpoints
+  with `android_java_breakpoint`, configure exception stops with
+  `android_java_exception_breakpoint`, and use `android_java_object` for
+  declared instance fields, arrays and strings. Java IDs use decimal strings.
+- In dual mode, use `android_java_control(action="continue",
+  release_native_startup=true, wait_ms=10000)` to release the initial LLDB stop
+  and the startup gate in one job. Subsequent Java continues can report
+  `native_stop`. Use native control at that point. When native execution
+  returns to a Java breakpoint, `android_run_until_stop` can report
+  `java_stop` with the Java stack and locals. While LLDB has stopped the
+  process, Java status returns `blockedByNative` instead of waiting on a
+  suspended JDWP agent. Java and native stacks remain separate views.
+
+The Java view provides JDWP inspection and stepping. Full Java expression
+evaluation, Kotlin inline/coroutine source mapping, and merged Java/native
+stack rendering are outside the current feature set.
 
 ## Validate
 
@@ -64,3 +109,12 @@ installer, target validation, and session contracts. The opt-in
 `tests/android_integration/run_android_smoke.py --help` describes the live
 smoke for a running test app with a repeatedly invoked native function. It
 drives the installed MCP with SDK environment variables and SDK paths removed.
+
+The Java/JNI smoke is emulator-only. Its fixture builder uses an SDK, NDK and
+JDK to build an APK for testing. The installed debugger uses its own runtime.
+
+```powershell
+python tests/android_integration/build_dual_probe.py --sdk $env:ANDROID_HOME --jdk <JDK> --output <fixture-dir>
+adb -s emulator-5588 install <fixture-dir>/dual.apk
+python tests/android_integration/run_android_dual_smoke.py --server <installed-android_server.py> --adb <private-adb.exe> --fixture <fixture-dir>
+```

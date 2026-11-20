@@ -2,6 +2,7 @@
 import io
 import os
 import queue
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -11,6 +12,8 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
+from android_backend.jdwp import HEADER, VM_DEATH, Cursor, JavaLost, JavaSession, u4
+from android_backend.jobs import Budget, JobStopped, checkpoint, current_job
 from android_backend.runtime import AndroidError, NDK, Runtime, destination, provision, runtime_member
 from android_backend.sessions import Sessions
 from android_backend.transport import Connection, LldbWorker, WorkerLost, paths, process_name, process_start_time
@@ -82,6 +85,15 @@ class AndroidSessionTests(unittest.TestCase):
         with self.assertRaises(AndroidError):
             process_start_time("4242 (truncated) S 4 5")
 
+    def test_startup_wait_uses_the_first_successful_pid_snapshot(self):
+        connection = Connection(Mock(), "id", "serial", "com.example", "com.example",
+                                None, "", [], {})
+        connection.adb = Mock()
+        connection.adb.shell.side_effect = [(1, "1234"), (0, "1234")]
+        connection.adb.run.return_value = (0, "serial")
+        self.assertEqual(connection.resolve_pids(wait=True), ["1234"])
+        self.assertEqual(connection.adb.shell.call_count, 2)
+
     def test_path_arguments_reject_debugger_expansion(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(ValueError):
@@ -112,6 +124,20 @@ class AndroidSessionTests(unittest.TestCase):
         connection.adb.shell.assert_not_called()
         connection.worker.close.assert_called_once_with()
 
+    def test_symbol_read_recovery_refuses_a_rebooted_device(self):
+        connection = Connection(Mock(), "id", "serial", "com.example", "com.example",
+                                42, "arm64-v8a", [], {})
+        original = connection.adb = Mock()
+        connection.boot_id = "previous boot"
+        discover, candidate = Mock(), Mock()
+        discover.devices.return_value = [{"serial": "serial", "state": "device", "transportId": "2"}]
+        candidate.run.return_value = (0, "serial")
+        candidate.shell.return_value = (0, "new boot")
+        with patch("android_backend.transport.Adb", side_effect=[discover, candidate]):
+            with self.assertRaisesRegex(AndroidError, "rebooted or changed"):
+                connection.recover_read_transport()
+        self.assertIs(connection.adb, original)
+
     def test_cleanup_retains_a_stub_still_tracing_the_app_and_only_removes_its_port(self):
         connection = Connection(Mock(), "id", "serial", "com.example", "com.example",
                                 42, "arm64-v8a", [], {})
@@ -138,6 +164,7 @@ class AndroidSessionTests(unittest.TestCase):
         connection.attach.side_effect = lambda: (release.wait(5), {"state": "stopped"})[1]
         connection.cleanup.return_value = ["device disconnected during cleanup"]
         connection.worker.call.side_effect = WorkerLost("worker disconnected")
+        connection.native_control.side_effect = connection.worker.call
         sessions = Sessions(Mock())
 
         def wait(receipt):
@@ -167,3 +194,75 @@ class AndroidSessionTests(unittest.TestCase):
             finally:
                 release.set()
                 sessions.shutdown()
+
+    def test_cancel_before_attach_reports_progress_and_releases_the_session(self):
+        connection = Mock(abi="", serial="serial", process_name="com.example", attach_requested=False)
+        connection.cleanup.return_value = []
+        began = threading.Event()
+
+        def attach():
+            checkpoint("wait_for_launched_process")
+            began.set()
+            while True:
+                checkpoint()
+                time.sleep(0.01)
+
+        connection.attach.side_effect = attach
+        sessions = Sessions(Mock())
+        with patch("android_backend.sessions.Connection", return_value=connection):
+            receipt = sessions.open("serial", "com.example", "", None, "", [], {})
+            session_id, job_id = receipt["sessionId"], receipt["jobId"]
+            try:
+                self.assertTrue(began.wait(2))
+                self.assertEqual(sessions.job(session_id, job_id)["stage"], "wait_for_launched_process")
+                self.assertTrue(sessions.cancel(session_id, job_id)["cancellationRequested"])
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    job = sessions.job(session_id, job_id)
+                    if job["state"] != "pending":
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(job["state"], "cancelled")
+                self.assertNotIn("targetState", job)
+                connection.cleanup.assert_called_once()
+            finally:
+                sessions.cancel(session_id, job_id)
+                sessions.shutdown()
+
+
+class JdwpTests(unittest.TestCase):
+    def test_vm_death_is_observed_before_the_socket_eof(self):
+        reader, peer = socket.socketpair()
+        with reader, peer:
+            reader.settimeout(1)
+            session = JavaSession.__new__(JavaSession)
+            session.socket, session.buffer, session.events = reader, bytearray(), []
+            session.state, session.stop = "running", None
+            event = b"\0" + u4(1) + bytes([VM_DEATH]) + u4(0)
+            peer.sendall(HEADER.pack(11 + len(event), 7, 0, 64, 100) + event)
+            peer.shutdown(socket.SHUT_WR)
+            session.sync()
+            self.assertEqual(session.state, "exited")
+
+    def test_cancelled_event_processing_marks_the_stream_unusable(self):
+        session = JavaSession.__new__(JavaSession)
+        session.state, session.events = "stopped", [b"jdwp-event"]
+        session.handle_events = Mock(side_effect=JobStopped("cancelled"))
+        with self.assertRaisesRegex(JavaLost, "suspension state is unknown"):
+            session.sync()
+
+    def test_incomplete_packet_keeps_header_when_deadline_expires(self):
+        session = JavaSession.__new__(JavaSession)
+        session.buffer = bytearray(HEADER.pack(14, 1, 128, 0, 0) + b"x")
+        expected = session.buffer[:]
+        token = current_job.set(Budget(0))
+        try:
+            with self.assertRaises(JobStopped):
+                session.packet(time.monotonic() + 1)
+        finally:
+            current_job.reset(token)
+        self.assertEqual(session.buffer, expected)
+
+    def test_truncated_jdwp_value_is_rejected(self):
+        with self.assertRaises(JavaLost):
+            Cursor(b"\0\0\0\x06short").text()

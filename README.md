@@ -17,8 +17,9 @@ and validation](docs/kernel-backend.md) for capabilities and live-validation lim
 Run `Install-AIDebugger.cmd` to deploy IDA/kernel MCP and the project-maintained
 IDA analysis Skill to Claude/Codex; Visual Studio keeps its VSIX installer/setup.
 Use `--backend kernel` to add kernel without changing an existing IDA setup.
-The Android backend uses an AIDebugger-managed ADB and LLDB runtime to attach to a
-running debuggable Android app. See [Android setup and debugging](docs/android-backend.md).
+The Android backend uses an AIDebugger-managed ADB and LLDB runtime plus an
+integrated JDWP client for native, Java, and dual Java/JNI debugging, including
+startup. See [Android setup and debugging](docs/android-backend.md).
 
 ## Architecture
 
@@ -26,7 +27,7 @@ running debuggable Android app. See [Android setup and debugging](docs/android-b
 Visual Studio VSIX -- authenticated AIDB/2 pipe --> VS-only FastMCP entry -- stdio --> MCP client
 IDA / IDB         -- private session transport --> IDA MCP entry        -- stdio --> MCP client
 DbgEng worker     -- inherited anonymous pipes --> Kernel MCP entry     -- stdio --> MCP client
-Android app       -- lldb-server, ADB forward --> Android MCP entry     -- stdio --> MCP client
+Android app       -- LLDB and JDWP over ADB  --> Android MCP entry     -- stdio --> MCP client
 ```
 
 A Visual Studio instance owns a paired data/control named pipe:
